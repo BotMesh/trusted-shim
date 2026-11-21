@@ -71,6 +71,7 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         nbf: grants::now(),
         exp: grants::now() + 120,
         purpose: Purpose::Access,
+        http_request: None,
         execution: request.execution.clone(),
         service: request.services[index].id.clone(),
         policy: PolicyRef {
@@ -101,7 +102,7 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         driver.clone(),
         request.execution.clone(),
         request.services[1].clone(),
-        verifier,
+        verifier.clone(),
         Some(ingress),
         target,
         stop.clone(),
@@ -242,6 +243,89 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
             .status(),
         403
     );
+    // Browser ingress requires per-request approval and commits replay state
+    // before forwarding, including across concurrent requests and restarts.
+    use sha2::{Digest, Sha256};
+    let mut once: management::Ingress =
+        serde_json::from_value(request.driver_options["ingress"]["chat"].clone()).unwrap();
+    once.single_use = true;
+    let (bound_app, bound_task) = management::bind(
+        driver.clone(),
+        request.execution.clone(),
+        request.services[1].clone(),
+        verifier.clone(),
+        Some(once.clone()),
+        target,
+        stop.clone(),
+    )
+    .await
+    .unwrap();
+    let bound_url = format!("http://{bound_app}/v1/chat/completions");
+    assert_eq!(
+        http.post(&bound_url)
+            .header("x-trusted-route", &chat)
+            .body("approved")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let mut bound = grant(1);
+    bound.http_request = Some(trusted_router_transport::grants::HttpRequestBinding {
+        id: "aa".repeat(32),
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        body_sha256: hex::encode(Sha256::digest(b"approved")),
+    });
+    let capability = grants::sign(&key, &bound).unwrap();
+    assert_eq!(
+        http.post(&bound_url)
+            .header("x-trusted-route", &capability)
+            .body("changed")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let attempts = futures::future::join_all((0..20).map(|_| {
+        http.post(&bound_url)
+            .header("x-trusted-route", &capability)
+            .body("approved")
+            .send()
+    }))
+    .await;
+    let codes = attempts
+        .into_iter()
+        .map(|r| r.unwrap().status().as_u16())
+        .collect::<Vec<_>>();
+    assert_eq!(codes.iter().filter(|&&v| v == 200).count(), 1, "{codes:?}");
+    assert_eq!(codes.iter().filter(|&&v| v == 409).count(), 19, "{codes:?}");
+    bound_task.abort();
+    let recovered = DockerDriver::new(tmp.path().join("state"), "local".into()).unwrap();
+    let (recovered_app, recovered_task) = management::bind(
+        recovered,
+        request.execution.clone(),
+        request.services[1].clone(),
+        verifier.clone(),
+        Some(once),
+        target,
+        stop.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        http.post(format!("http://{recovered_app}/v1/chat/completions"))
+            .header("x-trusted-route", &capability)
+            .body("approved")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    recovered_task.abort();
     let before = driver.inspect(&request.execution).await.unwrap().port;
     http.post(format!("http://{admin}/restart"))
         .header("x-trusted-route", &control)

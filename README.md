@@ -220,3 +220,21 @@ An administrator can declare the reserved `control` service (endpoint `control`)
 For application ingress, declare `endpoint_ref: ingress:<service>` and a matching `driver_options.ingress` entry with exact `paths`, allowed `methods` and optional `bearer_env`. The node reads that credential from the owned container and injects it into the local HTTP request; the client never receives it. This supports HTTP/SSE and rejects undeclared paths/methods. Use the direct app endpoint for services that need native WebSocket/TCP. Ingress is configured in the existing application manifest, not a second runtime catalog.
 
 `driver_options.port: 0` with `container_port` asks the shim to select and durably reserve a free host loopback port. Docker receives a fixed mapping, so a restart preserves the endpoint. Runtime status reports the assigned port. Reservation records are released only after network drain and confirmed container removal. A conflicting external listener fails launch; no different target is silently selected. Preserve the private state directory across upgrades. A crash before allocation-record persistence can leave a conservative orphan port reservation for operator reconciliation.
+
+
+### Single-use application ingress
+
+Set `single_use: true` on an existing ingress rule to require a signed
+`http_request` binding. The shim verifies the method, exact path and SHA-256 of
+at most 16 MiB of request body, then commits the invocation ID to a private SQLite
+ledger before sending to the workload. Concurrent replays and reconnect/restart
+replays return 409; a mismatched request returns 403 without consuming approval.
+Expired ledger entries are pruned. Preserve the shim state directory on upgrades.
+A lost upstream response consumes the approval: reconcile the application outcome
+before authorizing a new ID. HTTP response bodies remain streamed, including SSE.
+
+Old ingress rules keep their prior behavior and wire representation. Nodes report
+`single-use-ingress-v1`; Fleet must require this capability before placing a
+single-use rule. Admin control routes do not accept body-bound application grants.
+These invocation capabilities enforce application admission and replay protection;
+they are separate from the remote PolicyEngine proof required by trusted actions.

@@ -5029,7 +5029,7 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-data-router?rev=99b28bb9e7a56afbaf7e6c95f19bd2957f3db1c4#99b28bb9e7a56afbaf7e6c95f19bd2957f3db1c4"
+source = "git+https://github.com/BotMesh/trusted-data-router?rev=975a60e0de4c48c88fadfcc6ced154aa01bb1e16#975a60e0de4c48c88fadfcc6ced154aa01bb1e16"
 dependencies = [
  "async-trait",
  "axum",
@@ -5065,11 +5065,13 @@ dependencies = [
  "bincode",
  "fs2",
  "futures",
+ "futures-util",
  "hex",
  "k256",
  "prost",
  "protoc-bin-vendored",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
