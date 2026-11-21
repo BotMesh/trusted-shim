@@ -9,6 +9,7 @@ pub mod admission;
 pub mod attestation;
 pub mod data_plane;
 pub mod docker;
+pub mod ledger;
 pub mod management;
 pub mod network;
 pub mod proof;

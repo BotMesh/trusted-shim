@@ -35,8 +35,22 @@ Pending, failed, expired or invalid proofs never authorize execution. The receip
 must verify against the approved guest key and exact expected public values before
 calling `AuthorizationLedger::reserve`. The central ledger must independently
 verify evidence, current policy/context/lease and budgets, then atomically issue
-and consume a single-use grant. Its durable implementation belongs to the central
-policy gateway and is not provided here.
+and consume a single-use grant. `ledger::SqliteLedger` provides this durable
+implementation for the central policy gateway. It must not be hosted by an
+untrusted execution node.
+
+Open it in a private durable directory with the approved program and a real
+`ReceiptVerifier`. The operator sets a cumulative shared budget and activates an
+exact allocation with its approved policy, authoritative context and state root.
+Stage the request and cost before remote submission; after restart, `request`
+recovers the identical witness. The ledger re-verifies every receipt, atomically
+reserves budget across allocations, and consumes an HMAC-authenticated grant
+once before dispatch. Reservations are idempotent; execution failures do not
+refund them. Policy/context changes invalidate pending grants. Revocation is
+durable even when it arrives before activation. Preserve the database, including
+its signing secret, across restarts. This is a single-host SQLite authority;
+multi-host gateway replicas require a shared transactional ledger implementation.
+The operator APIs are library interfaces, not unauthenticated HTTP endpoints.
 
 `AuthorizedExecutor` binds a grant to the full request and execution identity,
 consumes it through the ledger before invoking `ActionHandler`, and rejects
@@ -117,8 +131,8 @@ also run in downstream binaries to prevent widening Regorus's deterministic prof
 
 `DockerDriver` implements the machine-local `RuntimeDriver`; `AttestationVerifier`
 remains an interface; the concrete data-plane adapter owns outbound connectors.
-TEE evidence verification and its separate proof guest, central ledger storage,
-OpenShell/TEE drivers, non-bypassable enforcement and backend
+TEE evidence verification and its separate proof guest,
+OpenShell/TEE drivers, non-bypassable enforcement and policy gateway
 integration follow separately. Non-TEE attestation remains `SkippedNonTee`;
 requiring an attestation proof for that outcome is invalid. No permissive fallback
 or local prover is included.
