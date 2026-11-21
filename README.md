@@ -1,5 +1,9 @@
 # trusted-shim
 
+Existing remote policy receipts can now be verified in Solidity and recorded in
+a mined local-EVM transaction. See [contract acceptance](contracts/README.md) for
+the pinned upstream verifier, negative tests and reproduction commands.
+
 ## Independently supervised node runtime
 
 Fleet can install this binary alongside its node agent and start it in a separate
