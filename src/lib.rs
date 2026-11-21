@@ -1,11 +1,16 @@
-//! Machine-local runtime and trust framework below zkm-fleet.
+//! Machine-local runtime and trust interfaces below zkm-fleet.
 //!
-//! Traits only: there is no scheduler, Docker/OpenShell implementation, local
-//! prover, permissive proof verifier or runnable node daemon in this revision.
+//! Policy admission evaluates Rego, requests a remote proof, verifies its exact
+//! public values and consumes a central ledger grant before dispatch. Runtime
+//! drivers and attestation adapters remain interfaces. There is no local prover.
 
+pub mod admission;
 pub mod attestation;
+pub mod network;
 pub mod proof;
 pub mod runtime;
+#[cfg(feature = "ziren")]
+pub mod ziren;
 
 pub use trusted_contracts as contracts;
 pub use trusted_data_router::{Connector, ServiceSpec};

@@ -1,4 +1,4 @@
-name: Rust framework
+name: Rust checks
 on:
   pull_request:
   push:
@@ -14,5 +14,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-features
+      - run: python3 scripts/check_engine_features.py

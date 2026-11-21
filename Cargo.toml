@@ -5,13 +5,39 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Machine-local runtime, enforcement and remote proof contracts"
 
+[features]
+default = []
+ziren = ["dep:zkm-verifier"]
+
 [dependencies]
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+bincode = "1.3"
+k256 = { version = "0.13", features = ["ecdsa"] }
+alloy-primitives = { version = "1", features = ["k256"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread"] }
+tonic = { version = "0.14", features = ["channel", "tls-ring", "tls-native-roots"] }
+prost = "0.14"
+tonic-prost = "0.14"
+zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", rev = "c9988a098d92bc55a85ca9307c470d1f97be3337", optional = true }
 trusted-contracts = { git = "https://github.com/BotMesh/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
 trusted-data-router = { git = "https://github.com/BotMesh/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
-trusted-rail = { git = "https://github.com/BotMesh/trusted-rail", rev = "9cde01405dc917e03e8733d0971c9502272ba8b2" }
+trusted-rail = { git = "https://github.com/BotMesh/trusted-rail", rev = "83162e68e9634ab33e00467fa1b622920cf51b92" }
 
 [profile.dev]
 debug = 0
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[[example]]
+name = "remote-policy-proof"
+required-features = ["ziren"]
