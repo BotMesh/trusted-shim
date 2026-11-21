@@ -31,6 +31,20 @@ enum Command {
 
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 6 && args[1] == "--serve" && args[2] == "--state-dir" && args[4] == "--node-id"
+    {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let signal = stop.clone();
+        tokio::spawn(async move {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("signal");
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+            signal.cancel();
+        });
+        return trusted_shim::daemon::serve(std::path::Path::new(&args[3]), args[5].clone(), stop)
+            .await;
+    }
     if args.len() == 2 && args[1] == "--capabilities" {
         println!("{{\"protocol\":1,\"drivers\":[\"docker\"],\"features\":[\"data-plane-v1\",\"runtime-management-v1\",\"single-use-ingress-v1\"]}}");
         return Ok(());

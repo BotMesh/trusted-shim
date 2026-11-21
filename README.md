@@ -1,5 +1,43 @@
 # trusted-shim
 
+## Independently supervised node runtime
+
+Fleet can install this binary alongside its node agent and start it in a separate
+service/cgroup:
+
+```sh
+trusted-shim-runtime --serve --state-dir /var/lib/zkm-fleet/shim --node-id machine-name
+```
+
+The service exposes only `STATE/control.sock` (0600), checks the connecting UID,
+and accepts a bounded JSON request followed by a write-half close:
+
+```json
+{"protocol":1,"node_id":"machine-name","command":{"operation":"capabilities"}}
+```
+
+Responses contain `protocol` and either `result` or `error`. Launch, inspect,
+stop, delete and network commands use the same execution contracts as the stdio
+adapter. Disconnecting a client does not cancel an accepted operation. Network
+commands are idempotent and return after starting a daemon-owned connector;
+their configuration is persisted privately and recovered on daemon restart.
+Recovery never starts a stopped/missing business container. Explicit stop/delete
+still fence and drain networking before confirming cleanup.
+
+The shim service must not be a child in fleet-node's service cgroup or have a
+`PartOf`/`BindsTo` dependency on it. A node restart reconnects to this running
+service. A shim restart itself closes transports; upgrading the node must not
+restart shim, Ray, Docker or upstream runtime services. The node installer pins
+the shim executable by content hash and leaves old versions available for active
+allocations. Automatic shim replacement and live migration between shim versions
+are not implemented by this protocol.
+
+With a relay supporting `POST /v1/connect/{route}/renew`, the connector refreshes
+its registration grant without replacing the transport. User Access grants retain
+their original expiry, policy binding and revocation checks. An unavailable gateway
+can only be tolerated until the last accepted registration grant expires. This
+does not turn Docker admission into a policy/TEE proof.
+
 Machine-local runtime and trust interfaces below zkm-fleet, with a concrete
 proof-required policy admission path. Policy evaluation uses trusted-rail's
 pinned Regorus engine; the same engine runs inside its Ziren guest. Proofs are

@@ -8,6 +8,7 @@
 
 pub mod admission;
 pub mod attestation;
+pub mod daemon;
 pub mod data_plane;
 pub mod docker;
 pub mod ledger;

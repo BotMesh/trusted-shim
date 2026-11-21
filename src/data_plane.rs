@@ -32,6 +32,18 @@ pub struct NetworkConfig {
     pub issuer: String,
 }
 
+pub(crate) fn validate_config(config: &NetworkConfig) -> Result<()> {
+    endpoint(&config.gateway_url, "https", "http")?;
+    endpoint(&config.relay_url, "wss", "ws")?;
+    Verifier::new(
+        &std::fs::read(&config.public_key_file).map_err(|_| Error::Unavailable)?,
+        config.issuer.clone(),
+    )
+    .map_err(|_| Error::InvalidContract)?;
+    read_private(&config.token_file)?;
+    Ok(())
+}
+
 pub struct NetworkLease {
     pub(crate) _file: File,
     pub(crate) closed: PathBuf,
@@ -137,6 +149,65 @@ async fn grant(
     ))
 }
 
+// Refresh the registration lease on the existing transport. Access grants on
+// individual application streams keep their own expiry/revocation semantics.
+async fn renew_registration(
+    config: &NetworkConfig,
+    verifier: &Verifier,
+    client: &reqwest::Client,
+    execution: &ExecutionIdentity,
+    service: &ServiceSpec,
+    connection_url: &str,
+    mut expires_at: u64,
+) {
+    let mut renew_url = match reqwest::Url::parse(connection_url) {
+        Ok(url) => url,
+        Err(_) => return,
+    };
+    let scheme = if renew_url.scheme() == "wss" {
+        "https"
+    } else {
+        "http"
+    };
+    if renew_url.set_scheme(scheme).is_err() {
+        return;
+    }
+    renew_url.set_path(&format!("{}/renew", renew_url.path()));
+    let mut delay = (expires_at.saturating_sub(grants::now()) / 2).clamp(1, 30);
+    loop {
+        let remaining = expires_at.saturating_sub(grants::now());
+        if remaining == 0 {
+            return;
+        }
+        let attempt = async {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            let (url, token, next_expiry) =
+                grant(config, verifier, client, execution, service).await?;
+            if url != connection_url {
+                return Err(Error::Untrusted);
+            }
+            let response = client
+                .post(renew_url.clone())
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err(Error::Untrusted);
+            }
+            Ok(next_expiry)
+        };
+        match tokio::time::timeout(Duration::from_secs(remaining), attempt).await {
+            Ok(Ok(next)) => {
+                expires_at = expires_at.max(next);
+                delay = (expires_at.saturating_sub(grants::now()) / 2).clamp(1, 30);
+            }
+            Ok(Err(_)) => delay = 1,
+            Err(_) => return,
+        }
+    }
+}
+
 /// Blocks for this allocation's lifetime. The supervisor may restart the
 /// connector, but cannot restart or substitute a missing/stopped runtime.
 pub async fn serve(
@@ -194,14 +265,15 @@ pub async fn serve(
                 if let Ok((url, token, exp)) = registration
                 {
                     let started = tokio::time::Instant::now();
-                    let until = Duration::from_secs(exp.saturating_sub(grants::now()));
                     let active_stop = CancellationToken::new();
                     let active = edge::connect(&url, &token, target, active_stop.clone());
                     tokio::pin!(active);
                     tokio::select! {
                         _ = &mut active => {},
                         _ = shutdown.cancelled() => { active_stop.cancel(); let _ = active.await; return; },
-                        _ = tokio::time::sleep(until) => { active_stop.cancel(); let _ = active.await; },
+                        _ = renew_registration(&config, &verifier, &client, &execution, &service, &url, exp) => {
+                            active_stop.cancel(); let _ = active.await;
+                        },
                     }
                     if started.elapsed() > Duration::from_secs(30) {
                         backoff = 1;
