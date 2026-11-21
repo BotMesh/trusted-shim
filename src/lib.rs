@@ -2,8 +2,9 @@
 //!
 //! Policy admission evaluates Rego, requests a remote proof, verifies its exact
 //! public values and consumes a central ledger grant before dispatch. Runtime
-//! lifecycle includes an opt-in Docker driver. Attestation and OpenShell adapters
-//! remain interfaces. There is no local prover.
+//! lifecycle includes an opt-in Docker driver. The optional OpenShell client
+//! calls its native private compute-driver API; Fleet activation and ownership
+//! integration remain separate. There is no local prover.
 
 pub mod admission;
 pub mod attestation;
@@ -12,6 +13,8 @@ pub mod docker;
 pub mod ledger;
 pub mod management;
 pub mod network;
+#[cfg(feature = "openshell")]
+pub mod openshell;
 pub mod proof;
 pub mod runtime;
 #[cfg(feature = "ziren")]

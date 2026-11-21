@@ -137,6 +137,36 @@ integration follow separately. Non-TEE attestation remains `SkippedNonTee`;
 requiring an attestation proof for that outcome is invalid. No permissive fallback
 or local prover is included.
 
+## Native OpenShell transport
+
+The optional `openshell` feature uses the unmodified upstream compute-driver
+protobufs at commit `ce58cf8e9b953281352d98a637e41616295b1318`.
+`openshell::NativeDriver` connects to a private same-UID Unix socket, negotiates
+the upstream extension contract and checks the operator's resource admission
+policy and CPU/memory limit capabilities. `NativeCreate` binds the native policy
+hash, namespace, image, command, environment and hard limits to the approved
+launch inputs. Unmapped GPU, identity, namespace and platform options fail closed.
+Inspect, stop and delete require the exact sandbox ID and name; deletion is
+confirmed by a subsequent lookup. Mutations are never automatically retried.
+
+This is a transport client, not an enabled Fleet runtime driver. The caller must
+persist allocation ownership, bind all native launch inputs to its authorization,
+consume any required proof-backed grant, and privately deliver the central
+gateway's split launch credentials before create. Those credentials must never
+enter an ordinary Fleet App spec, workload environment or public response.
+Fleet activation, durable native lifecycle ownership and application endpoint
+routing still need integration. The runtime CLI continues to advertise Docker
+only. Tests use an upstream-protocol test server; they do not establish native
+OpenShell isolation or an end-to-end policy proof.
+
+Proof-required admission waits for remote verification before dispatch. Applying
+that mode to every serial tool call adds the proof network's queue, proving and
+round-trip latency to every step. A future asynchronous audit path must remain a
+distinct mode: native permissions enforce before execution, while a later proof
+establishes the recorded policy evaluation. Such a proof alone establishes
+neither completeness of the execution log nor the external side effect. It must
+not be accepted as the existing pre-execution `ExecutionGrant`.
+
 Keep one authoritative existing runtime config per application and retain dormant
 ACK support. Fleet's runtime adapter will delegate container hard limits to shim
 ([zkm-fleet #95](https://github.com/ProjectZKM/zkm-fleet/issues/95)). Film and ClawUp
