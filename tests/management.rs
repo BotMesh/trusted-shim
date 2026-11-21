@@ -35,7 +35,7 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
     let request:LaunchRequest=serde_json::from_value(json!({
         "execution":{"namespace":"clawup","workload":"agent-test","allocation_id":tmp.path().file_name().unwrap().to_string_lossy(),"lease_id":"lease","generation":1,"node_id":"local"},
         "driver":"docker","image":"python:3.12-slim","command":["python","-u","-c",
-            "from http.server import BaseHTTPRequestHandler,HTTPServer\nclass Handler(BaseHTTPRequestHandler):\n def do_POST(self):\n  body=self.headers.get('Authorization','').encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)\n def log_message(self,*args):pass\nHTTPServer(('0.0.0.0',8080),Handler).serve_forever()"],
+            "import sys\nprint(\"x\"*300000+\"\\nstdout-log\");print(\"stderr-log\",file=sys.stderr)\nfrom http.server import BaseHTTPRequestHandler,HTTPServer\nclass Handler(BaseHTTPRequestHandler):\n def do_POST(self):\n  body=self.headers.get('Authorization','').encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)\n def log_message(self,*args):pass\nHTTPServer(('0.0.0.0',8080),Handler).serve_forever()"],
         "environment":{"NATIVE_TOKEN":"node-only-secret"},"limits":{"cpu_millicores":250,"memory_bytes":134217728},
         "policy":{"issuer":"fleet","policy_id":"unproved","version":0,"sha256":""},
         "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required","attestation_proof":"not_required"},
@@ -155,6 +155,36 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
             .status(),
         403
     );
+    for (token, status) in [(None, 401), (Some(&chat), 403)] {
+        let mut request = http.get(format!("http://{admin}/logs?tail=10"));
+        if let Some(token) = token {
+            request = request.header("x-trusted-route", token);
+        }
+        assert_eq!(request.send().await.unwrap().status(), status);
+    }
+    let mut foreign = grant(0);
+    foreign.execution.namespace = "another-tenant".into();
+    foreign.service.namespace = "another-tenant".into();
+    assert_eq!(
+        http.get(format!("http://{admin}/logs?tail=10"))
+            .header("x-trusted-route", grants::sign(&key, &foreign).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    for query in ["tail=0", "tail=5001", "tail=all", "tail=10&follow=true"] {
+        assert_eq!(
+            http.get(format!("http://{admin}/logs?{query}"))
+                .header("x-trusted-route", &control)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
     let output:management::ExecResponse=http.post(format!("http://{admin}/exec")).header("x-trusted-route",&control)
         .json(&json!({"command":["sh","-c","cat; printf error >&2; exit 7"],"stdin":base64::engine::general_purpose::STANDARD.encode("input"),"timeout_seconds":10}))
         .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
@@ -185,6 +215,26 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let logs: management::LogsResponse = http
+        .get(format!("http://{admin}/logs?tail=5000"))
+        .header("x-trusted-route", &control)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stdout = base64::engine::general_purpose::STANDARD
+        .decode(logs.stdout)
+        .unwrap();
+    let stderr = base64::engine::general_purpose::STANDARD
+        .decode(logs.stderr)
+        .unwrap();
+    assert_eq!(stdout.len(), 128 * 1024);
+    assert!(stdout.ends_with(b"stdout-log\n"));
+    assert_eq!(stderr, b"stderr-log\n");
     assert_eq!(
         http.post(format!("http://{app}/v1/chat/completions"))
             .header("x-trusted-route", &chat)
@@ -354,6 +404,15 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         .exists());
     assert_eq!(
         http.get(format!("http://{admin}/metadata"))
+            .header("x-trusted-route", &control)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    assert_eq!(
+        http.get(format!("http://{admin}/logs?tail=10"))
             .header("x-trusted-route", &control)
             .send()
             .await

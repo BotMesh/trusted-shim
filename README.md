@@ -62,8 +62,10 @@ shim -> rail evaluation -> remote proof -> cryptographic verification
 
 Fleet owns placement, retries and confirmed resource release. Shim owns one
 machine's authorized executions. The independent router carries service payloads;
-ClawUp backend and OpenShell gateway own control and policy management. Retain
-native OpenShell isolation and call upstream interfaces without forking it.
+Fleet's control plane owns infrastructure policy and service grants. Application
+backends retain their own user/session and API-key authorization. OpenShell is
+called through upstream interfaces for native isolation, without forking it;
+its durable runtime lifecycle and centralized policy integration are not yet wired.
 
 ## Policy admission
 
@@ -301,7 +303,7 @@ and fail closed when the selected runtime path cannot satisfy them.
 
 ### Runtime administration and restricted HTTP ingress
 
-An administrator can declare the reserved `control` service (endpoint `control`) to expose exact-allocation metadata, bounded command execution and in-place restart through the independent data relay. The central connection gateway requires a Fleet administrator credential for this service. The node checks the signed `X-Trusted-Route` grant again, including its exact execution and service. Ordinary application grants cannot access administration. The Docker daemon is never exposed remotely. Exec accepts argv, optional user, base64 stdin and a deadline of at most 600 seconds; it uses the image's `timeout` utility, bounds input/output at 64 MiB and returns base64 stdout/stderr plus an exit code. Callers must not automatically retry a timed-out command. Docker administration does not claim action-policy proof; proof-required launch requests continue to fail closed.
+An administrator can declare the reserved `control` service (endpoint `control`) to expose exact-allocation metadata, bounded runtime logs, command execution and in-place restart through the independent data relay. The central connection gateway requires a Fleet administrator credential for this service. The node checks the signed `X-Trusted-Route` grant again, including its exact execution and service. Ordinary application grants cannot access administration. The Docker daemon is never exposed remotely. Exec accepts argv, optional user, base64 stdin and a deadline of at most 600 seconds; it uses the image's `timeout` utility, bounds input/output at 64 MiB and returns base64 stdout/stderr plus an exit code. `GET /logs?tail=N` reads 1–5000 lines directly from the owned container, returns base64 stdout/stderr (at most the last 128 KiB each), and bounds the complete read to 15 seconds or the remaining grant lifetime. It requires the same exact-execution control grant and does not depend on legacy Fleet node log files. Callers must not automatically retry a timed-out command. Docker administration does not claim action-policy proof; proof-required launch requests continue to fail closed.
 
 For application ingress, declare `endpoint_ref: ingress:<service>` and a matching `driver_options.ingress` entry with exact `paths`, allowed `methods` and optional `bearer_env`. The node reads that credential from the owned container and injects it into the local HTTP request; the client never receives it. This supports HTTP/SSE and rejects undeclared paths/methods. Use the direct app endpoint for services that need native WebSocket/TCP. Ingress is configured in the existing application manifest, not a second runtime catalog.
 

@@ -4,7 +4,7 @@
 use crate::{contracts::ExecutionIdentity, docker::DockerDriver, Error, Result};
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::{any, get, post},
@@ -79,6 +79,18 @@ pub struct ExecResponse {
     pub exit_code: i32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogsQuery {
+    tail: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LogsResponse {
+    pub stdout: String,
+    pub stderr: String,
+}
+
 struct Service {
     driver: DockerDriver,
     execution: ExecutionIdentity,
@@ -146,6 +158,7 @@ pub async fn bind(
     let router = if control {
         Router::new()
             .route("/metadata", get(metadata))
+            .route("/logs", get(logs))
             .route("/exec", post(execute))
             .route("/restart", post(restart))
             .layer(DefaultBodyLimit::max(90 * 1024 * 1024))
@@ -195,6 +208,26 @@ async fn execute(
     service
         .driver
         .execute(&service.execution, request, expires_at)
+        .await
+        .map(Json)
+        .map_err(failure)
+}
+async fn logs(
+    State(service): State<Arc<Service>>,
+    headers: HeaderMap,
+    Query(query): Query<LogsQuery>,
+) -> std::result::Result<Json<LogsResponse>, StatusCode> {
+    let expires_at = service.authorize(&headers)?.exp;
+    if !(1..=5000).contains(&query.tail) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let _slot = service
+        .slots
+        .try_acquire()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    service
+        .driver
+        .logs(&service.execution, query.tail, expires_at)
         .await
         .map(Json)
         .map_err(failure)

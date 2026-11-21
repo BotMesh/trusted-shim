@@ -88,6 +88,27 @@ fn available<T>(result: std::io::Result<T>) -> Result<T> {
     result.map_err(|_| Error::Unavailable)
 }
 
+// Keep draining the pipe so verbose containers cannot deadlock `docker logs`,
+// but retain only the last 128 KiB of each stream (256 KiB total).
+async fn log_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    const LIMIT: usize = 128 * 1024;
+    let mut tail = std::collections::VecDeque::with_capacity(LIMIT);
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        if n == 0 {
+            return Ok(tail.into());
+        }
+        let discard = (tail.len() + n).saturating_sub(LIMIT);
+        tail.drain(..discard);
+        tail.extend(&chunk[..n]);
+    }
+}
+
 impl DockerDriver {
     /// Private durable replay ledger survives connector and shim restarts. A
     /// failed/ambiguous upstream dispatch never refunds an invocation.
@@ -293,6 +314,63 @@ impl DockerDriver {
         tokio::time::timeout(Duration::from_secs(request.timeout_seconds + 15), operation)
             .await
             .map_err(|_| Error::Unavailable)?
+    }
+
+    pub(crate) async fn logs(
+        &self,
+        execution: &ExecutionIdentity,
+        tail: u32,
+        expires_at: u64,
+    ) -> Result<crate::management::LogsResponse> {
+        use base64::Engine as _;
+        let remaining = expires_at.saturating_sub(trusted_router_transport::grants::now());
+        if remaining == 0 || !(1..=5000).contains(&tail) {
+            return Err(Error::Untrusted);
+        }
+        // Bound lock acquisition, ownership checks, and the full read together.
+        tokio::time::timeout(Duration::from_secs(remaining.min(15)), async {
+            let slot = self.slot(execution)?;
+            let _lock = self.lock(&slot).await?;
+            let record = self.owned(&slot, execution)?;
+            if record.phase == Phase::Deleted || Self::container(&slot, &record).await?.is_none() {
+                return Err(Error::Ownership);
+            }
+            let mut child = tokio::process::Command::new("/usr/bin/docker")
+                .arg("--host=unix:///var/run/docker.sock")
+                .args([
+                    "logs",
+                    "--tail",
+                    &tail.to_string(),
+                    "--",
+                    &Self::name(&slot),
+                ])
+                .env_remove("DOCKER_CONTEXT")
+                .env_remove("DOCKER_HOST")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| Error::Unavailable)?;
+            let (stdout, stderr) = tokio::try_join!(
+                log_tail(child.stdout.take().ok_or(Error::Unavailable)?),
+                log_tail(child.stderr.take().ok_or(Error::Unavailable)?),
+            )?;
+            if !child
+                .wait()
+                .await
+                .map_err(|_| Error::Unavailable)?
+                .success()
+            {
+                return Err(Error::Unavailable);
+            }
+            Ok(crate::management::LogsResponse {
+                stdout: base64::engine::general_purpose::STANDARD.encode(stdout),
+                stderr: base64::engine::general_purpose::STANDARD.encode(stderr),
+            })
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
     }
 
     pub(crate) async fn restart(
