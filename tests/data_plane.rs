@@ -69,6 +69,7 @@ async fn real_runtime_drains_network_before_releasing_its_port() {
         exp: grants::now() + 120,
         purpose: Purpose::Register,
         http_request: None,
+        access: None,
         execution: request.execution.clone(),
         service: ServiceId {
             namespace: "film".into(),
@@ -154,6 +155,7 @@ async fn real_runtime_drains_network_before_releasing_its_port() {
         &Grant {
             purpose: Purpose::Access,
             http_request: None,
+            access: None,
             ..grant.clone()
         },
     )

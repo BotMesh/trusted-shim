@@ -6336,7 +6336,7 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-data-router?rev=975a60e0de4c48c88fadfcc6ced154aa01bb1e16#975a60e0de4c48c88fadfcc6ced154aa01bb1e16"
+source = "git+https://github.com/BotMesh/trusted-data-router?rev=2b78922f9dc6074f64657a2b0342573bda271be8#2b78922f9dc6074f64657a2b0342573bda271be8"
 dependencies = [
  "async-trait",
  "axum",

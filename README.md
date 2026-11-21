@@ -282,3 +282,18 @@ Old ingress rules keep their prior behavior and wire representation. Nodes repor
 single-use rule. Admin control routes do not accept body-bound application grants.
 These invocation capabilities enforce application admission and replay protection;
 they are separate from the remote PolicyEngine proof required by trusted actions.
+
+
+### Fleet-managed access identity compatibility
+
+This revision accepts the optional signed `access` claim containing opaque
+principal/session IDs and the approved access-policy version/digest. Relay/Fleet
+own freshness and per-stream revocation; shim still validates the signature,
+exact execution/service and any single-use request/body binding before forwarding.
+This transport policy reference is not a PolicyEngine evaluation proof, and
+consuming a tool action does not generate a second proof. The Docker management
+acceptance covers scoped claims, changed-body rejection and concurrent replay.
+Upgrade shim before enabling `TRUSTED_GATEWAY_ROUTER_ID` in the application
+backend: older parsers reject the additive claim. Legacy grants omit it and
+existing runtimes are not migrated by this update. In managed mode, administrator
+control grants additionally require an enabled Fleet `control` service policy.

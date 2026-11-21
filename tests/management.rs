@@ -72,6 +72,7 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         exp: grants::now() + 120,
         purpose: Purpose::Access,
         http_request: None,
+        access: None,
         execution: request.execution.clone(),
         service: request.services[index].id.clone(),
         policy: PolicyRef {
@@ -272,6 +273,13 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         403
     );
     let mut bound = grant(1);
+    bound.sub = "12".repeat(32);
+    bound.access = Some(trusted_router_transport::authorization::AccessBinding {
+        principal: bound.sub.clone(),
+        session: "34".repeat(32),
+        policy_version: 2,
+        policy_sha256: "56".repeat(32),
+    });
     bound.http_request = Some(trusted_router_transport::grants::HttpRequestBinding {
         id: "aa".repeat(32),
         method: "POST".into(),
