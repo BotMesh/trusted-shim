@@ -32,7 +32,7 @@ enum Command {
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 2 && args[1] == "--capabilities" {
-        println!("{{\"protocol\":1,\"drivers\":[\"docker\"],\"features\":[\"data-plane-v1\"]}}");
+        println!("{{\"protocol\":1,\"drivers\":[\"docker\"],\"features\":[\"data-plane-v1\",\"runtime-management-v1\"]}}");
         return Ok(());
     }
     if args.len() != 5 || args[1] != "--state-dir" || args[3] != "--node-id" {

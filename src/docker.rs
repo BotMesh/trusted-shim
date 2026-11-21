@@ -36,6 +36,8 @@ pub struct DockerOptions {
     pub container_port: Option<u16>,
     pub entrypoint: Option<String>,
     pub stop_timeout_s: Option<u32>,
+    /// HTTP surfaces approved in the existing application manifest.
+    pub ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -59,11 +61,16 @@ struct Record {
     #[serde(default)]
     port: Option<u16>,
     #[serde(default)]
+    allocated_port: bool,
+    #[serde(default)]
     services: Vec<trusted_data_router::ServiceSpec>,
+    #[serde(default)]
+    ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
 }
 
 /// Private state must survive upgrades, deletion and restart. A tombstone fences
 /// old generations; removing this directory while allocations exist is unsafe.
+#[derive(Clone)]
 pub struct DockerDriver {
     state: PathBuf,
     node_id: String,
@@ -82,6 +89,211 @@ fn available<T>(result: std::io::Result<T>) -> Result<T> {
 }
 
 impl DockerDriver {
+    fn allocate_port(&self, execution: &ExecutionIdentity) -> Result<u16> {
+        // Reserve in the durable node state before dropping the OS socket.
+        // Docker receives a fixed mapping, so restarts cannot move the target.
+        for _ in 0..128 {
+            let socket = available(std::net::TcpListener::bind("127.0.0.1:0"))?;
+            let port = available(socket.local_addr())?.port();
+            let path = self.state.join(format!("port-{port}.json"));
+            let mut file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(Error::Unavailable),
+            };
+            available(
+                file.write_all(&serde_json::to_vec(execution).map_err(|_| Error::InvalidContract)?),
+            )?;
+            available(file.sync_all())?;
+            available(File::open(&self.state).and_then(|f| f.sync_all()))?;
+            return Ok(port);
+        }
+        Err(Error::Unavailable)
+    }
+    fn release_port(&self, record: &Record) -> Result<()> {
+        if !record.allocated_port {
+            return Ok(());
+        }
+        let path = self.state.join(format!(
+            "port-{}.json",
+            record.port.ok_or(Error::InvalidContract)?
+        ));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(Error::Unavailable),
+        };
+        let owner: ExecutionIdentity =
+            serde_json::from_slice(&bytes).map_err(|_| Error::InvalidContract)?;
+        // A repeated cleanup may observe this port already assigned elsewhere.
+        // Its old container has been confirmed absent; never touch the new owner.
+        if owner != record.execution {
+            return Ok(());
+        }
+        available(fs::remove_file(path))?;
+        available(File::open(&self.state).and_then(|f| f.sync_all()))
+    }
+    /// Node-administrator access only. All callers must validate a control grant.
+    pub(crate) async fn metadata(&self, execution: &ExecutionIdentity) -> Result<Value> {
+        let slot = self.slot(execution)?;
+        let _lock = self.lock(&slot).await?;
+        let record = self.owned(&slot, execution)?;
+        let container = Self::container(&slot, &record)
+            .await?
+            .ok_or(Error::Ownership)?;
+        if Self::status(&slot, &record, Some(&container))?.state != RuntimeState::Ready {
+            return Err(Error::Ownership);
+        }
+        Ok(
+            json!({"environment":container["Config"]["Env"], "image":container["Config"]["Image"],
+            "user":container["Config"]["User"], "runtime_id":Self::name(&slot)}),
+        )
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        execution: &ExecutionIdentity,
+        request: crate::management::ExecRequest,
+        expires_at: u64,
+    ) -> Result<crate::management::ExecResponse> {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let slot = self.slot(execution)?;
+        let _lock = self.lock(&slot).await?;
+        if trusted_router_transport::grants::now() >= expires_at {
+            return Err(Error::Untrusted);
+        }
+        let record = self.owned(&slot, execution)?;
+        if Self::status(
+            &slot,
+            &record,
+            Self::container(&slot, &record).await?.as_ref(),
+        )?
+        .state
+            != RuntimeState::Ready
+        {
+            return Err(Error::Ownership);
+        }
+        if request.command.is_empty()
+            || request.command.len() > 256
+            || request
+                .command
+                .iter()
+                .any(|s| s.contains('\0') || s.len() > 1024 * 1024)
+            || request.timeout_seconds == 0
+            || request.timeout_seconds > 600
+            || request.user.as_ref().is_some_and(|u| {
+                u.is_empty()
+                    || u.len() > 128
+                    || !u
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_:-".contains(&b))
+            })
+        {
+            return Err(Error::InvalidContract);
+        }
+        let input = base64::engine::general_purpose::STANDARD
+            .decode(&request.stdin)
+            .map_err(|_| Error::InvalidContract)?;
+        const LIMIT: usize = 64 * 1024 * 1024;
+        if input.len() > LIMIT {
+            return Err(Error::InvalidContract);
+        }
+        let mut command = tokio::process::Command::new("/usr/bin/docker");
+        command
+            .arg("--host=unix:///var/run/docker.sock")
+            .args(["exec", "-i"]);
+        if let Some(user) = &request.user {
+            command.args(["--user", user]);
+        }
+        let mut child = command
+            .args([
+                "--",
+                &Self::name(&slot),
+                "timeout",
+                "-s",
+                "TERM",
+                "-k",
+                "5",
+                &request.timeout_seconds.to_string(),
+            ])
+            .args(&request.command)
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_HOST")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| Error::Unavailable)?;
+        let mut stdin = child.stdin.take().ok_or(Error::Unavailable)?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or(Error::Unavailable)?
+            .take(LIMIT as u64 + 1);
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or(Error::Unavailable)?
+            .take(LIMIT as u64 + 1);
+        let operation = async {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let ((), _, _) = tokio::try_join!(
+                async move {
+                    stdin.write_all(&input).await?;
+                    stdin.shutdown().await?;
+                    drop(stdin);
+                    Ok::<(), std::io::Error>(())
+                },
+                stdout.read_to_end(&mut out),
+                stderr.read_to_end(&mut err)
+            )
+            .map_err(|_| Error::Unavailable)?;
+            if out.len() + err.len() > LIMIT {
+                return Err(Error::Unavailable);
+            }
+            let status = child.wait().await.map_err(|_| Error::Unavailable)?;
+            Ok(crate::management::ExecResponse {
+                stdout: base64::engine::general_purpose::STANDARD.encode(out),
+                stderr: base64::engine::general_purpose::STANDARD.encode(err),
+                exit_code: status.code().unwrap_or(-1),
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(request.timeout_seconds + 15), operation)
+            .await
+            .map_err(|_| Error::Unavailable)?
+    }
+
+    pub(crate) async fn restart(
+        &self,
+        execution: &ExecutionIdentity,
+        expires_at: u64,
+    ) -> Result<()> {
+        let slot = self.slot(execution)?;
+        let _lock = self.lock(&slot).await?;
+        if trusted_router_transport::grants::now() >= expires_at {
+            return Err(Error::Untrusted);
+        }
+        let record = self.owned(&slot, execution)?;
+        if record.phase != Phase::Running || Self::container(&slot, &record).await?.is_none() {
+            return Err(Error::Ownership);
+        }
+        Self::docker(&[
+            "restart".into(),
+            "--time".into(),
+            record.stop_timeout_s.to_string(),
+            Self::name(&slot),
+        ])
+        .await?;
+        Ok(())
+    }
+
     fn network_paths(&self, execution: &ExecutionIdentity) -> Result<(PathBuf, PathBuf)> {
         self.slot(execution)?;
         let id = hash(execution)?;
@@ -129,6 +341,7 @@ impl DockerDriver {
             _file: file,
             closed,
             services: record.services,
+            ingress: record.ingress,
             target: std::net::SocketAddr::from((
                 [127, 0, 0, 1],
                 record.port.ok_or(Error::InvalidContract)?,
@@ -348,6 +561,7 @@ impl DockerDriver {
             runtime_id: Self::name(slot),
             state,
             effective_limits,
+            port: r.port,
         })
     }
 
@@ -383,7 +597,7 @@ impl DockerDriver {
             request.driver_options.clone()
         })
         .map_err(|_| Error::InvalidContract)?;
-        if options.port == Some(0)
+        if options.port == Some(0) && options.container_port.is_none()
             || options.container_port == Some(0)
             || options.container_port.is_some() && options.port.is_none()
             || options
@@ -419,7 +633,11 @@ impl DockerDriver {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
                 || !names.insert(&service.id.service)
-                || service.endpoint_ref != "app"
+                || !(service.endpoint_ref == "app" && service.id.service != "control"
+                    || service.endpoint_ref == "control" && service.id.service == "control"
+                    || service.endpoint_ref == format!("ingress:{}", service.id.service)
+                        && service.id.service != "control"
+                        && options.ingress.contains_key(&service.id.service))
                 || options.port.is_none()
                 || !matches!(
                     service.protocol,
@@ -429,6 +647,14 @@ impl DockerDriver {
                 )
             {
                 return Err(Error::Unsupported);
+            }
+        }
+        for ingress in options.ingress.values() {
+            ingress.validate()?;
+            if let Some(env) = &ingress.bearer_env {
+                if !request.environment.get(env).is_some_and(|v| !v.is_empty()) {
+                    return Err(Error::InvalidContract);
+                }
             }
         }
         Ok(options)
@@ -468,7 +694,7 @@ impl DockerDriver {
         if let Some(bytes) = options.shm_bytes {
             args.extend(["--shm-size".into(), bytes.to_string()]);
         }
-        if let Some(port) = options.port {
+        if let Some(port) = r.port {
             args.extend([
                 "--publish".into(),
                 format!(
@@ -532,8 +758,14 @@ impl RuntimeDriver for DockerDriver {
                     limits: request.limits.clone(),
                     phase: Phase::Creating,
                     stop_timeout_s: options.stop_timeout_s.unwrap_or(30),
-                    port: options.port,
+                    port: if options.port == Some(0) {
+                        Some(self.allocate_port(&request.execution)?)
+                    } else {
+                        options.port
+                    },
+                    allocated_port: options.port == Some(0),
                     services: request.services.clone(),
+                    ingress: options.ingress.clone(),
                 };
                 self.save(&slot, &r)?;
                 r
@@ -656,7 +888,9 @@ impl RuntimeDriver for DockerDriver {
                 phase: Phase::Deleted,
                 stop_timeout_s: 30,
                 port: None,
+                allocated_port: false,
                 services: Vec::new(),
+                ingress: Default::default(),
             },
         };
         let _network = self.drain_network(execution).await?;
@@ -678,6 +912,7 @@ impl RuntimeDriver for DockerDriver {
         if Self::container(&slot, &r).await?.is_some() {
             return Err(Error::Unavailable);
         }
+        self.release_port(&r)?;
         Ok(())
     }
 }

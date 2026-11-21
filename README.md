@@ -212,3 +212,11 @@ private registration, distinct host/container ports, active-stream drain and por
 reuse fencing. The CLI advertises `data-plane-v1`; upgrade Fleet's node adapter
 before enabling services. Policy proof and TEE requirements remain independent
 and fail closed when the selected runtime path cannot satisfy them.
+
+### Runtime administration and restricted HTTP ingress
+
+An administrator can declare the reserved `control` service (endpoint `control`) to expose exact-allocation metadata, bounded command execution and in-place restart through the independent data relay. The central connection gateway requires a Fleet administrator credential for this service. The node checks the signed `X-Trusted-Route` grant again, including its exact execution and service. Ordinary application grants cannot access administration. The Docker daemon is never exposed remotely. Exec accepts argv, optional user, base64 stdin and a deadline of at most 600 seconds; it uses the image's `timeout` utility, bounds input/output at 64 MiB and returns base64 stdout/stderr plus an exit code. Callers must not automatically retry a timed-out command. Docker administration does not claim action-policy proof; proof-required launch requests continue to fail closed.
+
+For application ingress, declare `endpoint_ref: ingress:<service>` and a matching `driver_options.ingress` entry with exact `paths`, allowed `methods` and optional `bearer_env`. The node reads that credential from the owned container and injects it into the local HTTP request; the client never receives it. This supports HTTP/SSE and rejects undeclared paths/methods. Use the direct app endpoint for services that need native WebSocket/TCP. Ingress is configured in the existing application manifest, not a second runtime catalog.
+
+`driver_options.port: 0` with `container_port` asks the shim to select and durably reserve a free host loopback port. Docker receives a fixed mapping, so a restart preserves the endpoint. Runtime status reports the assigned port. Reservation records are released only after network drain and confirmed container removal. A conflicting external listener fails launch; no different target is silently selected. Preserve the private state directory across upgrades. A crash before allocation-record persistence can leave a conservative orphan port reservation for operator reconciliation.

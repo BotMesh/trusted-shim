@@ -58,6 +58,7 @@ pub struct RuntimeStatus {
     pub runtime_id: String,
     pub state: RuntimeState,
     pub effective_limits: ResourceLimits,
+    pub port: Option<u16>,
 }
 
 /// One machine, with no node selection or cluster resource allocator.

@@ -37,6 +37,7 @@ pub struct NetworkLease {
     pub(crate) closed: PathBuf,
     pub(crate) services: Vec<ServiceSpec>,
     pub(crate) target: SocketAddr,
+    pub(crate) ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
 }
 impl NetworkLease {
     async fn cancelled(&self) {
@@ -159,12 +160,29 @@ pub async fn serve(
     let lease = driver.network_lease(execution).await?;
     let mut tasks = tokio::task::JoinSet::new();
     let children = CancellationToken::new();
+    let _cancel_on_error = children.clone().drop_guard();
+    let mut servers = Vec::new();
     for service in lease.services.clone() {
         let config = config.clone();
         let verifier = verifier.clone();
         let client = client.clone();
         let execution = execution.clone();
-        let target = lease.target;
+        let target = if service.endpoint_ref == "app" {
+            lease.target
+        } else {
+            let (target, server) = crate::management::bind(
+                driver.clone(),
+                execution.clone(),
+                service.clone(),
+                verifier.clone(),
+                lease.ingress.get(&service.id.service).cloned(),
+                lease.target,
+                children.clone(),
+            )
+            .await?;
+            servers.push(server);
+            target
+        };
         let shutdown = children.clone();
         tasks.spawn(async move {
             let mut backoff = 1;
@@ -206,6 +224,12 @@ pub async fn serve(
     tokio::select! { _ = stop.cancelled() => {}, _ = lease.cancelled() => {}, _ = monitor => {}, _ = tasks.join_next() => {} }
     children.cancel();
     while tasks.join_next().await.is_some() {}
+    // Transport streams are closed before releasing the port. Cancel idle HTTP
+    // servers too; lifecycle ownership locks fence any queued administration.
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
     // Only now can cleanup acquire the network lock and reassign the host port.
     drop(lease);
     Ok(())

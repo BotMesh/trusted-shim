@@ -30,9 +30,11 @@ trusted-rail = { git = "https://github.com/BotMesh/trusted-rail", rev = "83162e6
 
 fs2 = "0.4"
 tempfile = "3"
-trusted-router-transport = { git = "https://github.com/BotMesh/trusted-data-router", rev = "cd17f29a34f361ad9924c526ccb10cf7882dde32" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+trusted-router-transport = { git = "https://github.com/BotMesh/trusted-data-router", rev = "99b28bb9e7a56afbaf7e6c95f19bd2957f3db1c4" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+axum = "0.8"
+base64 = "0.22"
 
 [profile.dev]
 debug = 0
@@ -43,7 +45,6 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }
-axum = "0.8"
 futures = "0.3"
 
 [[example]]
