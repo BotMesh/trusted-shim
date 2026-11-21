@@ -116,9 +116,9 @@ implementations or evidence of successful remote proving. The feature audit must
 also run in downstream binaries to prevent widening Regorus's deterministic profile.
 
 `DockerDriver` implements the machine-local `RuntimeDriver`; `AttestationVerifier`
-and router `Connector` remain interfaces.
+remains an interface; the concrete data-plane adapter owns outbound connectors.
 TEE evidence verification and its separate proof guest, central ledger storage,
-OpenShell/TEE drivers, non-bypassable enforcement, data transport and backend
+OpenShell/TEE drivers, non-bypassable enforcement and backend
 integration follow separately. Non-TEE attestation remains `SkippedNonTee`;
 requiring an attestation proof for that outcome is invalid. No permissive fallback
 or local prover is included.
@@ -141,7 +141,7 @@ local Unix socket; install the binary only for the trusted machine adapter.
 
 This lifecycle path accepts only explicit non-TEE, no-proof requests. It rejects
 policy-proof requirements, attestation requirements, unsupported driver options
-and router services rather than dropping them. Plain Docker is not an agent
+and unsupported router service mappings rather than dropping them. Plain Docker is not an agent
 shell policy boundary. Connect proof-required admission and upstream OpenShell
 before advertising those guarantees; the proven PolicyEngine is unchanged.
 
@@ -174,3 +174,41 @@ cargo test --locked --test docker -- --ignored
 
 It covers concurrent idempotent launch, hard limits, process recovery, request
 substitution, stale cleanup, tombstones and refusal to recreate a lost execution.
+
+## Outbound service connections
+
+Declare services in the existing `LaunchRequest.services`. The Docker adapter
+accepts approved `endpoint_ref: app` mappings with matching namespace/workload,
+a unique service name and HTTP/1, WebSocket or TCP protocol. Persist the resolved
+loopback port with the allocation. `container_port` can differ from the host
+port, and an explicit `entrypoint` supports existing agent images. These options
+are validated before Docker runs; they do not enable arbitrary Docker flags.
+
+The node supervisor runs a second long-lived stdio command:
+`{"operation":"network","execution":...,"config":...}`. `NetworkConfig` is
+node-owned data taken from Fleet's existing apps.yaml: `gateway_url`, `relay_url`,
+`token_file`, `public_key_file` and `issuer`. It is not a second runtime catalog.
+The central gateway's authenticated `POST /v1/runtime/registration` accepts
+`{"execution":...,"service":...}` and returns `{"token":"..."}` after checking
+the live allocation and approved policy. This increment supplies that client;
+the production registration gateway is a separate integration. A local test
+issuer does not substitute for production authorization.
+
+Shim verifies the Ed25519 registration grant, exact execution/service, issuer,
+audience and expiry before dialing the fixed relay. Gateway HTTP and relay WS
+must use TLS except numeric loopback tests. Redirects are disabled, responses are
+bounded and node credentials are read only from an explicitly named private file.
+No token value is placed in process arguments or runtime environment variables.
+
+The connector holds a per-execution network lock. Stop/delete durably fence new
+connectors and wait for every stream to close before stopping/removing the runtime
+or permitting port reuse. A failed drain leaves cleanup unconfirmed. Connection
+loss never restarts the container. Expiring credentials are refreshed through the
+central gateway, and reconnect never replays application requests. Applications
+must tolerate failed in-flight streams when a connection or grant expires.
+
+Validation includes a real Docker HTTP/SSE service across the independent relay,
+private registration, distinct host/container ports, active-stream drain and port
+reuse fencing. The CLI advertises `data-plane-v1`; upgrade Fleet's node adapter
+before enabling services. Policy proof and TEE requirements remain independent
+and fail closed when the selected runtime path cannot satisfy them.

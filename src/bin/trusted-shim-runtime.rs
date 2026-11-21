@@ -11,16 +11,28 @@ use trusted_shim::{
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
-    Launch { request: Box<LaunchRequest> },
-    Inspect { execution: ExecutionIdentity },
-    Stop { execution: ExecutionIdentity },
-    Delete { execution: ExecutionIdentity },
+    Launch {
+        request: Box<LaunchRequest>,
+    },
+    Inspect {
+        execution: ExecutionIdentity,
+    },
+    Stop {
+        execution: ExecutionIdentity,
+    },
+    Delete {
+        execution: ExecutionIdentity,
+    },
+    Network {
+        execution: ExecutionIdentity,
+        config: trusted_shim::data_plane::NetworkConfig,
+    },
 }
 
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 2 && args[1] == "--capabilities" {
-        println!("{{\"protocol\":1,\"drivers\":[\"docker\"]}}");
+        println!("{{\"protocol\":1,\"drivers\":[\"docker\"],\"features\":[\"data-plane-v1\"]}}");
         return Ok(());
     }
     if args.len() != 5 || args[1] != "--state-dir" || args[3] != "--node-id" {
@@ -48,6 +60,19 @@ async fn run() -> Result<()> {
         Command::Delete { execution } => {
             driver.delete(&execution).await?;
             serde_json::json!({"cleaned":true})
+        }
+        Command::Network { execution, config } => {
+            let stop = tokio_util::sync::CancellationToken::new();
+            let signal = stop.clone();
+            tokio::spawn(async move {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("signal");
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+                signal.cancel();
+            });
+            trusted_shim::data_plane::serve(&driver, &execution, &config, stop).await?;
+            serde_json::json!({"disconnected":true})
         }
     };
     let mut output = std::io::stdout().lock();

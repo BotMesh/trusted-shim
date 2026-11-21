@@ -33,6 +33,8 @@ pub struct DockerOptions {
     pub shm_bytes: Option<u64>,
     /// A single service port, published only on host loopback.
     pub port: Option<u16>,
+    pub container_port: Option<u16>,
+    pub entrypoint: Option<String>,
     pub stop_timeout_s: Option<u32>,
 }
 
@@ -54,6 +56,10 @@ struct Record {
     limits: ResourceLimits,
     phase: Phase,
     stop_timeout_s: u32,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    services: Vec<trusted_data_router::ServiceSpec>,
 }
 
 /// Private state must survive upgrades, deletion and restart. A tombstone fences
@@ -76,6 +82,96 @@ fn available<T>(result: std::io::Result<T>) -> Result<T> {
 }
 
 impl DockerDriver {
+    fn network_paths(&self, execution: &ExecutionIdentity) -> Result<(PathBuf, PathBuf)> {
+        self.slot(execution)?;
+        let id = hash(execution)?;
+        Ok((
+            self.state.join(format!("{id}.network.lock")),
+            self.state.join(format!("{id}.network.closed")),
+        ))
+    }
+
+    /// Hold the connector's lock until every stream is joined. Cleanup first
+    /// writes its permanent fence, then waits for this lock before port reuse.
+    pub async fn network_lease(
+        &self,
+        execution: &ExecutionIdentity,
+    ) -> Result<crate::data_plane::NetworkLease> {
+        let slot = self.slot(execution)?;
+        let _lock = self.lock(&slot).await?;
+        let record = self.owned(&slot, execution)?;
+        if record.services.is_empty()
+            || Self::status(
+                &slot,
+                &record,
+                Self::container(&slot, &record).await?.as_ref(),
+            )?
+            .state
+                != RuntimeState::Ready
+        {
+            return Err(Error::Ownership);
+        }
+        let (path, closed) = self.network_paths(execution)?;
+        let file = available(
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(path),
+        )?;
+        file.try_lock_exclusive().map_err(|_| Error::Ownership)?;
+        if closed.try_exists().map_err(|_| Error::Unavailable)? {
+            return Err(Error::Ownership);
+        }
+        Ok(crate::data_plane::NetworkLease {
+            _file: file,
+            closed,
+            services: record.services,
+            target: std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                record.port.ok_or(Error::InvalidContract)?,
+            )),
+        })
+    }
+
+    async fn drain_network(&self, execution: &ExecutionIdentity) -> Result<File> {
+        let (path, closed) = self.network_paths(execution)?;
+        let tombstone = available(
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .open(closed),
+        )?;
+        available(tombstone.sync_all())?;
+        available(File::open(&self.state).and_then(|f| f.sync_all()))?;
+        let file = available(
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(path),
+        )?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(file),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await
+                }
+                Err(_) => return Err(Error::Unavailable),
+            }
+        }
+    }
+
     pub fn new(state: impl Into<PathBuf>, node_id: String) -> Result<Self> {
         let state = state.into();
         if !state.is_absolute() || node_id.is_empty() {
@@ -260,7 +356,6 @@ impl DockerDriver {
             || request.trust.attestation != AttestationRequirement::SkipNonTee
             || request.trust.attestation_proof != ProofRequirement::NotRequired
             || request.trust.policy_proof != ProofRequirement::NotRequired
-            || !request.services.is_empty()
         {
             return Err(Error::Unsupported);
         }
@@ -289,6 +384,12 @@ impl DockerDriver {
         })
         .map_err(|_| Error::InvalidContract)?;
         if options.port == Some(0)
+            || options.container_port == Some(0)
+            || options.container_port.is_some() && options.port.is_none()
+            || options
+                .entrypoint
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.contains('\0'))
             || options.stop_timeout_s.is_some_and(|n| n > 90)
             || options.gpus.iter().any(|id| {
                 id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -305,6 +406,30 @@ impl DockerDriver {
                 .any(|s| !s.starts_with('/') || !s.contains(":"))
         {
             return Err(Error::InvalidContract);
+        }
+        let mut names = std::collections::HashSet::new();
+        for service in &request.services {
+            if service.id.namespace != request.execution.namespace
+                || service.id.workload != request.execution.workload
+                || service.id.service.is_empty()
+                || service.id.service.len() > 64
+                || !service
+                    .id
+                    .service
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                || !names.insert(&service.id.service)
+                || service.endpoint_ref != "app"
+                || options.port.is_none()
+                || !matches!(
+                    service.protocol,
+                    trusted_data_router::Protocol::Http1
+                        | trusted_data_router::Protocol::WebSocket
+                        | trusted_data_router::Protocol::Tcp
+                )
+            {
+                return Err(Error::Unsupported);
+            }
         }
         Ok(options)
     }
@@ -344,7 +469,16 @@ impl DockerDriver {
             args.extend(["--shm-size".into(), bytes.to_string()]);
         }
         if let Some(port) = options.port {
-            args.extend(["--publish".into(), format!("127.0.0.1:{port}:{port}")]);
+            args.extend([
+                "--publish".into(),
+                format!(
+                    "127.0.0.1:{port}:{}",
+                    options.container_port.unwrap_or(port)
+                ),
+            ]);
+        }
+        if let Some(entrypoint) = &options.entrypoint {
+            args.extend(["--entrypoint".into(), entrypoint.clone()]);
         }
         if let Some(user) = &options.user {
             args.extend(["--user".into(), user.clone()]);
@@ -398,6 +532,8 @@ impl RuntimeDriver for DockerDriver {
                     limits: request.limits.clone(),
                     phase: Phase::Creating,
                     stop_timeout_s: options.stop_timeout_s.unwrap_or(30),
+                    port: options.port,
+                    services: request.services.clone(),
                 };
                 self.save(&slot, &r)?;
                 r
@@ -481,6 +617,7 @@ impl RuntimeDriver for DockerDriver {
         let slot = self.slot(execution)?;
         let _lock = self.lock(&slot).await?;
         let mut r = self.owned(&slot, execution)?;
+        let _network = self.drain_network(execution).await?;
         if r.phase != Phase::Deleted {
             r.phase = Phase::Stopped;
             self.save(&slot, &r)?;
@@ -518,8 +655,11 @@ impl RuntimeDriver for DockerDriver {
                 },
                 phase: Phase::Deleted,
                 stop_timeout_s: 30,
+                port: None,
+                services: Vec::new(),
             },
         };
+        let _network = self.drain_network(execution).await?;
         // Fence even a launch that has not reached this machine yet.
         r.phase = Phase::Deleted;
         self.save(&slot, &r)?;
