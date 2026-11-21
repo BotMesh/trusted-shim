@@ -17,3 +17,7 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-features
       - run: python3 scripts/check_engine_features.py
+      - name: Verify real Docker lifecycle and hard limits
+        run: |
+          docker pull alpine:3.21
+          cargo test --locked --test docker -- --ignored

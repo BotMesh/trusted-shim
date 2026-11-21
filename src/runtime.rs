@@ -26,6 +26,8 @@ pub struct TrustRequirements {
 /// Built from existing app manifests by an authorized control-plane adapter.
 /// `driver` identifies runtime infrastructure, not agent business logic. Environment
 /// may contain credentials, so the launch request deliberately has no Debug impl.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchRequest {
     pub execution: ExecutionIdentity,
     pub driver: String,
@@ -36,9 +38,12 @@ pub struct LaunchRequest {
     pub policy: PolicyRef,
     pub trust: TrustRequirements,
     pub services: Vec<ServiceSpec>,
+    #[serde(default)]
+    pub driver_options: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RuntimeState {
     Starting,
     Ready,
@@ -47,7 +52,7 @@ pub enum RuntimeState {
     Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub execution: ExecutionIdentity,
     pub runtime_id: String,

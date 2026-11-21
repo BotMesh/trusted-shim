@@ -115,9 +115,10 @@ verifier. Test ledgers and proof networks are orchestration doubles, not product
 implementations or evidence of successful remote proving. The feature audit must
 also run in downstream binaries to prevent widening Regorus's deterministic profile.
 
-`RuntimeDriver`, `AttestationVerifier` and router `Connector` remain interfaces.
+`DockerDriver` implements the machine-local `RuntimeDriver`; `AttestationVerifier`
+and router `Connector` remain interfaces.
 TEE evidence verification and its separate proof guest, central ledger storage,
-Docker/OpenShell drivers, non-bypassable enforcement, data transport and backend
+OpenShell/TEE drivers, non-bypassable enforcement, data transport and backend
 integration follow separately. Non-TEE attestation remains `SkippedNonTee`;
 requiring an attestation proof for that outcome is invalid. No permissive fallback
 or local prover is included.
@@ -127,3 +128,49 @@ ACK support. Fleet's runtime adapter will delegate container hard limits to shim
 ([zkm-fleet #95](https://github.com/ProjectZKM/zkm-fleet/issues/95)). Film and ClawUp
 will share the independent data transport. This increment builds on framework
 PR #1 and pins companion repository commits for reproducibility.
+
+
+## Opt-in Docker lifecycle
+
+Build `cargo build --locked --bin trusted-shim-runtime`. Fleet selects the binary
+and a private persistent state directory in its existing node configuration. The
+binary accepts one JSON control request on stdin and returns bounded metadata on
+stdout; it has no network listener. `--capabilities` reports protocol 1 and the
+Docker driver. Docker is invoked directly through `/usr/bin/docker` against the
+local Unix socket; install the binary only for the trusted machine adapter.
+
+This lifecycle path accepts only explicit non-TEE, no-proof requests. It rejects
+policy-proof requirements, attestation requirements, unsupported driver options
+and router services rather than dropping them. Plain Docker is not an agent
+shell policy boundary. Connect proof-required admission and upstream OpenShell
+before advertising those guarantees; the proven PolicyEngine is unchanged.
+
+CPU millicores and memory bytes become Docker hard limits, checked before start
+and on inspect. The driver requires daemon support for the requested cgroup limits;
+the Docker acceptance test also reads CPU/memory limits from the live cgroup. Memory swap is limited to the same total. GPU ids come from the
+allocator. Published service ports bind host loopback only. Images must already
+be present; this driver does not pull images. Bind mounts are administrator
+settings. Environment is passed in a mode-0600 temporary env file, never argv;
+multiline env values are rejected. Local host administrators and Docker owners
+remain trusted.
+
+Each allocation has an exclusive file lock, atomically fsynced journal and Docker
+ownership labels binding the complete request and execution. Recovery reuses the
+same container; changed requests, stale leases and generations are rejected.
+Stopped/deleted generations stay fenced by tombstones. A missing started container
+or an ambiguous pending start is not automatically rerun: confirm cleanup and
+allocate a new generation explicitly. Cleanup checks ownership and actual daemon
+state before acknowledging release. Keep both Fleet's allocation journal and
+shim's state across restarts and upgrades; never delete them to retry an operation.
+A crashed process can leave a private temporary env file; protect the state directory
+with the same access and retention controls as runtime credentials.
+
+Run real Docker acceptance separately (only test containers are created/removed):
+
+```sh
+docker pull alpine:3.21
+cargo test --locked --test docker -- --ignored
+```
+
+It covers concurrent idempotent launch, hard limits, process recovery, request
+substitution, stale cleanup, tombstones and refusal to recreate a lost execution.

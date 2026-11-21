@@ -2,10 +2,12 @@
 //!
 //! Policy admission evaluates Rego, requests a remote proof, verifies its exact
 //! public values and consumes a central ledger grant before dispatch. Runtime
-//! drivers and attestation adapters remain interfaces. There is no local prover.
+//! lifecycle includes an opt-in Docker driver. Attestation and OpenShell adapters
+//! remain interfaces. There is no local prover.
 
 pub mod admission;
 pub mod attestation;
+pub mod docker;
 pub mod network;
 pub mod proof;
 pub mod runtime;
