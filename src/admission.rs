@@ -172,6 +172,27 @@ impl AuthorizedExecutor {
         Self { ledger, handler }
     }
 }
+
+/// Shared exact-request checks for native execution boundaries. The caller must
+/// still consume the grant at the central ledger before dispatching a mutation.
+pub(crate) fn execution_digest(
+    request: &EvaluationRequest,
+    grant: &ExecutionGrant,
+) -> Result<String> {
+    current(&request.validity)?;
+    current(&grant.validity)?;
+    let digest = request_digest(request).map_err(|_| Error::InvalidContract)?;
+    if grant.id.is_empty()
+        || grant.credential.is_empty()
+        || grant.execution != request.execution
+        || grant.request_sha256 != digest
+        || grant.validity.not_before < request.validity.not_before
+        || grant.validity.expires_at > request.validity.expires_at
+    {
+        return Err(Error::Untrusted);
+    }
+    Ok(digest)
+}
 #[async_trait]
 impl ActionExecutor for AuthorizedExecutor {
     async fn execute(
@@ -179,18 +200,7 @@ impl ActionExecutor for AuthorizedExecutor {
         request: &EvaluationRequest,
         grant: &ExecutionGrant,
     ) -> Result<Vec<u8>> {
-        current(&request.validity)?;
-        current(&grant.validity)?;
-        let digest = request_digest(request).map_err(|_| Error::InvalidContract)?;
-        if grant.id.is_empty()
-            || grant.credential.is_empty()
-            || grant.execution != request.execution
-            || grant.request_sha256 != digest
-            || grant.validity.not_before < request.validity.not_before
-            || grant.validity.expires_at > request.validity.expires_at
-        {
-            return Err(Error::Untrusted);
-        }
+        let digest = execution_digest(request, grant)?;
         self.ledger
             .consume(grant, &request.execution, &digest)
             .await

@@ -6336,7 +6336,7 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-data-router?rev=2b78922f9dc6074f64657a2b0342573bda271be8#2b78922f9dc6074f64657a2b0342573bda271be8"
+source = "git+https://github.com/BotMesh/trusted-data-router?rev=c5ef05076ef62a2073110aa295d967d6e6f5d573#c5ef05076ef62a2073110aa295d967d6e6f5d573"
 dependencies = [
  "async-trait",
  "axum",
@@ -6346,6 +6346,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken 9.3.1",
+ "libc",
+ "pem 3.0.6",
  "reqwest",
  "rusqlite",
  "serde",

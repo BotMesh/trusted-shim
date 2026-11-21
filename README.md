@@ -65,7 +65,8 @@ machine's authorized executions. The independent router carries service payloads
 Fleet's control plane owns infrastructure policy and service grants. Application
 backends retain their own user/session and API-key authorization. OpenShell is
 called through upstream interfaces for native isolation, without forking it;
-its durable runtime lifecycle and centralized policy integration are not yet wired.
+its durable provisioning adapter is implemented, while centralized native
+gateway preparation and application readiness are not yet wired into Fleet.
 
 ## Policy admission
 
@@ -188,20 +189,42 @@ protobufs at commit `ce58cf8e9b953281352d98a637e41616295b1318`.
 `openshell::NativeDriver` connects to a private same-UID Unix socket, negotiates
 the upstream extension contract and checks the operator's resource admission
 policy and CPU/memory limit capabilities. `NativeCreate` binds the native policy
-hash, namespace, image, command, environment and hard limits to the approved
-launch inputs. Unmapped GPU, identity, namespace and platform options fail closed.
+hash, namespace/workspace, image, command, environment and hard limits to the
+approved launch inputs. Fleet/Ray own resource requests; the native Docker
+driver receives only hard limits because it rejects resource request fields. Unmapped GPU, identity, namespace and platform options fail closed.
 Inspect, stop and delete require the exact sandbox ID and name; deletion is
 confirmed by a subsequent lookup. Mutations are never automatically retried.
 
-This is a transport client, not an enabled Fleet runtime driver. The caller must
-persist allocation ownership, bind all native launch inputs to its authorization,
-consume any required proof-backed grant, and privately deliver the central
-gateway's split launch credentials before create. Those credentials must never
-enter an ordinary Fleet App spec, workload environment or public response.
-Fleet activation, durable native lifecycle ownership and application endpoint
-routing still need integration. The runtime CLI continues to advertise Docker
-only. Tests use an upstream-protocol test server; they do not establish native
-OpenShell isolation or an end-to-end policy proof.
+`openshell_lifecycle::ManagedNativeDriver` adds durable allocation ownership,
+native sandbox ID/name claims and generation tombstones. The gateway first
+prepares the native sandbox and a Rail `runtime.create` evaluation whose
+resource and parameters come from `NativeCreate::authorization_resource` and
+`authorization_parameters`. These bind the complete launch input, native policy
+and exact private protobuf bytes. After remote proof verification, the adapter
+consumes the resulting exact-request grant at the central ledger before calling
+native create. The ledger must be reached through an authenticated gateway client
+on a node; its authoritative database must never be copied onto an untrusted node.
+
+SQLite stores only ownership, commitments and lifecycle state, without native
+credentials, environment or the grant. A replay after restart only observes the
+original sandbox. An unanswered create is never resubmitted, and an absent
+snapshot cannot release its reservation while the create may still be in flight.
+Stop and delete verify persisted ownership and confirm their outcome; failed
+cleanup retains the allocation. Old generations and reused sandbox identities
+remain fenced after deletion. A changed physical instance is rejected.
+
+This adapter proves provisioning admission only. It does not claim that platform
+`Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
+or provide TEE attestation. Native gateway preparation, authenticated central
+ledger transport, Fleet activation and application endpoint readiness still need
+integration. Native split credentials must never enter an ordinary Fleet App
+spec, workload environment or public response. The runtime CLI advertises Docker
+only, and the adapter rejects application services and action-proof-required
+requests until those boundaries are connected. Tests use an upstream-protocol
+test server. The ignored native admission test also calls the pinned, unmodified
+Docker compute-driver binary to check capabilities, real input validation and
+operator policy mismatch. Neither test establishes full OpenShell isolation or
+an end-to-end provisioning proof.
 
 Proof-required admission waits for remote verification before dispatch. Applying
 that mode to every serial tool call adds the proof network's queue, proving and
@@ -341,3 +364,11 @@ Upgrade shim before enabling `TRUSTED_GATEWAY_ROUTER_ID` in the application
 backend: older parsers reject the additive claim. Legacy grants omit it and
 existing runtimes are not migrated by this update. In managed mode, administrator
 control grants additionally require an enabled Fleet `control` service policy.
+
+The existing `public_key_file` in Fleet node network settings accepts a bounded
+Ed25519 PEM bundle and is reloaded for each new ingress authorization. Stage
+old+new public keys on every shim, relay and gateway before switching the central
+signer; remove the old key after replacing node enrollment credentials and
+allowing old route grants to expire. Use atomic file replacement and mode 0644
+or stricter. Runtime containers, ports and existing streams survive this update;
+stream expiry and Fleet revocation remain in force.

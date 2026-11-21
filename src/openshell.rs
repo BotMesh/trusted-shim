@@ -9,6 +9,7 @@ use openshell_core::{
     proto::compute::v1::{compute_driver_client::ComputeDriverClient, *},
 };
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -27,7 +28,28 @@ pub struct NativeDriver {
 /// Exact upstream provisioning bytes, delivered by the central OpenShell
 /// gateway after it mints split launch authentication. Deliberately no Debug.
 pub struct NativeCreate {
-    sandbox: DriverSandbox,
+    pub(crate) sandbox: DriverSandbox,
+    pub(crate) launch_sha256: String,
+    pub(crate) native_sha256: String,
+    pub(crate) policy_sha256: String,
+}
+
+/// Keep native negotiation/validation before central grant consumption, leaving
+/// only the mutation itself after the last authorization freshness check.
+pub(crate) struct NativeDispatch {
+    client: ComputeDriverClient<Channel>,
+    approved: NativeCreate,
+}
+impl NativeDispatch {
+    pub(crate) async fn send(mut self) -> Result<()> {
+        self.client
+            .create_sandbox(CreateSandboxRequest {
+                sandbox: Some(self.approved.sandbox),
+            })
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        Ok(())
+    }
 }
 
 fn private_socket(path: &Path) -> Result<()> {
@@ -80,6 +102,7 @@ impl NativeCreate {
             || sandbox.name.is_empty()
             || sandbox.status.is_some()
             || sandbox.namespace != request.execution.namespace
+            || sandbox.workspace != request.execution.namespace
             || template.image != request.image
             || spec.command != request.command
             || spec
@@ -92,9 +115,11 @@ impl NativeCreate {
             || spec.launch_authentication.is_empty()
             || spec.sandbox_token.is_empty()
             || limits.cpu_limit != format!("{cpu}m")
-            || limits.cpu_request != limits.cpu_limit
+            // Fleet/Ray own scheduling requests. The native Docker compute
+            // driver accepts hard limits and rejects Kubernetes-style requests.
+            || !limits.cpu_request.is_empty()
             || limits.memory_limit != memory.to_string()
-            || limits.memory_request != limits.memory_limit
+            || !limits.memory_request.is_empty()
         {
             return Err(Error::Untrusted);
         }
@@ -117,7 +142,13 @@ impl NativeCreate {
         {
             return Err(Error::Unsupported);
         }
-        Ok(Self { sandbox })
+        Ok(Self {
+            sandbox,
+            launch_sha256: trusted_rail::rego::commitment("trusted-shim.launch.v1", request)
+                .map_err(|_| Error::InvalidContract)?,
+            native_sha256: hex::encode(Sha256::digest(bytes)),
+            policy_sha256: policy_sha256.into(),
+        })
     }
 }
 
@@ -181,6 +212,10 @@ impl NativeDriver {
     /// authorization before this mutation. A timeout is ambiguous: inspect the
     /// same sandbox ID; never silently retry or replace it with a new sandbox.
     pub async fn create(&self, approved: NativeCreate) -> Result<()> {
+        self.prepare_dispatch(approved).await?.send().await
+    }
+
+    pub(crate) async fn prepare_dispatch(&self, approved: NativeCreate) -> Result<NativeDispatch> {
         let mut client = self.client().await?;
         client
             .validate_sandbox_create(ValidateSandboxCreateRequest {
@@ -188,12 +223,18 @@ impl NativeDriver {
             })
             .await
             .map_err(|_| Error::Untrusted)?;
-        client
-            .create_sandbox(CreateSandboxRequest {
-                sandbox: Some(approved.sandbox),
+        Ok(NativeDispatch { client, approved })
+    }
+
+    /// Read-only admission check; never consumes a grant or creates resources.
+    pub async fn validate(&self, approved: &NativeCreate) -> Result<()> {
+        self.client()
+            .await?
+            .validate_sandbox_create(ValidateSandboxCreateRequest {
+                sandbox: Some(approved.sandbox.clone()),
             })
             .await
-            .map_err(|_| Error::Unavailable)?;
+            .map_err(|_| Error::Untrusted)?;
         Ok(())
     }
 

@@ -35,11 +35,8 @@ pub struct NetworkConfig {
 pub(crate) fn validate_config(config: &NetworkConfig) -> Result<()> {
     endpoint(&config.gateway_url, "https", "http")?;
     endpoint(&config.relay_url, "wss", "ws")?;
-    Verifier::new(
-        &std::fs::read(&config.public_key_file).map_err(|_| Error::Unavailable)?,
-        config.issuer.clone(),
-    )
-    .map_err(|_| Error::InvalidContract)?;
+    Verifier::from_file(config.public_key_file.clone(), config.issuer.clone())
+        .map_err(|_| Error::InvalidContract)?;
     read_private(&config.token_file)?;
     Ok(())
 }
@@ -218,11 +215,8 @@ pub async fn serve(
 ) -> Result<()> {
     endpoint(&config.gateway_url, "https", "http")?;
     endpoint(&config.relay_url, "wss", "ws")?;
-    let verifier = Verifier::new(
-        &std::fs::read(&config.public_key_file).map_err(|_| Error::Unavailable)?,
-        config.issuer.clone(),
-    )
-    .map_err(|_| Error::InvalidContract)?;
+    let verifier = Verifier::from_file(config.public_key_file.clone(), config.issuer.clone())
+        .map_err(|_| Error::InvalidContract)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))

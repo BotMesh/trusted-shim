@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use serde_json::json;
-use std::{process::Command, time::Duration};
+use std::{os::unix::fs::PermissionsExt, process::Command, time::Duration};
 use tokio_util::sync::CancellationToken;
 use trusted_router_transport::grants::{self, Grant, Purpose, Verifier};
 use trusted_shim::{
@@ -31,7 +31,8 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         .unwrap()
         .success());
     let key = std::fs::read(keyfile).unwrap();
-    let verifier = Verifier::new(&std::fs::read(public).unwrap(), "test".into()).unwrap();
+    std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let verifier = Verifier::from_file(public.clone(), "test".into()).unwrap();
     let request:LaunchRequest=serde_json::from_value(json!({
         "execution":{"namespace":"clawup","workload":"agent-test","allocation_id":tmp.path().file_name().unwrap().to_string_lossy(),"lease_id":"lease","generation":1,"node_id":"local"},
         "driver":"docker","image":"python:3.12-slim","command":["python","-u","-c",
@@ -82,7 +83,7 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
             sha256: "ab".repeat(32),
         },
     };
-    let control = grants::sign(&key, &grant(0)).unwrap();
+    let mut control = grants::sign(&key, &grant(0)).unwrap();
     let chat = grants::sign(&key, &grant(1)).unwrap();
     let stop = CancellationToken::new();
     let target = ([127, 0, 0, 1], port).into();
@@ -396,6 +397,70 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         driver.inspect(&request.execution).await.unwrap().port,
         before
     );
+    // The running shim listeners must reload the existing trust file too;
+    // accepting a new relay signer only at the relay would break node ingress.
+    let next_key = tmp.path().join("next-key");
+    let next_public = tmp.path().join("next-public");
+    assert!(Command::new("openssl")
+        .args(["genpkey", "-algorithm", "ED25519", "-out"])
+        .arg(&next_key)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("openssl")
+        .args(["pkey", "-in"])
+        .arg(&next_key)
+        .args(["-pubout", "-out"])
+        .arg(&next_public)
+        .status()
+        .unwrap()
+        .success());
+    let next = grants::sign(&std::fs::read(next_key).unwrap(), &grant(0)).unwrap();
+    assert_eq!(
+        http.get(format!("http://{admin}/metadata"))
+            .header("x-trusted-route", &next)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let old_public = std::fs::read(&public).unwrap();
+    let new_public = std::fs::read(next_public).unwrap();
+    let replace = |bytes: &[u8]| {
+        use std::io::Write;
+        let mut temp = tempfile::NamedTempFile::new_in(tmp.path()).unwrap();
+        temp.write_all(bytes).unwrap();
+        temp.as_file().sync_all().unwrap();
+        temp.persist(&public).unwrap();
+    };
+    replace(&[old_public.as_slice(), new_public.as_slice()].concat());
+    for token in [&control, &next] {
+        assert_eq!(
+            http.get(format!("http://{admin}/metadata"))
+                .header("x-trusted-route", token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    replace(&new_public);
+    assert_eq!(
+        http.get(format!("http://{admin}/metadata"))
+            .header("x-trusted-route", &control)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        driver.inspect(&request.execution).await.unwrap().port,
+        before
+    );
+    control = next;
     driver.delete(&request.execution).await.unwrap();
     assert!(!tmp
         .path()
