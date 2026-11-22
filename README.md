@@ -296,6 +296,14 @@ decoded 32-byte program key (`vk.bytes32()`), not the global Groth16 circuit key
 trusted-rail's guest checker produces both values through upstream static machine
 setup. Guest, checker, verifier and Fleet prover image revisions must agree.
 
+Rail's v2 evaluator profile includes checked collection-index conversions for
+matching native/MIPS decisions. Roll out the native evaluator, guest ELF, approved
+program key and explicitly approved policy revisions together. Old profiles fail
+closed; existing stored policies and receipts are not silently rewritten. Run
+`scripts/check_engine_features.py` in every consumer build to audit the exact
+evaluator source and Cargo features. A previous remote proof does not validate
+the new ELF; repeat network acceptance before enabling it.
+
 ## Remote acceptance test
 
 First build trusted-rail's guest and run its native/MIPS differential checker.

@@ -5432,8 +5432,7 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 [[package]]
 name = "regorus"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "463ad781640cf7750bfc84b22cda8dffd529feb10d058d8796e2200e7209dfe7"
+source = "git+https://github.com/attestx/regorus?rev=1bbb3e6798c85e4b30b298fad9b8fc207e8480cc#1bbb3e6798c85e4b30b298fad9b8fc207e8480cc"
 dependencies = [
  "anyhow",
  "lazy_static",
@@ -7302,7 +7301,7 @@ dependencies = [
 [[package]]
 name = "trusted-rail"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-rail?rev=83162e68e9634ab33e00467fa1b622920cf51b92#83162e68e9634ab33e00467fa1b622920cf51b92"
+source = "git+https://github.com/BotMesh/trusted-rail?rev=9a9aa5cd493a9b81ba8c3ef8347afd5f9871737e#9a9aa5cd493a9b81ba8c3ef8347afd5f9871737e"
 dependencies = [
  "async-trait",
  "hex",
@@ -7317,7 +7316,7 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-data-router?rev=cc7e9b5840ba8d2c353a619fd3f3b8c148cfb2a9#cc7e9b5840ba8d2c353a619fd3f3b8c148cfb2a9"
+source = "git+https://github.com/BotMesh/trusted-data-router?rev=a90f901a31dc6672686190b8236260d25a6e16a8#a90f901a31dc6672686190b8236260d25a6e16a8"
 dependencies = [
  "async-trait",
  "axum",
