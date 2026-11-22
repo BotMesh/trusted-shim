@@ -19,7 +19,9 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly-2026-09-17
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-17
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
         run: |
