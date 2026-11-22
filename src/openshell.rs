@@ -9,6 +9,7 @@ use openshell_core::{
     proto::compute::v1::{compute_driver_client::ComputeDriverClient, *},
 };
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -27,7 +28,28 @@ pub struct NativeDriver {
 /// Exact upstream provisioning bytes, delivered by the central OpenShell
 /// gateway after it mints split launch authentication. Deliberately no Debug.
 pub struct NativeCreate {
-    sandbox: DriverSandbox,
+    pub(crate) sandbox: DriverSandbox,
+    pub(crate) launch_sha256: String,
+    pub(crate) native_sha256: String,
+    pub(crate) policy_sha256: String,
+}
+
+/// Keep native negotiation/validation before central grant consumption, leaving
+/// only the mutation itself after the last authorization freshness check.
+pub(crate) struct NativeDispatch {
+    client: ComputeDriverClient<Channel>,
+    approved: NativeCreate,
+}
+impl NativeDispatch {
+    pub(crate) async fn send(mut self) -> Result<()> {
+        self.client
+            .create_sandbox(CreateSandboxRequest {
+                sandbox: Some(self.approved.sandbox),
+            })
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        Ok(())
+    }
 }
 
 fn private_socket(path: &Path) -> Result<()> {
@@ -51,6 +73,10 @@ fn private_socket(path: &Path) -> Result<()> {
 }
 
 impl NativeCreate {
+    /// Commitment to the exact private protobuf bytes, safe for durable journals.
+    pub fn native_sha256(&self) -> &str {
+        &self.native_sha256
+    }
     /// Bind the native policy and every canonical workload input to the Fleet
     /// allocation. Resource strings are deliberately canonical at this boundary.
     pub fn decode(
@@ -62,6 +88,36 @@ impl NativeCreate {
             return Err(Error::InvalidContract);
         }
         let sandbox = DriverSandbox::decode(bytes).map_err(|_| Error::InvalidContract)?;
+        Self::validate(&sandbox, request, policy_sha256, true)?;
+        Ok(Self {
+            sandbox,
+            launch_sha256: trusted_rail::rego::commitment("trusted-shim.launch.v1", request)
+                .map_err(|_| Error::InvalidContract)?,
+            native_sha256: hex::encode(Sha256::digest(bytes)),
+            policy_sha256: policy_sha256.into(),
+        })
+    }
+
+    /// The gateway validates a proposal before minting launch credentials. This
+    /// shares all workload bindings with dispatch but does not authorize Create.
+    pub(crate) fn validate_proposal(
+        sandbox: &DriverSandbox,
+        request: &crate::runtime::LaunchRequest,
+        policy_sha256: &str,
+    ) -> Result<()> {
+        Self::validate(sandbox, request, policy_sha256, false)
+    }
+
+    fn validate(
+        sandbox: &DriverSandbox,
+        request: &crate::runtime::LaunchRequest,
+        policy_sha256: &str,
+        credentials_required: bool,
+    ) -> Result<()> {
+        if sandbox.encoded_len() > 1024 * 1024 || request.driver != "openshell" {
+            return Err(Error::InvalidContract);
+        }
+        crate::openshell_services::ServiceOptions::from_request(request)?;
         let spec = sandbox.spec.as_ref().ok_or(Error::InvalidContract)?;
         let template = spec.template.as_ref().ok_or(Error::InvalidContract)?;
         let policy = spec.policy.as_ref().ok_or(Error::InvalidContract)?;
@@ -78,8 +134,23 @@ impl NativeCreate {
             .ok_or(Error::InvalidContract)?;
         if sandbox.id.is_empty()
             || sandbox.name.is_empty()
-            || sandbox.status.is_some()
-            || sandbox.namespace != request.execution.namespace
+            // The stock gateway leaves the platform namespace empty; the
+            // driver chooses it from its operator configuration. Workspace is
+            // the tenant boundary and must match Fleet's canonical namespace.
+            || !sandbox.namespace.is_empty()
+            || sandbox.workspace != crate::openshell_gateway::workspace_name(&request.execution.namespace)
+            || sandbox.status.as_ref().is_some_and(|s| {
+                // The gateway supplies a pending configuration observation on
+                // create. It cannot supply an existing runtime or readiness.
+                s.name != sandbox.name
+                    || !s.instance_id.is_empty()
+                    || !s.agent_fd.is_empty()
+                    || !s.sandbox_fd.is_empty()
+                    || s.deleting
+                    || s.resolved_identity.is_some()
+                    || s.fence_evidence.is_some()
+                    || s.conditions.iter().any(|c| !matches!(c.status.as_str(), "False" | "Unknown"))
+            })
             || template.image != request.image
             || spec.command != request.command
             || spec
@@ -89,12 +160,34 @@ impl NativeCreate {
                 != request.environment.iter().collect()
             || !template.environment.is_empty()
             || deterministic_policy_hash(policy) != policy_sha256
-            || spec.launch_authentication.is_empty()
-            || spec.sandbox_token.is_empty()
+            || (credentials_required
+                && (spec.launch_authentication.is_empty() || spec.sandbox_token.is_empty()))
             || limits.cpu_limit != format!("{cpu}m")
-            || limits.cpu_request != limits.cpu_limit
+            // Fleet/Ray own scheduling requests. The native Docker compute
+            // driver accepts hard limits and rejects Kubernetes-style requests.
+            || !limits.cpu_request.is_empty()
             || limits.memory_limit != memory.to_string()
-            || limits.memory_request != limits.memory_limit
+            || !limits.memory_request.is_empty()
+        {
+            return Err(Error::Untrusted);
+        }
+        // The native gateway always supplies these selectors, including an
+        // empty pair for image defaults. Bind them to the committed policy;
+        // resolution to a non-root UID/GID remains the upstream driver's job.
+        let user = policy
+            .process
+            .as_ref()
+            .map_or("", |p| p.run_as_user.as_str());
+        let group = policy
+            .process
+            .as_ref()
+            .map_or("", |p| p.run_as_group.as_str());
+        if spec
+            .workload_identity
+            .as_ref()
+            .map_or(!user.is_empty() || !group.is_empty(), |i| {
+                i.user != user || i.group != group
+            })
         {
             return Err(Error::Untrusted);
         }
@@ -109,15 +202,13 @@ impl NativeCreate {
             || template.user_namespaces.is_some()
             || !template.agent_socket_path.is_empty()
             || !template.labels.is_empty()
-            || spec.workload_identity.is_some()
             || spec.tty
             || spec.await_main_process_attachment
             || spec.isolation_backend.is_some()
-            || !request.driver_options.is_null()
         {
             return Err(Error::Unsupported);
         }
-        Ok(Self { sandbox })
+        Ok(())
     }
 }
 
@@ -181,6 +272,10 @@ impl NativeDriver {
     /// authorization before this mutation. A timeout is ambiguous: inspect the
     /// same sandbox ID; never silently retry or replace it with a new sandbox.
     pub async fn create(&self, approved: NativeCreate) -> Result<()> {
+        self.prepare_dispatch(approved).await?.send().await
+    }
+
+    pub(crate) async fn prepare_dispatch(&self, approved: NativeCreate) -> Result<NativeDispatch> {
         let mut client = self.client().await?;
         client
             .validate_sandbox_create(ValidateSandboxCreateRequest {
@@ -188,12 +283,18 @@ impl NativeDriver {
             })
             .await
             .map_err(|_| Error::Untrusted)?;
-        client
-            .create_sandbox(CreateSandboxRequest {
-                sandbox: Some(approved.sandbox),
+        Ok(NativeDispatch { client, approved })
+    }
+
+    /// Read-only admission check; never consumes a grant or creates resources.
+    pub async fn validate(&self, approved: &NativeCreate) -> Result<()> {
+        self.client()
+            .await?
+            .validate_sandbox_create(ValidateSandboxCreateRequest {
+                sandbox: Some(approved.sandbox.clone()),
             })
             .await
-            .map_err(|_| Error::Unavailable)?;
+            .map_err(|_| Error::Untrusted)?;
         Ok(())
     }
 

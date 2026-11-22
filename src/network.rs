@@ -100,7 +100,7 @@ impl ZirenNetwork {
     }
 }
 
-fn valid_job_id(id: &str) -> bool {
+pub(crate) fn valid_job_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
