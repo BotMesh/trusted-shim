@@ -5,13 +5,27 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      supervisor_image:
+        description: Build only the OpenShell adapter image from this verified upstream digest
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  supervisor:
+    if: github.event_name == 'workflow_dispatch' && inputs.supervisor_image != ''
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/supervisor-image.yml
+    with:
+      supervisor_image: ${{ inputs.supervisor_image }}
   image:
+    if: ${{ !inputs.supervisor_image }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     permissions:
