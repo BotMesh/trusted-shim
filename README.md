@@ -282,7 +282,7 @@ remain fenced after deletion. A changed physical instance is rejected.
 This adapter proves provisioning admission only. It does not claim that platform
 `Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
 or provide TEE attestation. Fleet's guarded activation/credential API is available;
-automatic native gateway orchestration, delivery from Fleet to a remote node, and
+the native gateway compute extension's connection to Fleet's proof/delivery flow, and
 application endpoint readiness still need integration. Native split credentials
 must never enter an ordinary Fleet App spec, workload environment or public response.
 The adapter rejects application services and action-proof-required requests until
@@ -291,6 +291,23 @@ test server. The ignored native admission test also calls the pinned, unmodified
 Docker compute-driver binary to check capabilities, real input validation and
 operator policy mismatch. Neither test establishes full OpenShell isolation or
 an end-to-end provisioning proof.
+
+`openshell_gateway::GatewayLaunch` translates an admitted Fleet launch and native
+policy into the stock gateway's public create request. It binds the workspace,
+command, environment, CPU/memory limits and an allocation-derived routable name.
+The compute extension can use the same binding for validation before credential
+minting, then bind the credential-bearing Create bytes to Rail's authorization
+resource and commitments. `ProvisionRequest::validate_native` repeats these
+checks against the exact evaluation request before private delivery and again
+inside shim. It does not verify a proof or consume a grant; the existing central
+ledger remains responsible for those checks. This translation has no scheduler,
+queue, durable state or config file. Fleet remains the lifecycle owner.
+
+The opt-in `stock_gateway_mints_private_launch_for_shim_with_workspace_isolation`
+test runs the pinned, unmodified gateway with mTLS. It rejects a changed workload
+before native Create and checks the gateway-minted credentials through the same
+binding. Its capture driver deliberately refuses provisioning; this acceptance
+does not assert sandbox execution or readiness.
 
 Build the runtime with `--features openshell` to enable native provisioning inside
 the persistent daemon. Its optional `--options` argument contains only operator

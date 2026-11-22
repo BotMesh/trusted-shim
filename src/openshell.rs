@@ -84,6 +84,35 @@ impl NativeCreate {
             return Err(Error::InvalidContract);
         }
         let sandbox = DriverSandbox::decode(bytes).map_err(|_| Error::InvalidContract)?;
+        Self::validate(&sandbox, request, policy_sha256, true)?;
+        Ok(Self {
+            sandbox,
+            launch_sha256: trusted_rail::rego::commitment("trusted-shim.launch.v1", request)
+                .map_err(|_| Error::InvalidContract)?,
+            native_sha256: hex::encode(Sha256::digest(bytes)),
+            policy_sha256: policy_sha256.into(),
+        })
+    }
+
+    /// The gateway validates a proposal before minting launch credentials. This
+    /// shares all workload bindings with dispatch but does not authorize Create.
+    pub(crate) fn validate_proposal(
+        sandbox: &DriverSandbox,
+        request: &crate::runtime::LaunchRequest,
+        policy_sha256: &str,
+    ) -> Result<()> {
+        Self::validate(sandbox, request, policy_sha256, false)
+    }
+
+    fn validate(
+        sandbox: &DriverSandbox,
+        request: &crate::runtime::LaunchRequest,
+        policy_sha256: &str,
+        credentials_required: bool,
+    ) -> Result<()> {
+        if sandbox.encoded_len() > 1024 * 1024 || request.driver != "openshell" {
+            return Err(Error::InvalidContract);
+        }
         let spec = sandbox.spec.as_ref().ok_or(Error::InvalidContract)?;
         let template = spec.template.as_ref().ok_or(Error::InvalidContract)?;
         let policy = spec.policy.as_ref().ok_or(Error::InvalidContract)?;
@@ -126,8 +155,8 @@ impl NativeCreate {
                 != request.environment.iter().collect()
             || !template.environment.is_empty()
             || deterministic_policy_hash(policy) != policy_sha256
-            || spec.launch_authentication.is_empty()
-            || spec.sandbox_token.is_empty()
+            || (credentials_required
+                && (spec.launch_authentication.is_empty() || spec.sandbox_token.is_empty()))
             || limits.cpu_limit != format!("{cpu}m")
             // Fleet/Ray own scheduling requests. The native Docker compute
             // driver accepts hard limits and rejects Kubernetes-style requests.
@@ -175,13 +204,7 @@ impl NativeCreate {
         {
             return Err(Error::Unsupported);
         }
-        Ok(Self {
-            sandbox,
-            launch_sha256: trusted_rail::rego::commitment("trusted-shim.launch.v1", request)
-                .map_err(|_| Error::InvalidContract)?,
-            native_sha256: hex::encode(Sha256::digest(bytes)),
-            policy_sha256: policy_sha256.into(),
-        })
+        Ok(())
     }
 }
 

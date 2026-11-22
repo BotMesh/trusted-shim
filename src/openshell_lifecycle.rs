@@ -46,6 +46,26 @@ impl NativeCreate {
     pub fn authorization_resource(&self) -> String {
         format!("openshell/sandbox/{}", self.sandbox.id)
     }
+
+    /// Shared by central delivery admission and the final machine boundary.
+    /// This checks bindings only; central Consume still verifies freshness and
+    /// the proof-backed single-use grant before the native mutation.
+    pub fn validate_authorization(
+        &self,
+        request: &LaunchRequest,
+        authorization: &EvaluationRequest,
+    ) -> Result<()> {
+        if self.launch_sha256 != hash("trusted-shim.launch.v1", request)?
+            || self.sandbox.workspace != request.execution.namespace
+            || authorization.execution != request.execution
+            || authorization.operation != "runtime.create"
+            || authorization.resource != self.authorization_resource()
+            || authorization.parameters != self.authorization_parameters()
+        {
+            return Err(Error::Untrusted);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,15 +297,7 @@ impl ManagedNativeDriver {
             return Err(Error::Unsupported);
         }
         let digest = execution_digest(authorization, grant)?;
-        if prepared.launch_sha256 != hash("trusted-shim.launch.v1", request)?
-            || prepared.sandbox.workspace != request.execution.namespace
-            || authorization.execution != request.execution
-            || authorization.operation != "runtime.create"
-            || authorization.resource != prepared.authorization_resource()
-            || authorization.parameters != prepared.authorization_parameters()
-        {
-            return Err(Error::Untrusted);
-        }
+        prepared.validate_authorization(request, authorization)?;
         let slot = self.slot(&request.execution)?;
         let _lock = self.lock(&slot).await?;
         if let Some(mut old) = self.read(&slot)? {

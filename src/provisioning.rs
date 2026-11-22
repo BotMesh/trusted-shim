@@ -77,6 +77,20 @@ impl ProvisionRequest {
         Ok(())
     }
 
+    /// Reject a malformed or substituted native launch before Fleet queues it.
+    /// The node repeats the same checks; this does not reserve/consume a grant.
+    #[cfg(feature = "openshell")]
+    pub fn validate_native(&self) -> Result<crate::openshell::NativeCreate> {
+        self.validate()?;
+        let native = crate::openshell::NativeCreate::decode(
+            &self.native_bytes()?,
+            &self.request,
+            &self.native_policy_sha256,
+        )?;
+        native.validate_authorization(&self.request, &self.authorization)?;
+        Ok(native)
+    }
+
     pub(crate) fn native_bytes(&self) -> Result<Vec<u8>> {
         if self.native_create_base64.is_empty() || self.native_create_base64.len() > 1_398_104 {
             return Err(Error::InvalidContract);

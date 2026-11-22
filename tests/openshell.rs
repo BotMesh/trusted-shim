@@ -19,6 +19,7 @@ use std::{
 use tonic::{Request, Response, Status};
 use trusted_shim::{
     openshell::{NativeCreate, NativeDriver},
+    openshell_gateway::GatewayLaunch,
     runtime::LaunchRequest,
 };
 
@@ -181,11 +182,98 @@ fn native_launch_binds_policy_resources_command_and_environment() {
     assert!(NativeCreate::decode(&custom.encode_to_vec(), &r, &p).is_err());
 }
 
+#[test]
+fn gateway_binding_fences_every_allocation_field_and_requires_native_credentials() {
+    let (launch, mut sandbox, _) = fixture();
+    let policy = sandbox.spec.as_ref().unwrap().policy.clone().unwrap();
+    let binding = GatewayLaunch::new(launch.clone(), policy.clone()).unwrap();
+    let request = binding.request();
+    assert_eq!(request.name.len(), 19);
+    sandbox.name = request.name.clone();
+    sandbox.status.as_mut().unwrap().name = sandbox.name.clone();
+    assert!(binding.bind(&sandbox.encode_to_vec()).is_ok());
+    let mut proposal = sandbox.clone();
+    proposal
+        .spec
+        .as_mut()
+        .unwrap()
+        .launch_authentication
+        .clear();
+    proposal.spec.as_mut().unwrap().sandbox_token.clear();
+    binding.validate_proposal(&proposal).unwrap();
+    assert!(binding.bind(&proposal.encode_to_vec()).is_err());
+    for field in 0..6 {
+        let mut changed = launch.clone();
+        match field {
+            0 => changed.execution.namespace.push('x'),
+            1 => changed.execution.workload.push('x'),
+            2 => changed.execution.allocation_id.push('x'),
+            3 => changed.execution.lease_id.push('x'),
+            4 => changed.execution.generation += 1,
+            _ => changed.execution.node_id.push('x'),
+        }
+        let other = GatewayLaunch::new(changed, policy.clone()).unwrap();
+        assert_ne!(other.request().name, request.name);
+        assert!(other.validate_proposal(&proposal).is_err());
+        assert!(other.bind(&sandbox.encode_to_vec()).is_err());
+    }
+    let mut changed_policy = policy.clone();
+    changed_policy.version += 1;
+    let other = GatewayLaunch::new(launch.clone(), changed_policy).unwrap();
+    assert!(other.validate_proposal(&proposal).is_err());
+    let mut unsupported = launch.clone();
+    unsupported.driver_options = serde_json::json!({"privileged":true});
+    assert!(GatewayLaunch::new(unsupported, policy.clone()).is_err());
+    let mut unsupported = launch;
+    unsupported.trust.policy_proof = trusted_shim::proof::ProofRequirement::Required;
+    assert!(GatewayLaunch::new(unsupported, policy).is_err());
+}
+
+#[test]
+fn private_envelope_rejects_native_substitution_even_with_matching_request_digest() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let (launch, sandbox, policy) = fixture();
+    let bytes = sandbox.encode_to_vec();
+    let native = NativeCreate::decode(&bytes, &launch, &policy).unwrap();
+    let make = |authorization, grant| {
+        trusted_shim::provisioning::ProvisionRequest::new(
+            launch.clone(),
+            &bytes,
+            policy.clone(),
+            authorization,
+            grant,
+            "b".repeat(64),
+        )
+        .unwrap()
+    };
+    let (a, g) = authorization(&launch, &native, "one");
+    let mut envelope = make(a, g);
+    envelope.validate_native().unwrap();
+    let mut replaced = sandbox;
+    replaced.spec.as_mut().unwrap().sandbox_token = "substituted-native-credential".into();
+    envelope.native_create_base64 = STANDARD.encode(replaced.encode_to_vec());
+    assert!(envelope.validate_native().is_err());
+    for field in 0..3 {
+        let (mut a, mut g) = authorization(&launch, &native, "one");
+        match field {
+            0 => a.resource = "openshell/sandbox/another".into(),
+            1 => a.parameters["native_sha256"] = "f".repeat(64).into(),
+            _ => a.parameters["launch_sha256"] = "f".repeat(64).into(),
+        }
+        // The envelope/grant pair agrees with itself, but not the native input.
+        g.request_sha256 = trusted_rail::rego::request_digest(&a).unwrap();
+        let envelope = make(a, g);
+        envelope.validate().unwrap();
+        assert!(envelope.validate_native().is_err());
+    }
+}
+
 #[derive(Clone, Default)]
 struct Service {
     // The real gateway acceptance captures its private create message and
     // refuses provisioning; no synthetic credentials cross a native boundary.
     capture: Option<Arc<Mutex<Option<DriverSandbox>>>>,
+    gateway_launch: Option<Arc<GatewayLaunch>>,
     current: Arc<Mutex<Option<DriverSandbox>>>,
     created: Arc<AtomicUsize>,
     wrong_admission: Arc<AtomicBool>,
@@ -233,8 +321,18 @@ impl ComputeDriver for Service {
     }
     async fn validate_sandbox_create(
         &self,
-        _: Request<ValidateSandboxCreateRequest>,
+        r: Request<ValidateSandboxCreateRequest>,
     ) -> std::result::Result<Response<ValidateSandboxCreateResponse>, Status> {
+        if let Some(binding) = &self.gateway_launch {
+            binding
+                .validate_proposal(
+                    r.get_ref()
+                        .sandbox
+                        .as_ref()
+                        .ok_or(Status::invalid_argument("missing sandbox"))?,
+                )
+                .map_err(|_| Status::permission_denied("launch does not match allocation"))?;
+        }
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
     async fn create_sandbox(
@@ -243,6 +341,11 @@ impl ComputeDriver for Service {
     ) -> std::result::Result<Response<CreateSandboxResponse>, Status> {
         self.created.fetch_add(1, Ordering::SeqCst);
         let mut sandbox = r.into_inner().sandbox.unwrap();
+        if let Some(binding) = &self.gateway_launch {
+            binding
+                .bind(&sandbox.encode_to_vec())
+                .map_err(|_| Status::permission_denied("launch does not match allocation"))?;
+        }
         if let Some(capture) = &self.capture {
             *capture.lock().unwrap() = Some(sandbox);
             return Err(Status::failed_precondition(

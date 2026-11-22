@@ -116,8 +116,20 @@ async fn stock_gateway_mints_private_launch_for_shim_with_workspace_isolation() 
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let capture = Arc::new(Mutex::new(None));
+    let (mut launch, mut native, _) = fixture();
+    launch.image = "alpine:3.21".into();
+    launch.command = vec!["/bin/true".into()];
+    let policy = native.spec.as_mut().unwrap().policy.as_mut().unwrap();
+    policy.version = 1;
+    policy.process = Some(openshell_core::proto::sandbox::v1::ProcessPolicy {
+        run_as_user: "1000".into(),
+        run_as_group: "1000".into(),
+    });
+    let policy_hash = deterministic_policy_hash(policy);
+    let binding = Arc::new(GatewayLaunch::new(launch.clone(), policy.clone()).unwrap());
     let service = Service {
         capture: Some(capture.clone()),
+        gateway_launch: Some(binding.clone()),
         ..Default::default()
     };
     let task = tokio::spawn(async move {
@@ -203,60 +215,26 @@ async fn stock_gateway_mints_private_launch_for_shim_with_workspace_isolation() 
         })
         .await
         .unwrap();
-    let (mut launch, mut native, _) = fixture();
-    launch.image = "alpine:3.21".into();
-    launch.command = vec!["/bin/true".into()];
-    let policy = native.spec.as_mut().unwrap().policy.as_mut().unwrap();
-    policy.version = 1;
-    policy.process = Some(openshell_core::proto::sandbox::v1::ProcessPolicy {
-        run_as_user: "1000".into(),
-        run_as_group: "1000".into(),
-    });
-    let policy_hash = deterministic_policy_hash(policy);
-    let string = |s: &str| prost_types::Value {
-        kind: Some(prost_types::value::Kind::StringValue(s.into())),
-    };
-    let resources = prost_types::Struct {
-        fields: [(
-            "limits".into(),
-            prost_types::Value {
-                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                    fields: [
-                        ("cpu".into(), string("500m")),
-                        ("memory".into(), string("67108864")),
-                    ]
-                    .into(),
-                })),
-            },
-        )]
-        .into(),
-    };
-    let result = client
-        .create_sandbox(openshell_core::proto::CreateSandboxRequest {
-            workspace_scope: Some(openshell_core::proto::workspace_selector("test")),
-            name: "native-shim-test".into(),
-            spec: Some(openshell_core::proto::SandboxSpec {
-                environment: launch.environment.clone().into_iter().collect(),
-                command: launch.command.clone(),
-                policy: Some(policy.clone()),
-                template: Some(openshell_core::proto::SandboxTemplate {
-                    image: launch.image.clone(),
-                    resources: Some(resources),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await;
+    // An unrelated public request cannot select the reserved allocation even
+    // with the operator's mTLS identity. It fails before credentials are minted.
+    let mut wrong = binding.request();
+    wrong.spec.as_mut().unwrap().command.push("injected".into());
+    assert!(client.create_sandbox(wrong).await.is_err());
+    assert!(capture.lock().unwrap().is_none());
+    let result = client.create_sandbox(binding.request()).await;
     // The extension deliberately refuses every create after capturing it.
     assert!(result.is_err());
+    assert!(
+        capture.lock().unwrap().is_some(),
+        "gateway failed before capture: {:?}",
+        result.err().map(|s| (s.code(), s.message().to_owned()))
+    );
     let captured = capture
         .lock()
         .unwrap()
         .take()
         .expect("gateway must reach the private compute extension");
-    let prepared = NativeCreate::decode(&captured.encode_to_vec(), &launch, &policy_hash).unwrap();
+    let prepared = binding.bind(&captured.encode_to_vec()).unwrap();
     assert_eq!(
         prepared.authorization_resource(),
         format!("openshell/sandbox/{}", captured.id)

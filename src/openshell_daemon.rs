@@ -3,7 +3,7 @@
 //! either endpoint. Credentials live only for a single accepted call.
 use crate::{
     ledger_transport::RemoteLedger,
-    openshell::{NativeCreate, NativeDriver},
+    openshell::NativeDriver,
     openshell_lifecycle::{ManagedNativeDriver, ProvisioningStatus},
     provisioning::ProvisionRequest,
     Error, Result,
@@ -78,12 +78,7 @@ impl OpenShellRuntime {
     }
 
     pub async fn provision(&self, payload: ProvisionRequest) -> Result<ProvisioningStatus> {
-        payload.validate()?;
-        let native = NativeCreate::decode(
-            &payload.native_bytes()?,
-            &payload.request,
-            &payload.native_policy_sha256,
-        )?;
+        let native = payload.validate_native()?;
         // A lazy channel leaves idempotent inspection/cleanup independent of a
         // gateway outage. First-time dispatch still requires successful Consume.
         let ledger = RemoteLedger::from_channel(
