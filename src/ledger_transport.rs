@@ -330,11 +330,12 @@ impl wire::authorization_ledger_server::AuthorizationLedger for LedgerService {
         let authority = self.authority.clone();
         let grant = self
             .run(move |l| {
+                let verified = l.verify_reservation(&decision, &r.proof_evidence, Some(&token))?;
                 let _guard = authority
                     .as_ref()
                     .map(|a| a.guard(&decision.execution))
                     .transpose()?;
-                l.reserve_authenticated(&token, &decision, &r.proof_evidence)
+                l.commit_reservation(verified, Some(&token))
             })
             .await?;
         Ok(Response::new(grant_to_wire(grant).map_err(status)?))

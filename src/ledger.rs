@@ -101,7 +101,66 @@ pub struct SqliteLedger {
     program: ProgramRef,
     key: Vec<u8>,
 }
+
+/// Cryptography has been checked; commit must still recheck the live authority,
+/// staged decision and epoch. Fields are private so callers cannot forge this.
+pub struct VerifiedReservation {
+    decision: DecisionRecord,
+    evidence: Vec<u8>,
+    job_id: String,
+    ledger: [u8; 32],
+}
 impl SqliteLedger {
+    /// Reconstruct the same private outbox credential after an interrupted
+    /// delivery. Revocation is permanent for this ticket, even across retries.
+    pub fn issue_delivery_access(
+        &self,
+        ticket: &str,
+        execution: &ExecutionIdentity,
+        validity: &trusted_contracts::Validity,
+    ) -> Result<String> {
+        let time = now()?;
+        if ticket.len() != 64
+            || !ticket.bytes().all(|b| b.is_ascii_hexdigit())
+            || validity.not_before > time
+            || validity.expires_at <= time
+            || validity.expires_at.saturating_sub(validity.not_before) > 3600
+        {
+            return Err(Error::InvalidInput);
+        }
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).map_err(|_| Error::Unavailable)?;
+        mac.update(b"trusted-ledger.delivery-access.v1\0");
+        mac.update(&canonical_bytes(&(ticket, execution, validity))?);
+        let token = hex::encode(mac.finalize().into_bytes());
+        let hash = access_hash(&token)?;
+        let mut c = self.connection.lock().map_err(|_| Error::Unavailable)?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let old: Option<String> = db(tx
+            .query_row(
+                "SELECT token_hash FROM delivery_access WHERE ticket=?1",
+                [ticket],
+                |r| r.get(0),
+            )
+            .optional())?;
+        if let Some(old) = old {
+            if old != hash {
+                return Err(Error::Conflict);
+            }
+            check_access(&tx, &token, execution, LedgerPermission::Execution)?;
+        } else {
+            let inserted = db(tx.execute("INSERT INTO ledger_access SELECT ?1,execution,?3,?4,?5 FROM authorities WHERE execution=?2 AND active=1",
+                params![hash, execution_key(execution)?, LedgerPermission::Execution as i64, amount(validity.not_before)?, amount(validity.expires_at)?]))?;
+            if inserted != 1 {
+                return Err(Error::Rejected);
+            }
+            db(tx.execute(
+                "INSERT INTO delivery_access VALUES(?1,?2)",
+                params![ticket, hash],
+            ))?;
+        }
+        db(tx.commit())?;
+        Ok(token)
+    }
     /// Central operator API. Deliver the returned secret through the node's
     /// authenticated private provisioning channel; never an ordinary App spec.
     /// Only its hash is persisted. Maximum lifetime is one hour; the operator
@@ -152,15 +211,6 @@ impl SqliteLedger {
         let c = self.connection.lock().map_err(|_| Error::Unavailable)?;
         db(c.execute("DELETE FROM ledger_access WHERE token_hash=?1", params![id]))?;
         Ok(())
-    }
-
-    pub(crate) fn reserve_authenticated(
-        &self,
-        token: &str,
-        d: &DecisionRecord,
-        proof: &[u8],
-    ) -> Result<ExecutionGrant> {
-        self.reserve_inner(d, Some(proof), Some(token))
     }
 
     pub(crate) fn consume_authenticated(
@@ -214,6 +264,7 @@ impl SqliteLedger {
           CREATE TABLE IF NOT EXISTS revoked(execution TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS authorities(execution TEXT PRIMARY KEY, policy TEXT NOT NULL, context TEXT NOT NULL, root TEXT NOT NULL, budget TEXT NOT NULL REFERENCES budgets(name), epoch INTEGER NOT NULL, active INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS ledger_access(token_hash TEXT PRIMARY KEY, execution TEXT NOT NULL REFERENCES authorities(execution), permissions INTEGER NOT NULL, not_before INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS delivery_access(ticket TEXT PRIMARY KEY, token_hash TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, execution TEXT NOT NULL REFERENCES authorities(execution), action TEXT NOT NULL, epoch INTEGER NOT NULL, request TEXT NOT NULL, decision TEXT NOT NULL, cost INTEGER NOT NULL, state INTEGER NOT NULL DEFAULT 0, proof BLOB, UNIQUE(execution,action));"))?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         db(tx.execute_batch(
@@ -449,8 +500,21 @@ impl SqliteLedger {
         evidence: Option<&[u8]>,
         access: Option<&str>,
     ) -> Result<ExecutionGrant> {
+        let verified =
+            self.verify_reservation(decision, evidence.ok_or(Error::Rejected)?, access)?;
+        self.commit_reservation(verified, access)
+    }
+
+    /// Expensive verification runs before the scheduler takes its live lease
+    /// guard. An authenticated caller is checked before spending verifier work.
+    pub fn verify_reservation(
+        &self,
+        decision: &DecisionRecord,
+        evidence: &[u8],
+        access: Option<&str>,
+    ) -> Result<VerifiedReservation> {
         current(decision)?;
-        let evidence = evidence
+        let evidence = Some(evidence)
             .filter(|v| !v.is_empty() && v.len() <= 1024 * 1024)
             .ok_or(Error::Rejected)?;
         // Match the gateway's staged decision before invoking the verifier.
@@ -477,13 +541,37 @@ impl SqliteLedger {
                 &encode_public_values(decision)?,
             )
             .map_err(|_| Error::Rejected)?;
+        Ok(VerifiedReservation {
+            decision: decision.clone(),
+            evidence: evidence.to_vec(),
+            job_id: id,
+            ledger: Sha256::digest(&self.key).into(),
+        })
+    }
+
+    pub fn commit_reservation(
+        &self,
+        verified: VerifiedReservation,
+        access: Option<&str>,
+    ) -> Result<ExecutionGrant> {
+        let VerifiedReservation {
+            decision,
+            evidence,
+            job_id: id,
+            ledger,
+        } = verified;
+        if ledger != <[u8; 32]>::from(Sha256::digest(&self.key)) {
+            return Err(Error::Rejected);
+        }
+        let key = execution_key(&decision.execution)?;
+        let d = text(&decision)?;
         let mut c = self.connection.lock().map_err(|_| Error::Unavailable)?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         if let Some(token) = access {
             check_access(&tx, token, &decision.execution, LedgerPermission::Admission)?;
         }
-        let (state,cost,budget):(i64,i64,String)=db(tx.query_row("SELECT a.state,a.cost,t.budget FROM actions a JOIN authorities t ON a.execution=t.execution WHERE a.id=?1 AND t.active=1 AND a.epoch=t.epoch",params![id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))))?;
-        current(decision)?;
+        let (state,cost,budget):(i64,i64,String)=db(tx.query_row("SELECT a.state,a.cost,t.budget FROM actions a JOIN authorities t ON a.execution=t.execution WHERE a.id=?1 AND a.execution=?2 AND a.decision=?3 AND t.active=1 AND a.epoch=t.epoch",params![id,key,d],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))))?;
+        current(&decision)?;
         if state == 2 {
             return Err(Error::Conflict);
         }
@@ -503,7 +591,7 @@ impl SqliteLedger {
         db(tx.commit())?;
         Ok(ExecutionGrant {
             id: id.clone(),
-            credential: self.credential(&id, decision)?,
+            credential: self.credential(&id, &decision)?,
             execution: decision.execution.clone(),
             request_sha256: decision.request_sha256.clone(),
             validity: decision.validity.clone(),

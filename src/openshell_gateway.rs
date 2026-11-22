@@ -8,6 +8,7 @@ use crate::{
 use openshell_core::{policy_identity::deterministic_policy_hash, proto};
 use prost::Message;
 use prost_types::{value::Kind, Struct, Value};
+use trusted_contracts::ExecutionIdentity;
 use trusted_rail::rego::commitment;
 
 pub use openshell_core::proto as protocol;
@@ -65,6 +66,11 @@ pub struct GatewayLaunch {
 }
 
 impl GatewayLaunch {
+    pub fn execution_name(execution: &ExecutionIdentity) -> Result<String> {
+        let digest = commitment("trusted-shim.openshell.gateway-name.v1", execution)
+            .map_err(|_| Error::InvalidContract)?;
+        Ok(format!("f{}", &digest[..18]))
+    }
     pub fn new(launch: LaunchRequest, policy: SandboxPolicy) -> Result<Self> {
         let e = &launch.execution;
         if e.generation == 0
@@ -100,13 +106,11 @@ impl GatewayLaunch {
             return Err(Error::Unsupported);
         }
         crate::openshell_services::ServiceOptions::from_request(&launch)?;
-        let digest = commitment("trusted-shim.openshell.gateway-name.v1", e)
-            .map_err(|_| Error::InvalidContract)?;
         let result = Self {
             // Stock gateway routable names are limited to 19 characters. This
             // is a lookup hint, not authority: the full execution remains bound
             // in the launch commitment and proof, including on a name collision.
-            name: format!("f{}", &digest[..18]),
+            name: Self::execution_name(e)?,
             policy_sha256: deterministic_policy_hash(&policy),
             policy,
             launch,

@@ -81,6 +81,56 @@ fn stage(l: &SqliteLedger, p: &PolicyBundle, r: &EvaluationRequest, id: &str) {
     l.stage(id, r, 1).unwrap();
 }
 
+#[test]
+fn delivery_credentials_recover_but_never_revive_after_revocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let ledger = open(&path);
+    let (p, r) = fixture();
+    ledger.set_budget("shared", 10).unwrap();
+    stage(&ledger, &p, &r, "proof");
+    let ticket = "ab".repeat(32);
+    let first = ledger
+        .issue_delivery_access(&ticket, &r.execution, &r.validity)
+        .unwrap();
+    drop(ledger);
+    let ledger = open(&path);
+    assert_eq!(
+        first,
+        ledger
+            .issue_delivery_access(&ticket, &r.execution, &r.validity)
+            .unwrap()
+    );
+    let mut other = r.validity.clone();
+    other.expires_at += 1;
+    assert!(ledger
+        .issue_delivery_access(&ticket, &r.execution, &other)
+        .is_err());
+    ledger.revoke_access(&first).unwrap();
+    assert!(ledger
+        .issue_delivery_access(&ticket, &r.execution, &r.validity)
+        .is_err());
+}
+
+#[test]
+fn verified_reservation_rechecks_authority_and_ledger_at_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = open(&dir.path().join("ledger.sqlite"));
+    let (p, r) = fixture();
+    ledger.set_budget("shared", 10).unwrap();
+    stage(&ledger, &p, &r, "proof");
+    let d = RegorusEngine.evaluate(&p, &r).unwrap();
+    let proof = encode_public_values(&d).unwrap();
+    let verified = ledger.verify_reservation(&d, &proof, None).unwrap();
+    let other = open(&dir.path().join("other.sqlite"));
+    other.set_budget("shared", 10).unwrap();
+    stage(&other, &p, &r, "proof");
+    assert!(other.commit_reservation(verified, None).is_err());
+    let verified = ledger.verify_reservation(&d, &proof, None).unwrap();
+    ledger.revoke(&r.execution).unwrap();
+    assert!(ledger.commit_reservation(verified, None).is_err());
+}
+
 async fn serve(l: Arc<SqliteLedger>) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
