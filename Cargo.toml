@@ -26,13 +26,13 @@ prost = "0.14"
 prost-types = "0.14"
 tonic-prost = "0.14"
 zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", rev = "c9988a098d92bc55a85ca9307c470d1f97be3337", optional = true }
-trusted-contracts = { git = "https://github.com/BotMesh/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
-trusted-data-router = { git = "https://github.com/BotMesh/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
-trusted-rail = { git = "https://github.com/BotMesh/trusted-rail", rev = "9a9aa5cd493a9b81ba8c3ef8347afd5f9871737e" }
+trusted-contracts = { git = "https://github.com/attestx/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
+trusted-data-router = { git = "https://github.com/attestx/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
+trusted-rail = { git = "https://github.com/attestx/trusted-rail", rev = "cfd13f23dddaa76b61caa8d4abdd7f7534dd5436" }
 
 fs2 = "0.4"
 tempfile = "3"
-trusted-router-transport = { git = "https://github.com/BotMesh/trusted-data-router", rev = "a90f901a31dc6672686190b8236260d25a6e16a8" }
+trusted-router-transport = { git = "https://github.com/attestx/trusted-data-router", rev = "e830a0328752d24ac90c99e9e25f417a9d7f467c" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.8"

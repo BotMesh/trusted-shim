@@ -375,6 +375,18 @@ or local prover is included.
 
 ## Node-selected TEE startup
 
+Shim calls stock Trustee AS through generated bindings from its pinned official
+[gRPC schema](https://github.com/confidential-containers/trustee/blob/22788122660d6e9be3e4bf52704282de5fcc0a2a/protos/attestation.proto).
+The upstream [KBS client SDK](https://github.com/confidential-containers/trustee/blob/v0.19.0/tools/kbs-client/src/lib.rs)
+handles KBS authentication and secret delivery; it is not an AS gRPC client.
+Importing `attestation-service` would embed the verifier service, including its
+policy/storage dependencies. This adapter instead uses the same generated-client
+approach as [upstream KBS](https://github.com/confidential-containers/trustee/blob/v0.19.0/kbs/src/attestation/coco/grpc.rs).
+It supplies challenge/init-data bindings and transport limits; it does not
+reimplement hardware quote verification. A nonempty AS token is only a precheck,
+never authorization or a ZK receipt. The RA guest still needs independently
+verified quote/collateral logic; it is not implemented by this client.
+
 Fleet passes `shim_machine_labels` and `shim_tee` from the existing `apps.yaml`
 as daemon `machine` options; no second configuration file is introduced.
 `runtime.driver` selects `auto`, `docker`, `tee` or `tee-simulation`.
