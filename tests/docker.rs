@@ -32,6 +32,15 @@ async fn unsupported_trust_and_driver_requirements_never_create_state() {
     r.driver = "openshell".into();
     assert!(matches!(driver.launch(&r).await, Err(Error::Unsupported)));
     r.driver = "docker".into();
+    assert!(r.access_policy_sha256.is_none());
+    assert!(serde_json::to_value(&r)
+        .unwrap()
+        .get("access_policy_sha256")
+        .is_none());
+    trusted_shim::access::driver_bounds(&r).unwrap();
+    r.access_policy_sha256 = Some("ab".repeat(32));
+    assert!(matches!(driver.launch(&r).await, Err(Error::Unsupported)));
+    r.access_policy_sha256 = None;
     r.driver_options = json!({"privileged":true});
     assert!(matches!(
         driver.launch(&r).await,

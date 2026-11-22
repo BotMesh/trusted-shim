@@ -36,6 +36,11 @@ pub struct LaunchRequest {
     pub environment: BTreeMap<String, String>,
     pub limits: ResourceLimits,
     pub policy: PolicyRef,
+    /// User-authored OpenShell access rules, independent of the runtime driver.
+    /// None means no restrictions beyond the driver's own boundary. Omission
+    /// preserves existing launch commitments and recovery journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_policy_sha256: Option<String>,
     pub trust: TrustRequirements,
     pub services: Vec<ServiceSpec>,
     #[serde(default)]

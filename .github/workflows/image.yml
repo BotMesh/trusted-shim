@@ -40,7 +40,7 @@ jobs:
       - name: Build release binaries
         run: |
           mkdir -p target/image
-          cargo build --locked --release --features openshell,ziren --bin trusted-shim-runtime
+          cargo build --locked --release --features ziren --bin trusted-shim-runtime
           install -m 755 target/release/trusted-shim-runtime target/image/
           rustc --edition=2021 -C target-feature=+crt-static -C opt-level=s -C strip=symbols src/bin/trusted-shim-socket.rs -o target/image/trusted-shim-socket
           cp docker/Dockerfile target/image/Dockerfile

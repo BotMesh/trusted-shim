@@ -93,7 +93,11 @@ impl OpenShellRuntime {
         })
     }
 
-    pub async fn provision(&self, payload: ProvisionRequest) -> Result<ProvisioningStatus> {
+    pub async fn provision(
+        &self,
+        payload: ProvisionRequest,
+        attestation: Option<&crate::tee::AttestationGate>,
+    ) -> Result<ProvisioningStatus> {
         if !payload.request.services.is_empty() && self.supervisor_image.is_none() {
             return Err(Error::Unsupported);
         }
@@ -107,12 +111,13 @@ impl OpenShellRuntime {
         )
         .map_err(|_| Error::Untrusted)?;
         self.driver
-            .launch(
+            .launch_with_attestation(
                 &payload.request,
                 native,
                 &payload.authorization,
                 &payload.grant()?,
                 &ledger,
+                attestation,
             )
             .await
     }

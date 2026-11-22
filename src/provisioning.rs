@@ -52,8 +52,11 @@ impl ProvisionRequest {
     /// Checks the transport's identity, bounds and exact grant/request binding.
     /// This is not proof verification: only central Consume authorizes dispatch.
     pub fn validate(&self) -> Result<()> {
-        if self.request.driver != "openshell"
-            || self.request.execution != self.authorization.execution
+        crate::access::native_policy(&self.request, &self.native_policy_sha256)?;
+        if !matches!(
+            self.request.driver.as_str(),
+            "docker" | "tee" | "tee-simulation" | "openshell"
+        ) || self.request.execution != self.authorization.execution
             || self.authorization.operation != "runtime.create"
             || self.ledger_token.len() != 64
             || !self
@@ -79,7 +82,6 @@ impl ProvisionRequest {
 
     /// Reject a malformed or substituted native launch before Fleet queues it.
     /// The node repeats the same checks; this does not reserve/consume a grant.
-    #[cfg(feature = "openshell")]
     pub fn validate_native(&self) -> Result<crate::openshell::NativeCreate> {
         self.validate()?;
         let native = crate::openshell::NativeCreate::decode(

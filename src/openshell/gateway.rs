@@ -5,12 +5,13 @@ use crate::{
     attestation::AttestationRequirement, openshell::NativeCreate, proof::ProofRequirement,
     runtime::LaunchRequest, Error, Result,
 };
-use openshell_core::{policy_identity::deterministic_policy_hash, proto};
+use openshell_core::proto;
 use prost::Message;
 use prost_types::{value::Kind, Struct, Value};
 use trusted_contracts::ExecutionIdentity;
 use trusted_rail::rego::commitment;
 
+pub use openshell_core::policy_identity::deterministic_policy_hash;
 pub use openshell_core::proto as protocol;
 pub use openshell_core::proto::{compute::v1::DriverSandbox, sandbox::v1::SandboxPolicy};
 pub use openshell_core::{extension_protocol, resource_admission};
@@ -98,9 +99,18 @@ impl GatewayLaunch {
         }
         // This is the same initial native profile admitted at the node. No
         // unsupported request may silently turn into a weaker public API call.
-        if launch.driver != "openshell"
-            || launch.trust.attestation != AttestationRequirement::SkipNonTee
-            || launch.trust.attestation_proof != ProofRequirement::NotRequired
+        crate::access::native_policy(&launch, &deterministic_policy_hash(&policy))?;
+        let attestation_valid = match (&launch.trust.attestation, &launch.trust.attestation_proof) {
+            (AttestationRequirement::SkipNonTee, ProofRequirement::NotRequired) => true,
+            (AttestationRequirement::Required { profile }, ProofRequirement::Required) => {
+                matches!(profile.as_str(), "snp" | "tdx" | "sample")
+            }
+            _ => false,
+        };
+        if !matches!(
+            launch.driver.as_str(),
+            "docker" | "tee" | "tee-simulation" | "openshell"
+        ) || !attestation_valid
             || launch.trust.policy_proof != ProofRequirement::NotRequired
         {
             return Err(Error::Unsupported);

@@ -39,7 +39,7 @@ pub struct TeeConfig {
     pub evidence_endpoint: String,
     pub trustee_endpoint: String,
     pub trustee_policy_ids: Vec<String>,
-    /// Digest of measured init-data that confines this shim and the local Docker socket.
+    /// Digest of measured init-data that confines this shim and its local runtime endpoints.
     pub init_data_sha256: String,
     /// Runtime endpoint identity must be provisioned inside the measured guest.
     pub endpoint_key_sha256: String,
@@ -193,10 +193,10 @@ struct Pending {
     authorized: bool,
 }
 
-pub struct TeeDriver {
+/// Durable RA admission shared by machine-local runtime backends.
+pub struct AttestationGate {
     config: TeeConfig,
     state: PathBuf,
-    backend: DockerDriver,
     evidence: Arc<dyn EvidenceSource>,
     trustee: trustee::Trustee,
     network: Arc<dyn ProofNetwork>,
@@ -204,10 +204,9 @@ pub struct TeeDriver {
     serial: tokio::sync::Mutex<()>,
 }
 
-impl TeeDriver {
+impl AttestationGate {
     pub fn new(
         state: &Path,
-        node: String,
         config: TeeConfig,
         evidence: Arc<dyn EvidenceSource>,
         trustee: trustee::Trustee,
@@ -255,7 +254,6 @@ impl TeeDriver {
             Err(_) => return Err(Error::Unavailable),
         }
         Ok(Self {
-            backend: DockerDriver::new(state.join("runtime"), node)?,
             state,
             config,
             evidence,
@@ -267,7 +265,7 @@ impl TeeDriver {
     }
 
     #[cfg(feature = "ziren")]
-    pub async fn connect(state: &Path, node: String, config: TeeConfig) -> Result<Self> {
+    pub async fn connect(state: &Path, config: TeeConfig) -> Result<Self> {
         config.validate()?;
         let token_text = read_private(&config.proof_token_file, 4096)?;
         let token_text = std::str::from_utf8(&token_text).map_err(|_| Error::InvalidContract)?;
@@ -297,7 +295,6 @@ impl TeeDriver {
                 .await?;
         Self::new(
             state,
-            node,
             config,
             Arc::new(evidence),
             trustee,
@@ -308,22 +305,6 @@ impl TeeDriver {
 
     pub fn driver(&self) -> &'static str {
         self.config.driver()
-    }
-    pub(crate) fn backend(&self) -> &DockerDriver {
-        &self.backend
-    }
-    fn delegated(request: &LaunchRequest) -> LaunchRequest {
-        // Hardware deployment is inside an already measured confidential VM, not
-        // an SGX host or a host-side Docker socket. The pinned RA guest must enforce
-        // that measured init-data covers this shim, its key and the local runtime.
-        let mut delegated = request.clone();
-        delegated.driver = "docker".into();
-        delegated.trust.attestation = AttestationRequirement::SkipNonTee;
-        delegated.trust.attestation_proof = ProofRequirement::NotRequired;
-        delegated
-    }
-    async fn launch_admitted(&self, request: &LaunchRequest) -> Result<RuntimeStatus> {
-        self.backend.launch(&Self::delegated(request)).await
     }
     fn path(&self, execution: &ExecutionIdentity) -> Result<PathBuf> {
         Ok(self.state.join(format!("{}.json", digest(execution)?)))
@@ -341,35 +322,27 @@ impl TeeDriver {
     }
 }
 
-#[async_trait]
-impl RuntimeDriver for TeeDriver {
-    async fn launch(&self, request: &LaunchRequest) -> Result<RuntimeStatus> {
-        tokio::time::timeout(Duration::from_secs(300), self.launch_inner(request))
-            .await
-            .map_err(|_| Error::Unavailable)?
-    }
-    async fn inspect(&self, execution: &ExecutionIdentity) -> Result<RuntimeStatus> {
-        self.backend.inspect(execution).await
-    }
-    async fn stop(&self, execution: &ExecutionIdentity) -> Result<()> {
-        self.backend.stop(execution).await
-    }
-    async fn delete(&self, execution: &ExecutionIdentity) -> Result<()> {
-        self.backend.delete(execution).await
+/// A verified receipt authorizes creation only while its challenge is fresh.
+pub struct AttestationAdmission {
+    expires_at: u64,
+}
+impl AttestationAdmission {
+    pub fn ensure_fresh(&self) -> Result<()> {
+        if now()? >= self.expires_at {
+            return Err(Error::Untrusted);
+        }
+        Ok(())
     }
 }
-
-impl TeeDriver {
-    async fn launch_inner(&self, request: &LaunchRequest) -> Result<RuntimeStatus> {
-        if request.driver != self.driver()
-            || request.trust.attestation != (AttestationRequirement::Required { profile: self.config.platform.clone() })
-            || request.trust.attestation_proof != ProofRequirement::Required
-            // Policy admission remains a separate gate; never claim it was proved here.
-            || request.trust.policy_proof != ProofRequirement::NotRequired
-        {
-            return Err(Error::Unsupported);
+impl AttestationGate {
+    /// A node may require RA even for requests that do not request attestation.
+    pub fn validate_request(&self, request: &LaunchRequest) -> Result<()> {
+        match (&request.trust.attestation, &request.trust.attestation_proof) {
+            (AttestationRequirement::SkipNonTee, ProofRequirement::NotRequired) => (),
+            (AttestationRequirement::Required { profile }, ProofRequirement::Required)
+                if profile == &self.config.platform => {}
+            _ => return Err(Error::Unsupported),
         }
-        self.backend.validate_launch(&Self::delegated(request))?;
         if self.config.mode == Mode::Hardware {
             let suffix = request
                 .image
@@ -379,6 +352,27 @@ impl TeeDriver {
                 return Err(Error::InvalidContract);
             }
         }
+        Ok(())
+    }
+    /// Bind the backend's immutable create operation, excluding bearer tokens.
+    /// Callers check freshness immediately before dispatch.
+    pub async fn authorize(
+        &self,
+        execution: &ExecutionIdentity,
+        operation: &(impl Serialize + Sync),
+    ) -> Result<AttestationAdmission> {
+        tokio::time::timeout(
+            Duration::from_secs(300),
+            self.authorize_inner(execution, digest(operation)?),
+        )
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+    async fn authorize_inner(
+        &self,
+        execution: &ExecutionIdentity,
+        request_sha256: String,
+    ) -> Result<AttestationAdmission> {
         let _serial = self.serial.lock().await;
         let lock = std::fs::OpenOptions::new()
             .create(true)
@@ -388,8 +382,7 @@ impl TeeDriver {
             .open(self.state.join("launch.lock"))
             .map_err(|_| Error::Unavailable)?;
         lock.try_lock_exclusive().map_err(|_| Error::Ownership)?;
-        let path = self.path(&request.execution)?;
-        let request_sha256 = digest(request)?;
+        let path = self.path(execution)?;
         let config_sha256 = digest(&self.config)?;
         let mut pending: Pending = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| Error::InvalidContract)?,
@@ -403,7 +396,7 @@ impl TeeDriver {
                     expected_measurement: self.config.expected_measurement.clone(),
                     init_data_sha256: self.config.init_data_sha256.clone(),
                     endpoint_key_sha256: self.config.endpoint_key_sha256.clone(),
-                    execution: request.execution.clone(),
+                    execution: execution.clone(),
                     request_sha256: request_sha256.clone(),
                     nonce: hex::encode(nonce),
                     expires_at: now()? + 300,
@@ -429,23 +422,15 @@ impl TeeDriver {
             Err(_) => return Err(Error::Unavailable),
         };
         if pending.binding.request_sha256 != request_sha256
-            || pending.binding.execution != request.execution
+            || pending.binding.execution != *execution
             || pending.config_sha256 != config_sha256
         {
             return Err(Error::Untrusted);
         }
-        // After admission, retries reconcile the already-authorized exact request.
-        // Docker's durable tombstone prevents a stopped/deleted generation restarting.
         if pending.authorized {
-            if now()? >= pending.binding.expires_at {
-                // An expired grant can only observe an already created workload.
-                let status = self.backend.inspect(&request.execution).await?;
-                if status.state == crate::runtime::RuntimeState::Starting {
-                    return Err(Error::Untrusted);
-                }
-                return Ok(status);
-            }
-            return self.launch_admitted(request).await;
+            return Ok(AttestationAdmission {
+                expires_at: pending.binding.expires_at,
+            });
         }
         if now()? >= pending.binding.expires_at {
             return Err(Error::Untrusted);
@@ -490,10 +475,107 @@ impl TeeDriver {
                     }
                     pending.authorized = true;
                     self.save(&path, &pending)?;
-                    return self.launch_admitted(request).await;
+                    return Ok(AttestationAdmission {
+                        expires_at: pending.binding.expires_at,
+                    });
                 }
             }
         }
+    }
+}
+
+/// Docker lifecycle inside a measured confidential VM. OpenShell calls the
+/// admission gate directly, without passing through this Docker adapter.
+pub struct TeeDriver {
+    gate: AttestationGate,
+    backend: DockerDriver,
+}
+impl TeeDriver {
+    pub fn new(
+        state: &Path,
+        node: String,
+        config: TeeConfig,
+        evidence: Arc<dyn EvidenceSource>,
+        trustee: trustee::Trustee,
+        network: Arc<dyn ProofNetwork>,
+        verifier: Arc<dyn ReceiptVerifier>,
+    ) -> Result<Self> {
+        let gate = AttestationGate::new(state, config, evidence, trustee, network, verifier)?;
+        Ok(Self {
+            backend: DockerDriver::new(gate.state.join("runtime"), node)?,
+            gate,
+        })
+    }
+    #[cfg(feature = "ziren")]
+    pub async fn connect(state: &Path, node: String, config: TeeConfig) -> Result<Self> {
+        let gate = AttestationGate::connect(state, config).await?;
+        Ok(Self {
+            backend: DockerDriver::new(gate.state.join("runtime"), node)?,
+            gate,
+        })
+    }
+    pub fn driver(&self) -> &'static str {
+        self.gate.driver()
+    }
+    pub fn gate(&self) -> &AttestationGate {
+        &self.gate
+    }
+    pub(crate) fn backend(&self) -> &DockerDriver {
+        &self.backend
+    }
+    fn delegated(request: &LaunchRequest) -> LaunchRequest {
+        // Hardware deployment is inside an already measured confidential VM, not
+        // an SGX host or a host-side Docker socket. The pinned RA guest must enforce
+        // that measured init-data covers this shim, its key and the local runtime.
+        let mut delegated = request.clone();
+        delegated.driver = "docker".into();
+        delegated.trust.attestation = AttestationRequirement::SkipNonTee;
+        delegated.trust.attestation_proof = ProofRequirement::NotRequired;
+        delegated
+    }
+    async fn launch_admitted(&self, request: &LaunchRequest) -> Result<RuntimeStatus> {
+        self.backend.launch(&Self::delegated(request)).await
+    }
+
+    async fn launch_inner(&self, request: &LaunchRequest) -> Result<RuntimeStatus> {
+        if request.driver != self.driver()
+            || request.trust.attestation
+                != (AttestationRequirement::Required {
+                    profile: self.gate.config.platform.clone(),
+                })
+            || request.trust.attestation_proof != ProofRequirement::Required
+            || request.trust.policy_proof != ProofRequirement::NotRequired
+        {
+            return Err(Error::Unsupported);
+        }
+        self.backend.validate_launch(&Self::delegated(request))?;
+        self.gate.validate_request(request)?;
+        let admission = self.gate.authorize(&request.execution, request).await?;
+        if admission.ensure_fresh().is_err() {
+            let status = self.backend.inspect(&request.execution).await?;
+            if status.state == crate::runtime::RuntimeState::Starting {
+                return Err(Error::Untrusted);
+            }
+            return Ok(status);
+        }
+        self.launch_admitted(request).await
+    }
+}
+#[async_trait]
+impl RuntimeDriver for TeeDriver {
+    async fn launch(&self, request: &LaunchRequest) -> Result<RuntimeStatus> {
+        tokio::time::timeout(Duration::from_secs(300), self.launch_inner(request))
+            .await
+            .map_err(|_| Error::Unavailable)?
+    }
+    async fn inspect(&self, execution: &ExecutionIdentity) -> Result<RuntimeStatus> {
+        self.backend.inspect(execution).await
+    }
+    async fn stop(&self, execution: &ExecutionIdentity) -> Result<()> {
+        self.backend.stop(execution).await
+    }
+    async fn delete(&self, execution: &ExecutionIdentity) -> Result<()> {
+        self.backend.delete(execution).await
     }
 }
 

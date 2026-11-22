@@ -4,12 +4,14 @@
 //! proof job alongside a single-use ledger grant; receipt generation happens in
 //! the background. Strict admission still verifies a proof before granting
 //! runtime creation. Both paths consume exact-request grants before dispatch. Runtime
-//! lifecycle includes an opt-in Docker driver. The optional OpenShell client
+//! lifecycle includes Docker and TEE drivers. The always-present OpenShell access layer
+//! adds no restrictions when no user rules exist. Its native client
 //! calls its native private compute-driver API with durable ownership and
 //! proof-grant consumption through the persistent private daemon. The
 //! gateway protocol bindings are stateless; Fleet owns proof jobs, private
 //! delivery and the native readiness join. Application route publication joins durable service admission and app health. There is no local prover.
 
+pub use openshell::access;
 pub mod admission;
 pub mod attestation;
 pub mod daemon;
@@ -20,19 +22,12 @@ pub mod ledger_transport;
 pub mod machine;
 pub mod management;
 pub mod network;
-#[cfg(feature = "openshell")]
 pub mod openshell;
-#[cfg(feature = "openshell")]
 pub use openshell::daemon as openshell_daemon;
-#[cfg(feature = "openshell")]
 pub(crate) use openshell::data_plane as openshell_data_plane;
-#[cfg(feature = "openshell")]
 pub use openshell::gateway as openshell_gateway;
-#[cfg(feature = "openshell")]
 pub use openshell::lifecycle as openshell_lifecycle;
-#[cfg(feature = "openshell")]
 pub use openshell::network as openshell_network;
-#[cfg(feature = "openshell")]
 pub use openshell::services as openshell_services;
 pub mod proof;
 pub mod provisioning;

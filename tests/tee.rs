@@ -1,54 +1,25 @@
 //! Protocol/orchestration simulation. Fake receipts below are NOT ZK proofs.
-use async_trait::async_trait;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-};
-use tokio_stream::wrappers::TcpListenerStream;
+use std::sync::{atomic::Ordering, Arc};
 use trusted_shim::{
     contracts::ProofKind,
     machine::{MachineConfig, TeePlatform},
-    proof::*,
     runtime::{LaunchRequest, RuntimeDriver, RuntimeState},
     tee::{
         canonical,
         trustee::{wire, Trustee},
-        CocoEvidence, Mode, TeeConfig, TeeDriver,
+        CocoEvidence, Mode, TeeDriver,
     },
-    Error, Result,
 };
 
-fn config() -> TeeConfig {
-    TeeConfig {
-        mode: Mode::Simulation,
-        platform: "sample".into(),
-        evidence_endpoint: "http://127.0.0.1:1/aa/evidence".into(),
-        trustee_endpoint: "http://127.0.0.1:1".into(),
-        trustee_policy_ids: vec!["default".into()],
-        init_data_sha256: "11".repeat(32),
-        endpoint_key_sha256: "22".repeat(32),
-        expected_measurement: "abcde".into(),
-        proof_endpoint: "http://127.0.0.1:1".into(),
-        proof_token_file: "/unused/token".into(),
-        elf_file: "/unused/guest".into(),
-        proof_signer_file: None,
-        program_vkey_hash: "0x0000".into(),
-        program: ProgramRef {
-            kind: ProofKind::RemoteAttestation,
-            program_sha256: "aa".repeat(32),
-            verifying_key_sha256: "bb".repeat(32),
-        },
-    }
-}
+#[path = "support/tee.rs"]
+mod support;
+use support::{config, Lab, ProofDouble, ReceiptDouble};
 
 fn request(id: &str) -> LaunchRequest {
     serde_json::from_value(json!({
@@ -64,15 +35,15 @@ fn request(id: &str) -> LaunchRequest {
 #[test]
 fn machine_selection_never_promotes_discovery_or_sample_to_hardware() {
     let mut machine = MachineConfig::default();
-    assert_eq!(machine.resolve(vec![], false).unwrap().drivers, ["docker"]);
-    assert!(machine.resolve(vec![TeePlatform::IntelTdx], false).is_err());
+    assert_eq!(machine.resolve(vec![]).unwrap().drivers, ["docker"]);
+    assert!(machine.resolve(vec![TeePlatform::IntelTdx]).is_err());
     machine.tee = Some(config());
-    let profile = machine.resolve(vec![], false).unwrap();
+    let profile = machine.resolve(vec![]).unwrap();
     assert_eq!(profile.drivers, ["tee-simulation"]);
     assert!(!profile.attestation_verified);
     assert!(profile.tee_driver_configured);
     machine.labels.insert("runtime.driver".into(), "tee".into());
-    assert!(machine.resolve(vec![], false).is_err());
+    assert!(machine.resolve(vec![]).is_err());
     machine.labels.clear();
     for (platform, device) in [
         ("snp", TeePlatform::AmdSevSnp),
@@ -81,17 +52,13 @@ fn machine_selection_never_promotes_discovery_or_sample_to_hardware() {
         let tee = machine.tee.as_mut().unwrap();
         tee.mode = Mode::Hardware;
         tee.platform = platform.into();
-        assert!(machine.resolve(vec![], false).is_err());
-        assert_eq!(
-            machine.resolve(vec![device], false).unwrap().drivers,
-            ["tee"]
-        );
-        assert!(machine.resolve(vec![device], true).is_err());
+        assert!(machine.resolve(vec![]).is_err());
+        assert_eq!(machine.resolve(vec![device]).unwrap().drivers, ["tee"]);
     }
     machine.tee.as_mut().unwrap().platform = "sample".into();
-    assert!(machine.resolve(vec![TeePlatform::IntelTdx], false).is_err());
+    assert!(machine.resolve(vec![TeePlatform::IntelTdx]).is_err());
     machine.tee.as_mut().unwrap().platform = "sgx".into();
-    assert!(machine.resolve(vec![TeePlatform::IntelSgx], false).is_err());
+    assert!(machine.resolve(vec![TeePlatform::IntelSgx]).is_err());
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("sev-guest"), b"not a device").unwrap();
     std::os::unix::fs::symlink("/dev/null", root.path().join("tdx_guest")).unwrap();
@@ -117,167 +84,6 @@ fn explicit_contracts_and_canonical_configuration() {
     let a: Value = serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":0}"#).unwrap();
     let b: Value = serde_json::from_str(r#"{"a":0,"z":{"a":2,"b":1}}"#).unwrap();
     assert_eq!(canonical(&a).unwrap(), canonical(&b).unwrap());
-}
-
-#[derive(Default)]
-struct ProtocolTrustee;
-#[tonic::async_trait]
-impl wire::attestation_service_server::AttestationService for ProtocolTrustee {
-    async fn attestation_evaluate(
-        &self,
-        request: tonic::Request<wire::AttestationRequest>,
-    ) -> std::result::Result<tonic::Response<wire::AttestationResponse>, tonic::Status> {
-        use wire::individual_attestation_request::{InitData, RuntimeData};
-        let mut request = request.into_inner();
-        assert_eq!(request.policy_ids, ["default"]);
-        assert_eq!(request.verification_requests.len(), 1);
-        let request = request.verification_requests.pop().unwrap();
-        assert_eq!(request.tee, "sample");
-        assert_eq!(request.runtime_data_hash_algorithm, "sha256");
-        assert_eq!(
-            request.init_data,
-            Some(InitData::InitDataDigest(URL_SAFE_NO_PAD.encode([0x11; 32])))
-        );
-        let Some(RuntimeData::RawRuntimeData(raw)) = request.runtime_data else {
-            panic!("missing runtime binding")
-        };
-        let evidence: Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(request.evidence).unwrap()).unwrap();
-        let expected = URL_SAFE_NO_PAD.decode(raw).unwrap();
-        if STANDARD
-            .decode(evidence["report_data"].as_str().unwrap())
-            .unwrap()
-            != expected[..]
-        {
-            return Err(tonic::Status::permission_denied("report data mismatch"));
-        }
-        Ok(tonic::Response::new(wire::AttestationResponse {
-            attestation_token: "protocol-fixture-not-a-token-or-proof".into(),
-        }))
-    }
-    async fn set_attestation_policy(
-        &self,
-        _: tonic::Request<wire::SetPolicyRequest>,
-    ) -> std::result::Result<tonic::Response<wire::SetPolicyResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("read only"))
-    }
-    async fn get_attestation_challenge(
-        &self,
-        _: tonic::Request<wire::ChallengeRequest>,
-    ) -> std::result::Result<tonic::Response<wire::ChallengeResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not used for sample"))
-    }
-}
-
-struct Lab {
-    config: TeeConfig,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-}
-impl Drop for Lab {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
-impl Lab {
-    async fn start(bad_evidence: bool, real_trustee: Option<String>) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = config();
-        config.evidence_endpoint = format!("http://{}/aa/evidence", listener.local_addr().unwrap());
-        let app = axum::Router::new().route("/aa/evidence", axum::routing::get(move |axum::extract::Query(query): axum::extract::Query<HashMap<String,String>>| async move {
-            assert_eq!(query["encoding"], "base64");
-            let data = URL_SAFE_NO_PAD.decode(&query["runtime_data"]).unwrap();
-            axum::Json(json!({"svn":"1","report_data":STANDARD.encode(if bad_evidence { vec![0;32] } else { data })}))
-        }));
-        let mut tasks = vec![tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        })];
-        if let Some(endpoint) = real_trustee {
-            config.trustee_endpoint = endpoint;
-        } else {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            config.trustee_endpoint = format!("http://{}", listener.local_addr().unwrap());
-            tasks.push(tokio::spawn(async move {
-                tonic::transport::Server::builder()
-                    .add_service(
-                        wire::attestation_service_server::AttestationServiceServer::new(
-                            ProtocolTrustee,
-                        ),
-                    )
-                    .serve_with_incoming(TcpListenerStream::new(listener))
-                    .await
-                    .unwrap();
-            }));
-        }
-        Self { config, tasks }
-    }
-    async fn driver(
-        &self,
-        root: &std::path::Path,
-        proof: Arc<ProofDouble>,
-        reject: bool,
-    ) -> TeeDriver {
-        TeeDriver::new(
-            root,
-            "test-node".into(),
-            self.config.clone(),
-            Arc::new(CocoEvidence::new(self.config.evidence_endpoint.clone()).unwrap()),
-            Trustee::connect(
-                &self.config.trustee_endpoint,
-                self.config.trustee_policy_ids.clone(),
-            )
-            .await
-            .unwrap(),
-            proof,
-            Arc::new(ReceiptDouble { reject }),
-        )
-        .unwrap()
-    }
-}
-
-#[derive(Default)]
-struct ProofDouble {
-    submitted: AtomicUsize,
-    fail_submit: AtomicBool,
-    public: Mutex<Option<(String, Vec<u8>)>>,
-}
-#[async_trait]
-impl ProofNetwork for ProofDouble {
-    async fn submit(&self, request: &ProofRequest) -> Result<String> {
-        self.submitted.fetch_add(1, Ordering::SeqCst);
-        let witness: Value = serde_json::from_slice(&request.witness).unwrap();
-        assert_eq!(witness["binding"]["mode"], "simulation");
-        let evidence: Vec<u8> = serde_json::from_value(witness["evidence"].clone()).unwrap();
-        let public = canonical(&json!({"binding":witness["binding"], "evidence_sha256":hex::encode(Sha256::digest(evidence))})).unwrap();
-        assert_eq!(public, request.expected_public_values);
-        assert_eq!(request.program.kind, ProofKind::RemoteAttestation);
-        *self.public.lock().unwrap() = Some((request.request_id.clone(), public));
-        if self.fail_submit.load(Ordering::SeqCst) {
-            return Err(Error::Unavailable);
-        }
-        Ok(request.request_id.clone())
-    }
-    async fn status(&self, id: &str) -> Result<ProofStatus> {
-        let (job_id, bytes) = self.public.lock().unwrap().clone().unwrap();
-        assert_eq!(id, job_id);
-        Ok(ProofStatus::Complete(ProofReceipt {
-            job_id,
-            encoded_receipt: bytes,
-        }))
-    }
-}
-struct ReceiptDouble {
-    reject: bool,
-}
-impl ReceiptVerifier for ReceiptDouble {
-    fn verify(&self, _: &ProgramRef, receipt: &ProofReceipt, expected: &[u8]) -> Result<()> {
-        if self.reject || receipt.encoded_receipt != expected {
-            Err(Error::Untrusted)
-        } else {
-            Ok(())
-        }
-    }
 }
 
 fn no_container_intent(root: &std::path::Path) {
@@ -469,7 +275,7 @@ async fn daemon_recovers_simulation_configuration_without_contacting_proof_servi
     use std::{os::unix::fs::PermissionsExt, time::Duration};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let root = tempfile::tempdir().unwrap();
-    let state = root.path().join("daemon");
+
     let mut cfg = config();
     // Synthetic artifact identities exercise startup validation only, never proving.
     cfg.elf_file = root.path().join("synthetic.elf");
@@ -489,40 +295,47 @@ async fn daemon_recovers_simulation_configuration_without_contacting_proof_servi
         tee: Some(cfg),
         ..Default::default()
     };
-    for _ in 0..2 {
-        let config = serde_json::from_value(json!({"machine":machine})).unwrap();
-        let stop = tokio_util::sync::CancellationToken::new();
-        let daemon_state = state.clone();
-        let daemon_stop = stop.clone();
-        let task = tokio::spawn(async move {
-            trusted_shim::daemon::serve_configured(
-                &daemon_state,
-                "test-node".into(),
-                config,
-                daemon_stop,
-            )
-            .await
-        });
-        let socket = state.join("control.sock");
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
+    for native in [false, true] {
+        let state = root.path().join(if native { "native" } else { "docker" });
+        for _ in 0..2 {
+            let mut options = json!({"machine":machine});
+            if native {
+                options["openshell"] = json!({"socket":root.path().join("compute.sock"), "admission_policy":"approved", "ledger_endpoint":"http://127.0.0.1:1"});
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let config = serde_json::from_value(options).unwrap();
+            let stop = tokio_util::sync::CancellationToken::new();
+            let daemon_state = state.clone();
+            let daemon_stop = stop.clone();
+            let task = tokio::spawn(async move {
+                trusted_shim::daemon::serve_configured(
+                    &daemon_state,
+                    "test-node".into(),
+                    config,
+                    daemon_stop,
+                )
+                .await
+            });
+            let socket = state.join("control.sock");
+            for _ in 0..100 {
+                if socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+            stream.write_all(&serde_json::to_vec(&json!({"protocol":1,"node_id":"test-node","command":{"operation":"capabilities"}})).unwrap()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            let response: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response["result"]["drivers"], json!(["tee-simulation"]));
+            assert_eq!(
+                response["result"]["machine_config_sha256"],
+                machine.digest().unwrap()
+            );
+            assert_eq!(response["result"]["machine"]["attestation_verified"], false);
+            stop.cancel();
+            task.await.unwrap().unwrap();
         }
-        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
-        stream.write_all(&serde_json::to_vec(&json!({"protocol":1,"node_id":"test-node","command":{"operation":"capabilities"}})).unwrap()).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes).await.unwrap();
-        let response: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(response["result"]["drivers"], json!(["tee-simulation"]));
-        assert_eq!(
-            response["result"]["machine_config_sha256"],
-            machine.digest().unwrap()
-        );
-        assert_eq!(response["result"]["machine"]["attestation_verified"], false);
-        stop.cancel();
-        task.await.unwrap().unwrap();
     }
 }

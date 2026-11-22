@@ -1,6 +1,7 @@
 //! Calls the unmodified OpenShell compute driver on a private, same-UID Unix
 //! socket. The native driver owns workload/supervisor separation and isolation.
 //! This transport never exposes the Docker socket or substitutes plain Docker.
+pub mod access;
 pub mod daemon;
 pub(crate) mod data_plane;
 pub mod gateway;
@@ -91,7 +92,7 @@ impl NativeCreate {
         request: &crate::runtime::LaunchRequest,
         policy_sha256: &str,
     ) -> Result<Self> {
-        if bytes.len() > 1024 * 1024 || request.driver != "openshell" {
+        if bytes.len() > 1024 * 1024 {
             return Err(Error::InvalidContract);
         }
         let sandbox = DriverSandbox::decode(bytes).map_err(|_| Error::InvalidContract)?;
@@ -121,7 +122,13 @@ impl NativeCreate {
         policy_sha256: &str,
         credentials_required: bool,
     ) -> Result<()> {
-        if sandbox.encoded_len() > 1024 * 1024 || request.driver != "openshell" {
+        crate::access::native_policy(request, policy_sha256)?;
+        if sandbox.encoded_len() > 1024 * 1024
+            || !matches!(
+                request.driver.as_str(),
+                "docker" | "tee" | "tee-simulation" | "openshell"
+            )
+        {
             return Err(Error::InvalidContract);
         }
         crate::openshell_services::ServiceOptions::from_request(request)?;

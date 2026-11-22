@@ -67,7 +67,7 @@ impl MachineConfig {
 
     /// Resolve operator intent against local discovery and configured backends.
     /// Hardware discovery never supplies verifier trust roots or substitutes for evidence.
-    pub fn resolve(&self, detected: Vec<TeePlatform>, openshell: bool) -> Result<MachineProfile> {
+    pub fn resolve(&self, detected: Vec<TeePlatform>) -> Result<MachineProfile> {
         if self.labels.len() > 64
             || self.labels.iter().any(|(k, v)| {
                 k.is_empty()
@@ -93,7 +93,7 @@ impl MachineConfig {
         if let Some(tee) = &self.tee {
             tee.validate()?;
             if !matches!(selected, "auto" | "tee" | "tee-simulation")
-                || (selected != "auto" && selected != tee.driver())
+                || (matches!(selected, "tee" | "tee-simulation") && selected != tee.driver())
             {
                 return Err(Error::InvalidContract);
             }
@@ -114,11 +114,6 @@ impl MachineConfig {
             if platform.is_some_and(|p| !detected.contains(&p)) {
                 return Err(Error::Untrusted);
             }
-            // A native OpenShell driver has its own provisioning path; do not
-            // advertise it on a node whose only configured trust gate is TEE.
-            if openshell {
-                return Err(Error::Unsupported);
-            }
             drivers.push(tee.driver().into());
         } else {
             if !matches!(expected, "auto" | "none") {
@@ -129,17 +124,8 @@ impl MachineConfig {
                 "auto" if !detected.is_empty() && expected != "none" => {
                     return Err(Error::Unsupported)
                 }
-                "auto" => {
-                    drivers.push("docker".into());
-                    if openshell {
-                        drivers.push("openshell".into());
-                    }
-                }
-                "docker" if !openshell => drivers.push("docker".into()),
-                "openshell" if openshell => drivers.push("openshell".into()),
-                "docker" | "openshell" | "tee" | "tee-simulation" => {
-                    return Err(Error::Unsupported)
-                }
+                "auto" | "docker" => drivers.push("docker".into()),
+                "openshell" | "tee" | "tee-simulation" => return Err(Error::Unsupported),
                 _ => return Err(Error::InvalidContract),
             }
         }

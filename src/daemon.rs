@@ -36,7 +36,8 @@ const MAX_REQUEST: usize = crate::provisioning::MAX_PROVISION_BYTES + 16 * 1024;
 pub struct DaemonConfig {
     #[serde(default)]
     pub machine: crate::machine::MachineConfig,
-    #[cfg(feature = "openshell")]
+    /// Native enforcement connection, not an enable switch. Without it, only
+    /// requests with no user access rules can use the driver directly.
     pub openshell: Option<crate::openshell_daemon::OpenShellConfig>,
 }
 
@@ -48,8 +49,9 @@ pub enum DriverKind {
     Tee,
     #[serde(rename = "tee-simulation")]
     TeeSimulation,
-    #[cfg(feature = "openshell")]
-    Openshell,
+    /// Read compatibility for existing native journals; never advertised as a driver.
+    #[serde(rename = "openshell")]
+    LegacyOpenShell,
 }
 impl DriverKind {
     fn is_docker(&self) -> bool {
@@ -72,12 +74,10 @@ pub enum Command {
     Launch {
         request: Box<LaunchRequest>,
     },
-    #[cfg(feature = "openshell")]
     Allocate {
         execution: ExecutionIdentity,
         driver: DriverKind,
     },
-    #[cfg(feature = "openshell")]
     Provision {
         payload: Box<crate::provisioning::ProvisionRequest>,
     },
@@ -105,8 +105,8 @@ pub enum Command {
 }
 
 pub fn capabilities() -> Value {
-    json!({"protocol": PROTOCOL, "drivers": ["docker"], "features": [
-        "data-plane-v1", "runtime-management-v1", "single-use-ingress-v1", "runtime-daemon-v1"
+    json!({"protocol": PROTOCOL, "drivers": ["docker"], "access_policy": {"provider":"openshell", "default":"driver_bounds"}, "features": [
+        "data-plane-v1", "runtime-management-v1", "single-use-ingress-v1", "runtime-daemon-v1", "openshell-access-v1"
     ]})
 }
 
@@ -123,7 +123,6 @@ struct NetworkTask {
     record: Vec<u8>,
     stop: CancellationToken,
     task: JoinHandle<Result<()>>,
-    #[cfg(feature = "openshell")]
     health: Arc<crate::openshell_data_plane::Health>,
 }
 
@@ -132,9 +131,9 @@ struct Daemon {
     tee: Option<crate::tee::TeeDriver>,
     machine: crate::machine::MachineProfile,
     machine_config_sha256: String,
-    #[cfg(feature = "openshell")]
     openshell: Option<crate::openshell_daemon::OpenShellRuntime>,
     node_id: String,
+    creations: Mutex<()>,
     networks_dir: PathBuf,
     networks: Mutex<HashMap<String, NetworkTask>>,
 }
@@ -146,6 +145,37 @@ fn network_key(execution: &ExecutionIdentity) -> Result<String> {
 }
 
 impl Daemon {
+    fn lifecycle_driver(
+        &self,
+        execution: &ExecutionIdentity,
+        requested: DriverKind,
+    ) -> Result<DriverKind> {
+        if let Some(native) = &self.openshell {
+            if native.driver.claims(execution)? {
+                return Ok(DriverKind::LegacyOpenShell);
+            }
+        }
+        Ok(requested)
+    }
+    fn unclaimed_local(&self, execution: &ExecutionIdentity) -> Result<()> {
+        if self
+            .driver
+            .as_ref()
+            .map(|d| d.claims(execution))
+            .transpose()?
+            .unwrap_or(false)
+            || self
+                .tee
+                .as_ref()
+                .map(|d| d.backend().claims(execution))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            return Err(Error::Ownership);
+        }
+        Ok(())
+    }
+
     fn docker(&self) -> Result<&DockerDriver> {
         self.driver.as_ref().ok_or(Error::Unsupported)
     }
@@ -165,7 +195,6 @@ impl Daemon {
         match driver {
             DriverKind::Docker => self.docker(),
             DriverKind::Tee | DriverKind::TeeSimulation => Ok(self.tee(driver)?.backend()),
-            #[cfg(feature = "openshell")]
             _ => Err(Error::Unsupported),
         }
     }
@@ -173,11 +202,11 @@ impl Daemon {
         match driver {
             DriverKind::Docker => Ok(self.docker()?),
             DriverKind::Tee | DriverKind::TeeSimulation => Ok(self.tee(driver)?),
-            #[cfg(feature = "openshell")]
             _ => Err(Error::Unsupported),
         }
     }
-    async fn network(&self, record: NetworkRecord) -> Result<Value> {
+    async fn network(&self, mut record: NetworkRecord) -> Result<Value> {
+        record.driver = self.lifecycle_driver(&record.execution, record.driver)?;
         let key = network_key(&record.execution)?;
         let bytes = serde_json::to_vec(&record).map_err(|_| Error::InvalidContract)?;
         let mut networks = self.networks.lock().await;
@@ -210,8 +239,7 @@ impl Daemon {
                         .await?,
                 );
             }
-            #[cfg(feature = "openshell")]
-            DriverKind::Openshell => {
+            DriverKind::LegacyOpenShell => {
                 let native = self.openshell.as_ref().ok_or(Error::Unsupported)?;
                 native.supervisor_image.as_ref().ok_or(Error::Unsupported)?;
                 drop(native.driver.network_lease(&record.execution).await?);
@@ -226,7 +254,6 @@ impl Daemon {
         self.sync_networks()?;
         let stop = CancellationToken::new();
         let worker_stop = stop.clone();
-        #[cfg(feature = "openshell")]
         let health = Arc::new(crate::openshell_data_plane::Health::default());
         let task = match record.driver {
             DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
@@ -235,8 +262,7 @@ impl Daemon {
                     data_plane::serve(&driver, &record.execution, &record.config, worker_stop).await
                 })
             }
-            #[cfg(feature = "openshell")]
-            DriverKind::Openshell => {
+            DriverKind::LegacyOpenShell => {
                 let native = self.openshell.as_ref().ok_or(Error::Unsupported)?;
                 let driver = native.driver.clone();
                 let image = native.supervisor_image.clone().ok_or(Error::Unsupported)?;
@@ -260,7 +286,6 @@ impl Daemon {
                 record: bytes,
                 stop,
                 task,
-                #[cfg(feature = "openshell")]
                 health,
             },
         );
@@ -299,7 +324,6 @@ impl Daemon {
                 value["drivers"] = json!(self.machine.drivers);
                 value["machine"] = json!(self.machine);
                 value["machine_config_sha256"] = json!(self.machine_config_sha256);
-                #[cfg(feature = "openshell")]
                 if let Some(native) = &self.openshell {
                     value["openshell_config_sha256"] = json!(native.configuration_sha256);
                     value["features"]
@@ -331,16 +355,28 @@ impl Daemon {
                 Ok(value)
             }
             Command::Launch { request } => {
+                let _creation = self.creations.lock().await;
+                crate::access::driver_bounds(&request)?;
+                if self
+                    .openshell
+                    .as_ref()
+                    .map(|n| n.driver.claims(&request.execution))
+                    .transpose()?
+                    .unwrap_or(false)
+                {
+                    return Err(Error::Ownership);
+                }
                 let driver: DriverKind = serde_json::from_value(json!(request.driver))
                     .map_err(|_| Error::Unsupported)?;
                 serde_json::to_value(self.runtime(driver)?.launch(&request).await?)
                     .map_err(|_| Error::InvalidContract)
             }
-            #[cfg(feature = "openshell")]
             Command::Allocate { execution, driver } => {
-                if !matches!(driver, DriverKind::Openshell) {
-                    return Err(Error::Unsupported);
+                let _creation = self.creations.lock().await;
+                if !matches!(driver, DriverKind::LegacyOpenShell) {
+                    self.runtime(driver)?;
                 }
+                self.unclaimed_local(&execution)?;
                 serde_json::to_value(
                     self.openshell
                         .as_ref()
@@ -351,54 +387,62 @@ impl Daemon {
                 )
                 .map_err(|_| Error::InvalidContract)
             }
-            #[cfg(feature = "openshell")]
-            Command::Provision { payload } => serde_json::to_value(
-                self.openshell
-                    .as_ref()
-                    .ok_or(Error::Unsupported)?
-                    .provision(*payload)
-                    .await?,
-            )
-            .map_err(|_| Error::InvalidContract),
-            Command::Inspect { execution, driver } => match driver {
-                DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
-                    serde_json::to_value(self.runtime(driver)?.inspect(&execution).await?)
+            Command::Provision { payload } => {
+                let _creation = self.creations.lock().await;
+                self.unclaimed_local(&payload.request.execution)?;
+                if payload.request.driver != "openshell" {
+                    let driver = serde_json::from_value(json!(payload.request.driver))
+                        .map_err(|_| Error::Unsupported)?;
+                    self.runtime(driver)?;
                 }
-                #[cfg(feature = "openshell")]
-                DriverKind::Openshell => {
-                    let status = self
-                        .openshell
+                serde_json::to_value(
+                    self.openshell
                         .as_ref()
                         .ok_or(Error::Unsupported)?
-                        .driver
-                        .inspect(&execution)
-                        .await?;
-                    let ready = status.platform_ready
-                        && self
-                            .networks
-                            .lock()
-                            .await
-                            .get(&network_key(&execution)?)
-                            .is_some_and(|task| {
-                                !task.stop.is_cancelled()
-                                    && !task.task.is_finished()
-                                    && task.health.ready()
-                            });
-                    let mut value =
-                        serde_json::to_value(status).map_err(|_| Error::InvalidContract)?;
-                    value["application_ready"] = json!(ready);
-                    Ok(value)
-                }
+                        .provision(*payload, self.tee.as_ref().map(|tee| tee.gate()))
+                        .await?,
+                )
+                .map_err(|_| Error::InvalidContract)
             }
-            .map_err(|_| Error::InvalidContract),
+            Command::Inspect { execution, driver } => {
+                match self.lifecycle_driver(&execution, driver)? {
+                    DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
+                        serde_json::to_value(self.runtime(driver)?.inspect(&execution).await?)
+                    }
+                    DriverKind::LegacyOpenShell => {
+                        let status = self
+                            .openshell
+                            .as_ref()
+                            .ok_or(Error::Unsupported)?
+                            .driver
+                            .inspect(&execution)
+                            .await?;
+                        let ready = status.platform_ready
+                            && self
+                                .networks
+                                .lock()
+                                .await
+                                .get(&network_key(&execution)?)
+                                .is_some_and(|task| {
+                                    !task.stop.is_cancelled()
+                                        && !task.task.is_finished()
+                                        && task.health.ready()
+                                });
+                        let mut value =
+                            serde_json::to_value(status).map_err(|_| Error::InvalidContract)?;
+                        value["application_ready"] = json!(ready);
+                        Ok(value)
+                    }
+                }
+                .map_err(|_| Error::InvalidContract)
+            }
             Command::Stop { execution, driver } => {
-                match driver {
+                match self.lifecycle_driver(&execution, driver)? {
                     DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
                         self.runtime(driver)?.stop(&execution).await?;
                         self.forget_network(&execution).await?;
                     }
-                    #[cfg(feature = "openshell")]
-                    DriverKind::Openshell => {
+                    DriverKind::LegacyOpenShell => {
                         self.openshell
                             .as_ref()
                             .ok_or(Error::Unsupported)?
@@ -411,13 +455,12 @@ impl Daemon {
                 Ok(json!({"stopped": true}))
             }
             Command::Delete { execution, driver } => {
-                match driver {
+                match self.lifecycle_driver(&execution, driver)? {
                     DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
                         self.runtime(driver)?.delete(&execution).await?;
                         self.forget_network(&execution).await?;
                     }
-                    #[cfg(feature = "openshell")]
-                    DriverKind::Openshell => {
+                    DriverKind::LegacyOpenShell => {
                         self.openshell
                             .as_ref()
                             .ok_or(Error::Unsupported)?
@@ -514,13 +557,7 @@ pub async fn serve_configured(
     config: DaemonConfig,
     stop: CancellationToken,
 ) -> Result<()> {
-    #[cfg(feature = "openshell")]
-    let has_openshell = config.openshell.is_some();
-    #[cfg(not(feature = "openshell"))]
-    let has_openshell = false;
-    let machine = config
-        .machine
-        .resolve(crate::machine::detect()?, has_openshell)?;
+    let machine = config.machine.resolve(crate::machine::detect()?)?;
     let machine_config_sha256 = config.machine.digest()?;
     if !state.is_absolute() || node_id.is_empty() {
         return Err(Error::InvalidContract);
@@ -571,13 +608,13 @@ pub async fn serve_configured(
         // cleanup authority as well as the already-created workloads.
         return Err(Error::Ownership);
     }
-    #[cfg(feature = "openshell")]
+    if config.openshell.is_none() && state.join("openshell.sqlite").exists() {
+        return Err(Error::Ownership);
+    }
     let openshell = config
         .openshell
         .map(|c| crate::openshell_daemon::OpenShellRuntime::open(state, node_id.clone(), c))
         .transpose()?;
-    #[cfg(not(feature = "openshell"))]
-    let _ = config;
     let socket_path = state.join("control.sock");
     match std::fs::remove_file(&socket_path) {
         Ok(()) => {}
@@ -596,9 +633,9 @@ pub async fn serve_configured(
         tee,
         machine,
         machine_config_sha256,
-        #[cfg(feature = "openshell")]
         openshell,
         node_id,
+        creations: Mutex::new(()),
         networks_dir,
         networks: Mutex::new(HashMap::new()),
     });

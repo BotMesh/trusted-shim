@@ -1,4 +1,3 @@
-#![cfg(feature = "openshell")]
 use openshell_core::{
     extension_protocol::{extension_metadata, ExtensionFamily},
     policy_identity::deterministic_policy_hash,
@@ -58,15 +57,16 @@ fn gateway_workspace_mapping_keeps_full_canonical_identity_bound() {
 mod native_gateway;
 
 fn fixture() -> (LaunchRequest, DriverSandbox, String) {
-    let request: LaunchRequest = serde_json::from_value(serde_json::json!({
+    let mut request: LaunchRequest = serde_json::from_value(serde_json::json!({
         "execution":{"namespace":"test","workload":"agent","allocation_id":"agent-0","lease_id":"one","generation":1,"node_id":"node"},
-        "driver":"openshell","image":"agent@sha256:approved","command":["agent","serve"],"environment":{"MODEL":"test"},
+        "driver":"docker","image":"agent@sha256:approved","command":["agent","serve"],"environment":{"MODEL":"test"},
         "limits":{"cpu_millicores":500,"memory_bytes":67108864},
         "policy":{"issuer":"central","policy_id":"create","version":1,"sha256":"a".repeat(64)},
         "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required","attestation_proof":"not_required"},"services":[]
     })).unwrap();
     let policy = SandboxPolicy::default();
     let hash = deterministic_policy_hash(&policy);
+    request.access_policy_sha256 = Some(hash.clone());
     let sandbox = DriverSandbox {
         id: "sandbox-1".into(),
         name: "agent-1".into(),
@@ -182,7 +182,7 @@ fn control_observation_strips_native_credentials_endpoints_and_diagnostics() {
 #[test]
 fn native_gateway_pending_status_and_identity_selectors_cannot_claim_execution_authority() {
     use openshell_core::proto::sandbox::v1::ProcessPolicy;
-    let (r, mut sandbox, _) = fixture();
+    let (mut r, mut sandbox, _) = fixture();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.policy.as_mut().unwrap().process = Some(ProcessPolicy {
         run_as_user: "1000".into(),
@@ -193,6 +193,7 @@ fn native_gateway_pending_status_and_identity_selectors_cannot_claim_execution_a
         group: "1000".into(),
     });
     let p = deterministic_policy_hash(spec.policy.as_ref().unwrap());
+    r.access_policy_sha256 = Some(p.clone());
     assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &r, &p).is_ok());
     for change in 0..11 {
         let mut s = sandbox.clone();
@@ -322,8 +323,7 @@ fn gateway_binding_fences_every_allocation_field_and_requires_native_credentials
     }
     let mut changed_policy = policy.clone();
     changed_policy.version += 1;
-    let other = GatewayLaunch::new(launch.clone(), changed_policy).unwrap();
-    assert!(other.validate_proposal(&proposal).is_err());
+    assert!(GatewayLaunch::new(launch.clone(), changed_policy).is_err());
     let mut unsupported = launch.clone();
     unsupported.driver_options = serde_json::json!({"privileged":true});
     assert!(GatewayLaunch::new(unsupported, policy.clone()).is_err());
@@ -1126,9 +1126,17 @@ async fn native_dispatch_at_remote(via_daemon: bool) {
             let command = json!({"operation":"provision","payload":payload});
             let caps = call(json!({"operation":"capabilities"})).await;
             let allocated =
-                call(json!({"operation":"allocate","driver":"openshell","execution":r.execution}))
+                call(json!({"operation":"allocate","driver":"docker","execution":r.execution}))
                     .await;
             assert_eq!(allocated["result"]["phase"], "reserved");
+            let mut stripped = r.clone();
+            stripped.access_policy_sha256 = None;
+            assert!(call(json!({"operation":"launch", "request":stripped}))
+                .await
+                .get("error")
+                .is_some());
+            assert_eq!(caps["result"]["drivers"], json!(["docker"]));
+            assert_eq!(caps["result"]["access_policy"]["default"], "driver_bounds");
             assert!(caps["result"]["features"]
                 .as_array()
                 .unwrap()
@@ -1165,7 +1173,7 @@ async fn native_dispatch_at_remote(via_daemon: bool) {
             let (stop, task) = start();
             assert_eq!(call(command).await.get("error").is_none(), !lose);
             let status =
-                call(json!({"operation":"inspect","driver":"openshell","execution":r.execution}))
+                call(json!({"operation":"inspect","driver":"docker","execution":r.execution}))
                     .await;
             assert!(status.get("error").is_none());
             assert!(status["result"].get("ready").is_none()); // platform is not application readiness
@@ -1173,14 +1181,14 @@ async fn native_dispatch_at_remote(via_daemon: bool) {
             let mut other = r.execution.clone();
             other.lease_id = "wrong".into();
             assert!(
-                call(json!({"operation":"delete","driver":"openshell","execution":other}))
+                call(json!({"operation":"delete","driver":"docker","execution":other}))
                     .await
                     .get("error")
                     .is_some()
             );
             assert_eq!(
-                call(json!({"operation":"delete","driver":"openshell","execution":r.execution}))
-                    .await["result"]["cleaned"],
+                call(json!({"operation":"delete","driver":"docker","execution":r.execution})).await
+                    ["result"]["cleaned"],
                 true
             );
             stop.cancel();
@@ -1370,4 +1378,114 @@ async fn reserved_allocation_is_created_once_under_concurrent_replay() {
     assert!(x.is_ok() && y.is_ok());
     assert_eq!(h.service.created.load(Ordering::SeqCst), 1);
     assert_eq!(h.ledger.consumed.lock().unwrap().len(), 1);
+}
+
+#[path = "../support/tee.rs"]
+mod tee_support;
+
+#[tokio::test]
+async fn native_tee_gate_precedes_policy_consumption_and_create_and_survives_replay() {
+    use tee_support::{Lab, ProofDouble};
+    for bad_quote in [true, false] {
+        let lab = Lab::start(bad_quote, None).await;
+        let h = Harness::new().await;
+        let proof = Arc::new(ProofDouble::default());
+        let gate_root = tempfile::tempdir().unwrap();
+        let tee = lab
+            .driver(gate_root.path(), proof.clone(), !bad_quote)
+            .await;
+        let (r, s, p) = fixture();
+        let native = NativeCreate::decode(&s.encode_to_vec(), &r, &p).unwrap();
+        let (a, g) = authorization(&r, &native, "rejected-ra");
+        assert!(h
+            .driver()
+            .launch_with_attestation(&r, native, &a, &g, h.ledger.as_ref(), Some(tee.gate()))
+            .await
+            .is_err());
+        assert_eq!(h.service.created.load(Ordering::SeqCst), 0);
+        assert!(h.ledger.consumed.lock().unwrap().is_empty());
+    }
+    let lab = Lab::start(false, None).await;
+    let h = Harness::new().await;
+    let proof = Arc::new(ProofDouble::default());
+    let gate_root = tempfile::tempdir().unwrap();
+    let tee = lab.driver(gate_root.path(), proof.clone(), false).await;
+    let (r, s, p) = fixture();
+    let bytes = s.encode_to_vec();
+    let native = || NativeCreate::decode(&bytes, &r, &p).unwrap();
+    let (a, g) = authorization(&r, &native(), "accepted-ra");
+    h.driver()
+        .launch_with_attestation(&r, native(), &a, &g, h.ledger.as_ref(), Some(tee.gate()))
+        .await
+        .unwrap();
+    // A restart must only observe the existing native sandbox, even if the
+    // proof service is unavailable. It cannot consume another grant or create.
+    drop(tee);
+    let tee = lab.driver(gate_root.path(), proof.clone(), true).await;
+    drop(lab);
+    h.driver()
+        .launch_with_attestation(&r, native(), &a, &g, h.ledger.as_ref(), Some(tee.gate()))
+        .await
+        .unwrap();
+    assert_eq!(h.service.created.load(Ordering::SeqCst), 1);
+    assert_eq!(h.ledger.consumed.lock().unwrap().len(), 1);
+    assert_eq!(proof.submitted.load(Ordering::SeqCst), 1);
+    h.driver().delete(&r.execution).await.unwrap();
+    assert!(h
+        .driver()
+        .launch_with_attestation(&r, native(), &a, &g, h.ledger.as_ref(), Some(tee.gate()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn expired_native_ra_cannot_consume_a_grant_or_dispatch() {
+    use sha2::{Digest, Sha256};
+    use tee_support::{Lab, ProofDouble};
+    let lab = Lab::start(false, None).await;
+    let h = Harness::new().await;
+    let proof = Arc::new(ProofDouble::default());
+    let root = tempfile::tempdir().unwrap();
+    let tee = lab.driver(root.path(), proof, false).await;
+    let (r, s, p) = fixture();
+    let native = NativeCreate::decode(&s.encode_to_vec(), &r, &p).unwrap();
+    let (a, g) = authorization(&r, &native, "expired-ra");
+    tee.gate()
+        .authorize(&r.execution, &native.authorization_parameters())
+        .await
+        .unwrap();
+    let path = root.path().join("tee").join(format!(
+        "{}.json",
+        hex::encode(Sha256::digest(
+            trusted_shim::tee::canonical(&r.execution).unwrap()
+        ))
+    ));
+    let mut pending: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    pending["binding"]["expires_at"] = 0.into();
+    std::fs::write(path, serde_json::to_vec(&pending).unwrap()).unwrap();
+    assert!(h
+        .driver()
+        .launch_with_attestation(&r, native, &a, &g, h.ledger.as_ref(), Some(tee.gate()))
+        .await
+        .is_err());
+    assert_eq!(h.service.created.load(Ordering::SeqCst), 0);
+    assert!(h.ledger.consumed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn user_access_policy_is_independent_of_driver_and_cannot_be_dropped_or_substituted() {
+    let (mut request, sandbox, hash) = fixture();
+    for driver in ["docker", "tee", "tee-simulation"] {
+        request.driver = driver.into();
+        NativeCreate::decode(&sandbox.encode_to_vec(), &request, &hash).unwrap();
+        assert!(trusted_shim::access::driver_bounds(&request).is_err());
+        let mut missing = request.clone();
+        missing.access_policy_sha256 = None;
+        trusted_shim::access::driver_bounds(&missing).unwrap();
+        assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &missing, &hash).is_err());
+        request.access_policy_sha256 = Some("ff".repeat(32));
+        assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &request, &hash).is_err());
+        request.access_policy_sha256 = Some(hash.clone());
+    }
 }

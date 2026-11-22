@@ -123,6 +123,11 @@ pub struct ManagedNativeDriver {
 }
 
 impl ManagedNativeDriver {
+    pub(crate) fn claims(&self, execution: &ExecutionIdentity) -> Result<bool> {
+        Ok(self.read(&self.slot(execution)?)?.is_some_and(|r| {
+            r.phase != ProvisioningPhase::Deleted || r.execution.generation >= execution.generation
+        }))
+    }
     pub fn open(state: PathBuf, node_id: String, native: NativeDriver) -> Result<Self> {
         if !state.is_absolute() || node_id.is_empty() {
             return Err(Error::InvalidContract);
@@ -296,7 +301,24 @@ impl ManagedNativeDriver {
         grant: &ExecutionGrant,
         ledger: &dyn AuthorizationLedger,
     ) -> Result<ProvisioningStatus> {
-        if request.trust.attestation != AttestationRequirement::SkipNonTee
+        self.launch_with_attestation(request, prepared, authorization, grant, ledger, None)
+            .await
+    }
+
+    /// The node-owned gate applies to every new native create on a TEE node.
+    /// Reconciliation and cleanup remain independent of proof service availability.
+    pub async fn launch_with_attestation(
+        &self,
+        request: &LaunchRequest,
+        prepared: NativeCreate,
+        authorization: &EvaluationRequest,
+        grant: &ExecutionGrant,
+        ledger: &dyn AuthorizationLedger,
+        attestation: Option<&crate::tee::AttestationGate>,
+    ) -> Result<ProvisioningStatus> {
+        if let Some(gate) = attestation {
+            gate.validate_request(request)?;
+        } else if request.trust.attestation != AttestationRequirement::SkipNonTee
             || request.trust.attestation_proof != ProofRequirement::NotRequired
         {
             return Err(Error::Unsupported);
@@ -342,6 +364,18 @@ impl ManagedNativeDriver {
         {
             return Err(Error::Ownership);
         }
+        // Hashes bind the exact launch, native protobuf and policy; bearer
+        // tokens never enter the RA witness. Do not consume the policy grant
+        // until the synchronous RA gate has accepted the receipt.
+        let admission = if let Some(gate) = attestation {
+            let admission = gate
+                .authorize(&request.execution, &prepared.authorization_parameters())
+                .await?;
+            admission.ensure_fresh()?;
+            Some(admission)
+        } else {
+            None
+        };
         let mut record = Record {
             execution: request.execution.clone(),
             launch_sha256: prepared.launch_sha256.clone(),
@@ -364,6 +398,9 @@ impl ManagedNativeDriver {
         record.phase = ProvisioningPhase::Dispatched;
         self.save(&slot, &record, false)?;
         execution_digest(authorization, grant)?;
+        if let Some(admission) = &admission {
+            admission.ensure_fresh()?;
+        }
         dispatch.send().await?;
         record.phase = ProvisioningPhase::Created;
         self.save(&slot, &record, false)?;

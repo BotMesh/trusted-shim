@@ -110,6 +110,11 @@ async fn log_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u
 }
 
 impl DockerDriver {
+    pub(crate) fn claims(&self, execution: &ExecutionIdentity) -> Result<bool> {
+        Ok(self.read(&self.slot(execution)?)?.is_some_and(|r| {
+            r.phase != Phase::Deleted || r.execution.generation >= execution.generation
+        }))
+    }
     pub(crate) fn validate_launch(&self, request: &LaunchRequest) -> Result<()> {
         self.slot(&request.execution)?;
         Self::options(request)?;
@@ -696,6 +701,7 @@ impl DockerDriver {
     }
 
     fn options(request: &LaunchRequest) -> Result<DockerOptions> {
+        crate::access::driver_bounds(request)?;
         if request.driver != "docker"
             || request.trust.attestation != AttestationRequirement::SkipNonTee
             || request.trust.attestation_proof != ProofRequirement::NotRequired
