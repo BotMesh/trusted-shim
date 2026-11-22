@@ -477,6 +477,16 @@ Its proof service and route-grant issuer
 are explicit test fixtures; it is neither a fresh proof nor a cross-machine NAT
 acceptance test.
 
+The pinned router transport also sends standard WebSocket Ping/Pong controls,
+with a 15-second interval and 15-second reply deadline. Idle outbound connections
+stay active through NAT/proxies; silent network loss closes streams within about
+30 seconds plus scheduling delay. Recovery reconnects without replaying work or
+creating another runtime. Router's `tools/test_nat.py` and `tools/test_remote.py`
+exercise this transport using isolated NAT namespaces and an authorized remote
+SSH host, respectively. They use fixture grants and loopback applications;
+cross-machine Fleet/OpenShell control and actual workload migration remain
+separate acceptance gates.
+
 Canonical namespace IDs map to native workspace names within the stock gateway's
 19-byte limit; the full Fleet identity remains proof-bound. The embedding control
 plane must reject collisions. Explicit nonempty commands avoid the gateway's
