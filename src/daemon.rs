@@ -118,6 +118,8 @@ struct NetworkTask {
     record: Vec<u8>,
     stop: CancellationToken,
     task: JoinHandle<Result<()>>,
+    #[cfg(feature = "openshell")]
+    health: Arc<crate::openshell_data_plane::Health>,
 }
 
 struct Daemon {
@@ -175,6 +177,8 @@ impl Daemon {
         self.sync_networks()?;
         let stop = CancellationToken::new();
         let worker_stop = stop.clone();
+        #[cfg(feature = "openshell")]
+        let health = Arc::new(crate::openshell_data_plane::Health::default());
         let task = match record.driver {
             DriverKind::Docker => {
                 let driver = self.driver.clone();
@@ -187,6 +191,7 @@ impl Daemon {
                 let native = self.openshell.as_ref().ok_or(Error::Unsupported)?;
                 let driver = native.driver.clone();
                 let image = native.supervisor_image.clone().ok_or(Error::Unsupported)?;
+                let health = health.clone();
                 tokio::spawn(async move {
                     crate::openshell_data_plane::serve(
                         &driver,
@@ -194,6 +199,7 @@ impl Daemon {
                         &record.config,
                         &image,
                         worker_stop,
+                        health,
                     )
                     .await
                 })
@@ -205,6 +211,8 @@ impl Daemon {
                 record: bytes,
                 stop,
                 task,
+                #[cfg(feature = "openshell")]
+                health,
             },
         );
         Ok(json!({"connected_worker": true}))
@@ -259,6 +267,10 @@ impl Daemon {
                             .as_array_mut()
                             .unwrap()
                             .push(json!("openshell-local-services-v1"));
+                        value["features"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!("openshell-service-health-v1"));
                     }
                 }
                 value["pid"] = json!(std::process::id());
@@ -295,14 +307,30 @@ impl Daemon {
             Command::Inspect { execution, driver } => match driver {
                 DriverKind::Docker => serde_json::to_value(self.driver.inspect(&execution).await?),
                 #[cfg(feature = "openshell")]
-                DriverKind::Openshell => serde_json::to_value(
-                    self.openshell
+                DriverKind::Openshell => {
+                    let status = self
+                        .openshell
                         .as_ref()
                         .ok_or(Error::Unsupported)?
                         .driver
                         .inspect(&execution)
-                        .await?,
-                ),
+                        .await?;
+                    let ready = status.platform_ready
+                        && self
+                            .networks
+                            .lock()
+                            .await
+                            .get(&network_key(&execution)?)
+                            .is_some_and(|task| {
+                                !task.stop.is_cancelled()
+                                    && !task.task.is_finished()
+                                    && task.health.ready()
+                            });
+                    let mut value =
+                        serde_json::to_value(status).map_err(|_| Error::InvalidContract)?;
+                    value["application_ready"] = json!(ready);
+                    Ok(value)
+                }
             }
             .map_err(|_| Error::InvalidContract),
             Command::Stop { execution, driver } => {

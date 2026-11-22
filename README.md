@@ -385,8 +385,8 @@ This adapter proves provisioning admission only. It does not claim that platform
 or provide TEE attestation. Fleet's guarded activation/credential API is available;
 Fleet's embedded stock-gateway compute extension now connects remote startup
 proofs to private node delivery. Local HTTP health now gates outbound service
-registration; joining central policy readiness for production publication still
-needs integration. `control_observation` strips native configuration, credentials, local
+registration; Fleet joins central policy readiness before publishing services.
+`control_observation` strips native configuration, credentials, local
 endpoints and condition messages before returning bounded status to Fleet; it
 cannot establish application readiness. Native split credentials
 must never enter an ordinary Fleet App spec, workload environment or public response.
@@ -451,8 +451,14 @@ of Ray. Stop/delete permanently fence connections and wait for transport drain
 before native cleanup. No host application port is published. A started connector
 worker is not proof of route reachability or policy readiness.
 
-Automatic Fleet publication remains disabled pending authenticated gateway
-configuration/policy readiness. The stock supervisor health socket indicates
+With the service adapter configured, `openshell-service-health-v1` advertises
+local health reporting. Native `inspect.application_ready` requires a running
+connector worker and a successful local probe within six seconds. It does not
+wait for registration grants. The value resets on health failure, worker exit,
+cancellation and daemon restart, avoiding a route-grant/readiness dependency cycle.
+
+Fleet publication additionally requires its authenticated gateway
+configuration/policy observer. The stock supervisor health socket indicates
 session acceptance **before** asynchronous configuration application, so it cannot
 replace this gate. Router grants, revocation and control-snapshot freshness still apply;
 local connectivity during a control outage does not authorize indefinite access.
@@ -460,7 +466,8 @@ local connectivity during a control outage does not authorize indefinite access.
 Fleet's opt-in native Docker acceptance composes this helper with the stock
 supervisor and exercises real HTTP/SSE/WebSocket through the local Data Router,
 including wrong tenant/image/host-key rejection, active-stream revocation,
-health denial/recovery, durable daemon restart, cleanup drain and control-gateway outage.
+health denial/recovery, durable daemon restart, cleanup drain, gateway mTLS
+readiness, cache expiry and control-gateway outage.
 Its proof service and route-grant issuer
 are explicit test fixtures; it is neither a fresh proof nor a cross-machine NAT
 acceptance test.

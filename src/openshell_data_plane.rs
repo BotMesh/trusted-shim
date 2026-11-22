@@ -6,10 +6,35 @@ use crate::{
     openshell_lifecycle::ManagedNativeDriver,
     Error, Result,
 };
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 use trusted_contracts::ExecutionIdentity;
 use trusted_router_transport::grants::Verifier;
+
+/// Local application health only. Never persisted and never derived from a
+/// registration grant: Fleet must independently join central policy readiness.
+#[derive(Default)]
+pub(crate) struct Health(Mutex<Option<Instant>>);
+impl Health {
+    pub fn ready(&self) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|v| v.is_some_and(|t| t.elapsed() < Duration::from_secs(6)))
+    }
+    fn mark(&self) {
+        if let Ok(mut value) = self.0.lock() {
+            *value = Some(Instant::now());
+        }
+    }
+    fn clear(&self) {
+        if let Ok(mut value) = self.0.lock() {
+            *value = None;
+        }
+    }
+}
 
 pub(crate) async fn serve(
     driver: &ManagedNativeDriver,
@@ -17,10 +42,19 @@ pub(crate) async fn serve(
     config: &NetworkConfig,
     supervisor_image: &str,
     stop: CancellationToken,
+    health: Arc<Health>,
 ) -> Result<()> {
     data_plane::validate_config(config)?;
     loop {
-        let result = serve_once(driver, execution, config, supervisor_image, stop.clone()).await;
+        let result = serve_once(
+            driver,
+            execution,
+            config,
+            supervisor_image,
+            stop.clone(),
+            &health,
+        )
+        .await;
         if stop.is_cancelled() {
             return Ok(());
         }
@@ -43,7 +77,16 @@ async fn serve_once(
     config: &NetworkConfig,
     supervisor_image: &str,
     stop: CancellationToken,
+    application: &Health,
 ) -> Result<()> {
+    application.clear();
+    struct Reset<'a>(&'a Health);
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            self.0.clear();
+        }
+    }
+    let _reset = Reset(application);
     let health_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(3))
@@ -90,6 +133,7 @@ async fn serve_once(
     let mut tasks = tokio::task::JoinSet::new();
     let result = async {
         ready?;
+        application.mark();
         let verifier = Verifier::from_file(config.public_key_file.clone(), config.issuer.clone())
             .map_err(|_| Error::InvalidContract)?;
         let client = reqwest::Client::builder()
@@ -122,6 +166,7 @@ async fn serve_once(
                 {
                     return;
                 }
+                application.mark();
             }
         };
         tokio::select! {
@@ -131,10 +176,28 @@ async fn serve_once(
         Ok(())
     }
     .await;
+    application.clear();
     children.cancel();
     while tasks.join_next().await.is_some() {}
     service.close().await;
     // Cleanup waits for this guard: transport shutdown precedes native deletion.
     drop(lease.fence);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn health_requires_recent_probe_and_is_not_restored_from_disk() {
+        let health = Health::default();
+        assert!(!health.ready());
+        health.mark();
+        assert!(health.ready());
+        *health.0.lock().unwrap() = Some(Instant::now() - Duration::from_secs(6));
+        assert!(!health.ready());
+        health.mark();
+        health.clear();
+        assert!(!health.ready());
+    }
 }
