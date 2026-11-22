@@ -35,24 +35,24 @@ pub struct NetworkConfig {
 pub(crate) fn validate_config(config: &NetworkConfig) -> Result<()> {
     endpoint(&config.gateway_url, "https", "http")?;
     endpoint(&config.relay_url, "wss", "ws")?;
-    Verifier::new(
-        &std::fs::read(&config.public_key_file).map_err(|_| Error::Unavailable)?,
-        config.issuer.clone(),
-    )
-    .map_err(|_| Error::InvalidContract)?;
+    Verifier::from_file(config.public_key_file.clone(), config.issuer.clone())
+        .map_err(|_| Error::InvalidContract)?;
     read_private(&config.token_file)?;
     Ok(())
 }
 
 pub struct NetworkLease {
-    pub(crate) _file: File,
-    pub(crate) closed: PathBuf,
+    pub(crate) fence: NetworkFence,
     pub(crate) services: Vec<ServiceSpec>,
     pub(crate) target: SocketAddr,
     pub(crate) ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
 }
-impl NetworkLease {
-    async fn cancelled(&self) {
+pub(crate) struct NetworkFence {
+    pub(crate) _file: File,
+    pub(crate) closed: PathBuf,
+}
+impl NetworkFence {
+    pub(crate) async fn cancelled(&self) {
         loop {
             // An unreadable fence is also a reason to close network access.
             if !matches!(self.closed.try_exists(), Ok(false)) {
@@ -218,11 +218,8 @@ pub async fn serve(
 ) -> Result<()> {
     endpoint(&config.gateway_url, "https", "http")?;
     endpoint(&config.relay_url, "wss", "ws")?;
-    let verifier = Verifier::new(
-        &std::fs::read(&config.public_key_file).map_err(|_| Error::Unavailable)?,
-        config.issuer.clone(),
-    )
-    .map_err(|_| Error::InvalidContract)?;
+    let verifier = Verifier::from_file(config.public_key_file.clone(), config.issuer.clone())
+        .map_err(|_| Error::InvalidContract)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
@@ -255,34 +252,9 @@ pub async fn serve(
             target
         };
         let shutdown = children.clone();
-        tasks.spawn(async move {
-            let mut backoff = 1;
-            loop {
-                let registration = tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    registration = grant(&config, &verifier, &client, &execution, &service) => registration,
-                };
-                if let Ok((url, token, exp)) = registration
-                {
-                    let started = tokio::time::Instant::now();
-                    let active_stop = CancellationToken::new();
-                    let active = edge::connect(&url, &token, target, active_stop.clone());
-                    tokio::pin!(active);
-                    tokio::select! {
-                        _ = &mut active => {},
-                        _ = shutdown.cancelled() => { active_stop.cancel(); let _ = active.await; return; },
-                        _ = renew_registration(&config, &verifier, &client, &execution, &service, &url, exp) => {
-                            active_stop.cancel(); let _ = active.await;
-                        },
-                    }
-                    if started.elapsed() > Duration::from_secs(30) {
-                        backoff = 1;
-                    }
-                }
-                tokio::select! { _ = shutdown.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(backoff)) => {} }
-                backoff = (backoff * 2).min(30);
-            }
-        });
+        tasks.spawn(connect_service(
+            config, verifier, client, execution, service, target, shutdown,
+        ));
     }
     let monitor = async {
         loop {
@@ -293,7 +265,7 @@ pub async fn serve(
             }
         }
     };
-    tokio::select! { _ = stop.cancelled() => {}, _ = lease.cancelled() => {}, _ = monitor => {}, _ = tasks.join_next() => {} }
+    tokio::select! { _ = stop.cancelled() => {}, _ = lease.fence.cancelled() => {}, _ = monitor => {}, _ = tasks.join_next() => {} }
     children.cancel();
     while tasks.join_next().await.is_some() {}
     // Transport streams are closed before releasing the port. Cancel idle HTTP
@@ -305,4 +277,42 @@ pub async fn serve(
     // Only now can cleanup acquire the network lock and reassign the host port.
     drop(lease);
     Ok(())
+}
+
+// Shared by native and Docker adapters; targets always come from owned records.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn connect_service(
+    config: NetworkConfig,
+    verifier: Verifier,
+    client: reqwest::Client,
+    execution: ExecutionIdentity,
+    service: ServiceSpec,
+    target: SocketAddr,
+    shutdown: CancellationToken,
+) {
+    let mut backoff = 1;
+    loop {
+        let registration = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            registration = grant(&config, &verifier, &client, &execution, &service) => registration,
+        };
+        if let Ok((url, token, exp)) = registration {
+            let started = tokio::time::Instant::now();
+            let active_stop = CancellationToken::new();
+            let active = edge::connect(&url, &token, target, active_stop.clone());
+            tokio::pin!(active);
+            tokio::select! {
+                _ = &mut active => {},
+                _ = shutdown.cancelled() => { active_stop.cancel(); let _ = active.await; return; },
+                _ = renew_registration(&config, &verifier, &client, &execution, &service, &url, exp) => {
+                    active_stop.cancel(); let _ = active.await;
+                },
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                backoff = 1;
+            }
+        }
+        tokio::select! { _ = shutdown.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(backoff)) => {} }
+        backoff = (backoff * 2).min(30);
+    }
 }
