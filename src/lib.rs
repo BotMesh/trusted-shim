@@ -1,7 +1,9 @@
 //! Machine-local runtime and trust interfaces below zkm-fleet.
 //!
-//! Policy admission evaluates Rego, requests a remote proof, verifies its exact
-//! public values and consumes a central ledger grant before dispatch. Runtime
+//! Preflight action admission evaluates Rego and atomically persists a remote
+//! proof job alongside a single-use ledger grant; receipt generation happens in
+//! the background. Strict admission still verifies a proof before granting
+//! runtime creation. Both paths consume exact-request grants before dispatch. Runtime
 //! lifecycle includes an opt-in Docker driver. The optional OpenShell client
 //! calls its native private compute-driver API with durable ownership and
 //! proof-grant consumption through the persistent private daemon. The

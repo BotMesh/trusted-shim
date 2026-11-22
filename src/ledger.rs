@@ -17,6 +17,10 @@ use trusted_rail::{
     *,
 };
 
+#[path = "preflight.rs"]
+mod preflight;
+pub use preflight::{PreflightDecision, PreflightReceiptState, PreflightWorker};
+
 type Result<T> = trusted_rail::Result<T>;
 
 /// Operator-selected rights for a single exact execution, never a namespace-wide
@@ -212,6 +216,12 @@ impl SqliteLedger {
           CREATE TABLE IF NOT EXISTS ledger_access(token_hash TEXT PRIMARY KEY, execution TEXT NOT NULL REFERENCES authorities(execution), permissions INTEGER NOT NULL, not_before INTEGER NOT NULL, expires_at INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, execution TEXT NOT NULL REFERENCES authorities(execution), action TEXT NOT NULL, epoch INTEGER NOT NULL, request TEXT NOT NULL, decision TEXT NOT NULL, cost INTEGER NOT NULL, state INTEGER NOT NULL DEFAULT 0, proof BLOB, UNIQUE(execution,action));"))?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        db(tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS preflight_receipts(
+          id TEXT PRIMARY KEY REFERENCES actions(id), witness BLOB NOT NULL,
+          public_values BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'queued', receipt BLOB);
+          CREATE INDEX IF NOT EXISTS preflight_pending ON preflight_receipts(status);",
+        ))?;
         db(tx.execute(
             "INSERT OR IGNORE INTO program VALUES(1,?1,?2)",
             params![program.program_sha256, program.verifying_key_sha256],
