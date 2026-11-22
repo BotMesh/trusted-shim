@@ -234,6 +234,21 @@ or local prover is included.
 
 ## Native OpenShell transport
 
+The pinned stock gateway's create protocol is covered by an opt-in integration
+test. It starts an isolated gateway, authenticates with mTLS, creates a workspace,
+and captures the gateway-prepared private compute request. The shim accepts its
+pending configuration status and policy-derived process selectors, binds the
+workspace to Fleet's tenant, and rejects substituted tenants or claimed runtime
+readiness. The platform namespace is empty on create and remains driver-owned.
+The test extension refuses provisioning after capture; this does not establish
+native sandbox isolation, application readiness or completed Fleet migration.
+
+```sh
+OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
+  cargo test --locked --all-features --test openshell \
+  stock_gateway_mints_private_launch -- --ignored
+```
+
 The optional `openshell` feature uses the unmodified upstream compute-driver
 protobufs at commit `ce58cf8e9b953281352d98a637e41616295b1318`.
 `openshell::NativeDriver` connects to a private same-UID Unix socket, negotiates

@@ -100,9 +100,23 @@ impl NativeCreate {
             .ok_or(Error::InvalidContract)?;
         if sandbox.id.is_empty()
             || sandbox.name.is_empty()
-            || sandbox.status.is_some()
-            || sandbox.namespace != request.execution.namespace
+            // The stock gateway leaves the platform namespace empty; the
+            // driver chooses it from its operator configuration. Workspace is
+            // the tenant boundary and must match Fleet's canonical namespace.
+            || !sandbox.namespace.is_empty()
             || sandbox.workspace != request.execution.namespace
+            || sandbox.status.as_ref().is_some_and(|s| {
+                // The gateway supplies a pending configuration observation on
+                // create. It cannot supply an existing runtime or readiness.
+                s.name != sandbox.name
+                    || !s.instance_id.is_empty()
+                    || !s.agent_fd.is_empty()
+                    || !s.sandbox_fd.is_empty()
+                    || s.deleting
+                    || s.resolved_identity.is_some()
+                    || s.fence_evidence.is_some()
+                    || s.conditions.iter().any(|c| !matches!(c.status.as_str(), "False" | "Unknown"))
+            })
             || template.image != request.image
             || spec.command != request.command
             || spec
@@ -123,6 +137,26 @@ impl NativeCreate {
         {
             return Err(Error::Untrusted);
         }
+        // The native gateway always supplies these selectors, including an
+        // empty pair for image defaults. Bind them to the committed policy;
+        // resolution to a non-root UID/GID remains the upstream driver's job.
+        let user = policy
+            .process
+            .as_ref()
+            .map_or("", |p| p.run_as_user.as_str());
+        let group = policy
+            .process
+            .as_ref()
+            .map_or("", |p| p.run_as_group.as_str());
+        if spec
+            .workload_identity
+            .as_ref()
+            .map_or(!user.is_empty() || !group.is_empty(), |i| {
+                i.user != user || i.group != group
+            })
+        {
+            return Err(Error::Untrusted);
+        }
         // Fleet must explicitly map Ray's GPU allocation and every external
         // attachment before those features can be exposed by this adapter.
         if spec
@@ -134,7 +168,6 @@ impl NativeCreate {
             || template.user_namespaces.is_some()
             || !template.agent_socket_path.is_empty()
             || !template.labels.is_empty()
-            || spec.workload_identity.is_some()
             || spec.tty
             || spec.await_main_process_attachment
             || spec.isolation_backend.is_some()

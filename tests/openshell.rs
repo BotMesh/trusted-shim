@@ -22,6 +22,9 @@ use trusted_shim::{
     runtime::LaunchRequest,
 };
 
+#[path = "support/native_gateway.rs"]
+mod native_gateway;
+
 fn fixture() -> (LaunchRequest, DriverSandbox, String) {
     let request: LaunchRequest = serde_json::from_value(serde_json::json!({
         "execution":{"namespace":"test","workload":"agent","allocation_id":"agent-0","lease_id":"one","generation":1,"node_id":"node"},
@@ -35,14 +38,27 @@ fn fixture() -> (LaunchRequest, DriverSandbox, String) {
     let sandbox = DriverSandbox {
         id: "sandbox-1".into(),
         name: "agent-1".into(),
-        namespace: "test".into(),
+        // Matches the stock gateway's driver_sandbox_from_public conversion:
+        // platform namespace is driver-owned; workspace is the tenant.
+        namespace: String::new(),
         workspace: "test".into(),
+        status: Some(DriverSandboxStatus {
+            name: "agent-1".into(),
+            conditions: vec![DriverCondition {
+                r#type: "ConfigurationReady".into(),
+                status: "False".into(),
+                reason: "ConfigurationPending".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
         spec: Some(DriverSandboxSpec {
             environment: request.environment.clone().into_iter().collect(),
             command: request.command.clone(),
             policy: Some(policy),
             launch_authentication: b"synthetic-split-auth".to_vec(),
             sandbox_token: "synthetic-bootstrap".into(),
+            workload_identity: Some(WorkloadIdentityRequest::default()),
             template: Some(DriverSandboxTemplate {
                 image: request.image.clone(),
                 resources: Some(DriverResourceRequirements {
@@ -55,9 +71,56 @@ fn fixture() -> (LaunchRequest, DriverSandbox, String) {
             }),
             ..Default::default()
         }),
-        ..Default::default()
     };
     (request, sandbox, hash)
+}
+
+#[test]
+fn native_gateway_pending_status_and_identity_selectors_cannot_claim_execution_authority() {
+    use openshell_core::proto::sandbox::v1::ProcessPolicy;
+    let (r, mut sandbox, _) = fixture();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.policy.as_mut().unwrap().process = Some(ProcessPolicy {
+        run_as_user: "1000".into(),
+        run_as_group: "1000".into(),
+    });
+    spec.workload_identity = Some(WorkloadIdentityRequest {
+        user: "1000".into(),
+        group: "1000".into(),
+    });
+    let p = deterministic_policy_hash(spec.policy.as_ref().unwrap());
+    assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &r, &p).is_ok());
+    for change in 0..11 {
+        let mut s = sandbox.clone();
+        match change {
+            0 => s.workspace = "another-tenant".into(),
+            1 => s.status.as_mut().unwrap().name = "another-sandbox".into(),
+            2 => s.status.as_mut().unwrap().instance_id = "existing-runtime".into(),
+            3 => s.status.as_mut().unwrap().agent_fd = "127.0.0.1:1234".into(),
+            4 => s.status.as_mut().unwrap().sandbox_fd = "127.0.0.1:1234".into(),
+            5 => s.status.as_mut().unwrap().deleting = true,
+            6 => s.status.as_mut().unwrap().conditions[0].status = "True".into(),
+            7 => {
+                s.status.as_mut().unwrap().resolved_identity =
+                    Some(ResolvedWorkloadIdentity::default())
+            }
+            8 => s.status.as_mut().unwrap().fence_evidence = Some(DriverFenceEvidence::default()),
+            9 => {
+                s.spec
+                    .as_mut()
+                    .unwrap()
+                    .workload_identity
+                    .as_mut()
+                    .unwrap()
+                    .user = "0".into()
+            }
+            _ => s.spec.as_mut().unwrap().workload_identity = None,
+        }
+        assert!(
+            NativeCreate::decode(&s.encode_to_vec(), &r, &p).is_err(),
+            "change {change}"
+        );
+    }
 }
 #[test]
 fn native_launch_binds_policy_resources_command_and_environment() {
@@ -120,6 +183,9 @@ fn native_launch_binds_policy_resources_command_and_environment() {
 
 #[derive(Clone, Default)]
 struct Service {
+    // The real gateway acceptance captures its private create message and
+    // refuses provisioning; no synthetic credentials cross a native boundary.
+    capture: Option<Arc<Mutex<Option<DriverSandbox>>>>,
     current: Arc<Mutex<Option<DriverSandbox>>>,
     created: Arc<AtomicUsize>,
     wrong_admission: Arc<AtomicBool>,
@@ -139,12 +205,14 @@ impl ComputeDriver for Service {
     ) -> std::result::Result<Response<GetCapabilitiesResponse>, Status> {
         Ok(Response::new(GetCapabilitiesResponse {
             driver_name: "docker".into(),
-            resource_admission_policy: if self.wrong_admission.load(Ordering::SeqCst) {
-                "different"
+            resource_admission_policy: if self.capture.is_some() {
+                openshell_core::resource_admission::DriverAdmissionConfig::default()
+                    .acknowledgement()
+            } else if self.wrong_admission.load(Ordering::SeqCst) {
+                "different".into()
             } else {
-                "approved"
-            }
-            .into(),
+                "approved".into()
+            },
             extension: Some(extension_metadata(
                 ExtensionFamily::Compute,
                 "openshell/docker",
@@ -175,6 +243,12 @@ impl ComputeDriver for Service {
     ) -> std::result::Result<Response<CreateSandboxResponse>, Status> {
         self.created.fetch_add(1, Ordering::SeqCst);
         let mut sandbox = r.into_inner().sandbox.unwrap();
+        if let Some(capture) = &self.capture {
+            *capture.lock().unwrap() = Some(sandbox);
+            return Err(Status::failed_precondition(
+                "acceptance capture; no runtime dispatched",
+            ));
+        }
         sandbox.status = Some(DriverSandboxStatus {
             instance_id: "instance-1".into(),
             conditions: vec![DriverCondition {
@@ -243,7 +317,7 @@ impl ComputeDriver for Service {
         &self,
         _: Request<ListSandboxesRequest>,
     ) -> std::result::Result<Response<ListSandboxesResponse>, Status> {
-        Err(Status::unimplemented("test"))
+        Ok(Response::new(ListSandboxesResponse { sandboxes: vec![] }))
     }
     async fn start_sandbox(
         &self,
@@ -261,7 +335,7 @@ impl ComputeDriver for Service {
         &self,
         _: Request<EnsureWorkspaceRequest>,
     ) -> std::result::Result<Response<EnsureWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("test"))
+        Ok(Response::new(EnsureWorkspaceResponse::default()))
     }
     async fn delete_workspace(
         &self,
@@ -516,6 +590,7 @@ async fn managed_native_lifecycle_survives_restart_fences_generations_and_keeps_
     let mut sandbox = s.clone();
     sandbox.id = "sandbox-2".into();
     sandbox.name = "agent-2".into();
+    sandbox.status.as_mut().unwrap().name = sandbox.name.clone();
     let bytes = sandbox.encode_to_vec();
     let native = NativeCreate::decode(&bytes, &next, &p).unwrap();
     let (a, g) = authorization(&next, &native, "two");

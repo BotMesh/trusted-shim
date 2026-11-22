@@ -6383,6 +6383,7 @@ dependencies = [
  "libc",
  "openshell-core",
  "prost",
+ "prost-types",
  "protoc-bin-vendored",
  "reqwest",
  "rusqlite",
