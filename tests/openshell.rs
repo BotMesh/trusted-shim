@@ -895,6 +895,10 @@ async fn native_dispatch_at_remote(via_daemon: bool) {
             .unwrap();
             let command = json!({"operation":"provision","payload":payload});
             let caps = call(json!({"operation":"capabilities"})).await;
+            let allocated =
+                call(json!({"operation":"allocate","driver":"openshell","execution":r.execution}))
+                    .await;
+            assert_eq!(allocated["result"]["phase"], "reserved");
             assert!(caps["result"]["features"]
                 .as_array()
                 .unwrap()
@@ -1073,4 +1077,67 @@ async fn unmodified_native_driver_admits_canonical_inputs_and_rejects_wrong_oper
         .validate(&NativeCreate::decode(&s.encode_to_vec(), &r, &p).unwrap())
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn reservations_survive_restart_and_cancel_without_native_or_ledger_access() {
+    use trusted_shim::openshell_lifecycle::ProvisioningPhase;
+    let h = Harness::new().await;
+    let (mut request, sandbox, policy) = fixture();
+    h.task.abort(); // Reserving/cancelling must work even with the compute driver down.
+    let status = h.driver().reserve(&request.execution).await.unwrap();
+    assert_eq!(status.phase, ProvisioningPhase::Reserved);
+    assert!(!status.present && !status.platform_ready && status.sandbox_id.is_empty());
+    assert_eq!(
+        h.driver().reserve(&request.execution).await.unwrap().phase,
+        ProvisioningPhase::Reserved
+    );
+    let mut future = request.execution.clone();
+    future.generation += 1;
+    future.lease_id = "next".into();
+    assert!(h.driver().reserve(&future).await.is_err());
+    h.driver().delete(&request.execution).await.unwrap();
+    assert_eq!(
+        h.driver().reserve(&request.execution).await.unwrap().phase,
+        ProvisioningPhase::Deleted
+    );
+    let native = NativeCreate::decode(&sandbox.encode_to_vec(), &request, &policy).unwrap();
+    let (a, g) = authorization(&request, &native, "late");
+    assert!(h
+        .driver()
+        .launch(&request, native, &a, &g, h.ledger.as_ref())
+        .await
+        .is_err());
+    assert!(h.ledger.consumed.lock().unwrap().is_empty());
+    request.execution = future;
+    assert_eq!(
+        h.driver().reserve(&request.execution).await.unwrap().phase,
+        ProvisioningPhase::Reserved
+    );
+    h.driver().stop(&request.execution).await.unwrap();
+    assert_eq!(
+        h.driver().reserve(&request.execution).await.unwrap().phase,
+        ProvisioningPhase::Stopped
+    );
+    h.driver().delete(&request.execution).await.unwrap();
+    assert_eq!(h.service.created.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reserved_allocation_is_created_once_under_concurrent_replay() {
+    let h = Harness::new().await;
+    let (r, s, p) = fixture();
+    h.driver().reserve(&r.execution).await.unwrap();
+    let bytes = s.encode_to_vec();
+    let native = || NativeCreate::decode(&bytes, &r, &p).unwrap();
+    let (a, g) = authorization(&r, &native(), "reserved");
+    let one = h.driver();
+    let two = h.driver();
+    let (x, y) = tokio::join!(
+        one.launch(&r, native(), &a, &g, h.ledger.as_ref()),
+        two.launch(&r, native(), &a, &g, h.ledger.as_ref())
+    );
+    assert!(x.is_ok() && y.is_ok());
+    assert_eq!(h.service.created.load(Ordering::SeqCst), 1);
+    assert_eq!(h.ledger.consumed.lock().unwrap().len(), 1);
 }

@@ -51,6 +51,7 @@ impl NativeCreate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvisioningPhase {
+    Reserved,
     Authorizing,
     Dispatched,
     Created,
@@ -213,6 +214,9 @@ impl ManagedNativeDriver {
         Ok(record)
     }
     async fn observe(&self, slot: &str, record: &mut Record) -> Result<Option<DriverSandbox>> {
+        if record.sandbox_id.is_empty() {
+            return Ok(None);
+        }
         let sandbox = self
             .native
             .inspect(&record.sandbox_id, &record.sandbox_name)
@@ -285,7 +289,7 @@ impl ManagedNativeDriver {
         let slot = self.slot(&request.execution)?;
         let _lock = self.lock(&slot).await?;
         if let Some(mut old) = self.read(&slot)? {
-            if old.execution == request.execution {
+            if old.execution == request.execution && old.phase != ProvisioningPhase::Reserved {
                 if old.launch_sha256 != prepared.launch_sha256
                     || old.native_sha256 != prepared.native_sha256
                     || old.authorization_sha256 != digest
@@ -299,9 +303,10 @@ impl ManagedNativeDriver {
                 let observed = self.observe(&slot, &mut old).await?;
                 return Ok(Self::status(&old, observed.as_ref()));
             }
-            if old.phase != ProvisioningPhase::Deleted
-                || request.execution.generation <= old.execution.generation
-                || self.observe(&slot, &mut old).await?.is_some()
+            if old.execution != request.execution
+                && (old.phase != ProvisioningPhase::Deleted
+                    || request.execution.generation <= old.execution.generation
+                    || self.observe(&slot, &mut old).await?.is_some())
             {
                 return Err(Error::Ownership);
             }
@@ -350,6 +355,39 @@ impl ManagedNativeDriver {
         Ok(Self::status(&record, observed.as_ref()))
     }
 
+    /// Hold an admitted allocation before private provisioning material arrives.
+    /// No credentials, proof consumption or native mutation is needed. Cleanup
+    /// leaves a tombstone so a delayed grant cannot revive a cancelled lease.
+    pub async fn reserve(&self, execution: &ExecutionIdentity) -> Result<ProvisioningStatus> {
+        let slot = self.slot(execution)?;
+        let _lock = self.lock(&slot).await?;
+        if let Some(mut old) = self.read(&slot)? {
+            let observed = self.observe(&slot, &mut old).await?;
+            if old.execution == *execution {
+                return Ok(Self::status(&old, observed.as_ref()));
+            }
+            if old.phase != ProvisioningPhase::Deleted
+                || execution.generation <= old.execution.generation
+                || observed.is_some()
+            {
+                return Err(Error::Ownership);
+            }
+        }
+        let record = Record {
+            execution: execution.clone(),
+            launch_sha256: String::new(),
+            native_sha256: String::new(),
+            authorization_sha256: String::new(),
+            sandbox_id: String::new(),
+            sandbox_name: String::new(),
+            workspace: execution.namespace.clone(),
+            phase: ProvisioningPhase::Reserved,
+            instance_id: None,
+        };
+        self.save(&slot, &record, false)?;
+        Ok(Self::status(&record, None))
+    }
+
     /// Cleanup uses persisted ownership, even after the launch grant expires.
     pub async fn delete(&self, execution: &ExecutionIdentity) -> Result<()> {
         let slot = self.slot(execution)?;
@@ -363,9 +401,11 @@ impl ManagedNativeDriver {
         }
         record.phase = ProvisioningPhase::Deleting;
         self.save(&slot, &record, false)?;
-        self.native
-            .delete(&record.sandbox_id, &record.sandbox_name)
-            .await?;
+        if !record.sandbox_id.is_empty() {
+            self.native
+                .delete(&record.sandbox_id, &record.sandbox_name)
+                .await?;
+        }
         record.phase = ProvisioningPhase::Deleted;
         self.save(&slot, &record, false)
     }
@@ -386,9 +426,11 @@ impl ManagedNativeDriver {
         }
         record.phase = ProvisioningPhase::Stopping;
         self.save(&slot, &record, false)?;
-        self.native
-            .stop(&record.sandbox_id, &record.sandbox_name)
-            .await?;
+        if !record.sandbox_id.is_empty() {
+            self.native
+                .stop(&record.sandbox_id, &record.sandbox_name)
+                .await?;
+        }
         let observed = self.observe(&slot, &mut record).await?;
         if observed.as_ref().is_some_and(|s| {
             !s.status.as_ref().is_some_and(|status| {

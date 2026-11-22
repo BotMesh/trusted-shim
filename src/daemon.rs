@@ -63,6 +63,11 @@ pub enum Command {
         request: Box<LaunchRequest>,
     },
     #[cfg(feature = "openshell")]
+    Allocate {
+        execution: ExecutionIdentity,
+        driver: DriverKind,
+    },
+    #[cfg(feature = "openshell")]
     Provision {
         payload: Box<crate::provisioning::ProvisionRequest>,
     },
@@ -207,6 +212,10 @@ impl Daemon {
                         .as_array_mut()
                         .unwrap()
                         .push(json!("openshell-provisioning-v1"));
+                    value["features"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("openshell-allocation-v1"));
                 }
                 value["pid"] = json!(std::process::id());
                 Ok(value)
@@ -214,6 +223,21 @@ impl Daemon {
             Command::Launch { request } => {
                 serde_json::to_value(self.driver.launch(&request).await?)
                     .map_err(|_| Error::InvalidContract)
+            }
+            #[cfg(feature = "openshell")]
+            Command::Allocate { execution, driver } => {
+                if !matches!(driver, DriverKind::Openshell) {
+                    return Err(Error::Unsupported);
+                }
+                serde_json::to_value(
+                    self.openshell
+                        .as_ref()
+                        .ok_or(Error::Unsupported)?
+                        .driver
+                        .reserve(&execution)
+                        .await?,
+                )
+                .map_err(|_| Error::InvalidContract)
             }
             #[cfg(feature = "openshell")]
             Command::Provision { payload } => serde_json::to_value(

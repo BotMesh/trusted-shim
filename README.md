@@ -300,7 +300,7 @@ settings: `{"openshell":{"socket":"/run/openshell/compute.sock",
 The socket must be private and owned by the same UID. HTTPS uses system roots or
 the explicitly configured, non-writable CA file; plain HTTP is restricted to numeric
 loopback. A daemon without these settings still advertises Docker only. An enabled
-daemon adds `openshell-provisioning-v1` and a digest of its effective operator settings.
+daemon adds `openshell-provisioning-v1`, `openshell-allocation-v1` and a digest of its effective operator settings.
 It can start during a gateway outage without claiming the native driver is healthy.
 
 The private daemon command `{"operation":"provision","payload":...}` accepts a
@@ -311,6 +311,15 @@ status or durable node state. The payload cannot supply a ledger endpoint or dri
 socket. Native validation precedes central Consume and the one permitted Create.
 Daemon request bodies are bounded; losing the caller does not cancel accepted work.
 An ambiguous Consume is retained as authorizing and never retried automatically.
+
+Before private credentials arrive, `{"operation":"allocate","driver":"openshell",
+"execution":...}` durably reserves ownership without calling the compute driver or
+ledger. The `reserved` phase has no sandbox ID, compute or application readiness.
+Repeated allocation returns the current phase; it never revives a cancelled lease.
+Stopping/deleting an unprovisioned reservation works offline and leaves a tombstone,
+so late grants cannot create it. A newer generation requires confirmed deletion.
+Fleet retains Ray resources during this state and uses a separate, private outbound
+HTTPS delivery for the provisioning envelope.
 
 Use `driver: "openshell"` with the existing `inspect`, `stop` and `delete` daemon
 commands to manage that allocation. Inspection returns `phase`, `present` and
