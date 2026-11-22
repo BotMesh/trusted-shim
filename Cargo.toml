@@ -8,7 +8,7 @@ description = "Machine-local runtime, enforcement and remote proof contracts"
 [features]
 default = []
 ziren = ["dep:zkm-verifier"]
-openshell = ["dep:openshell-core", "dep:tower", "dep:hyper-util"]
+openshell = ["dep:openshell-core", "dep:tower", "dep:hyper-util", "dep:russh"]
 
 [dependencies]
 async-trait = "0.1"
@@ -46,6 +46,7 @@ libc = "0.2"
 openshell-core = { git = "https://github.com/ai-openshell/openshell", rev = "ce58cf8e9b953281352d98a637e41616295b1318", default-features = false, optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+russh = { version = "=0.65.1", default-features = false, features = ["ring"], optional = true }
 
 [profile.dev]
 debug = 0

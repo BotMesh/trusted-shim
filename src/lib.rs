@@ -7,9 +7,9 @@
 //! lifecycle includes an opt-in Docker driver. The optional OpenShell client
 //! calls its native private compute-driver API with durable ownership and
 //! proof-grant consumption through the persistent private daemon. The
-//! gateway protocol bindings are stateless; Fleet owns proof jobs and private
-//! delivery. Wiring the gateway compute extension and joining supervisor
-//! readiness still need integration. There is no local prover.
+//! gateway protocol bindings are stateless; Fleet owns proof jobs, private
+//! delivery and the native readiness join. Application route publication still
+//! needs durable service admission and app health integration. There is no local prover.
 
 pub mod admission;
 pub mod attestation;
@@ -28,6 +28,8 @@ pub mod openshell_daemon;
 pub mod openshell_gateway;
 #[cfg(feature = "openshell")]
 pub mod openshell_lifecycle;
+#[cfg(feature = "openshell")]
+pub mod openshell_network;
 pub mod proof;
 pub mod provisioning;
 pub mod registration;

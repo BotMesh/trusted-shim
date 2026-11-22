@@ -395,6 +395,54 @@ Docker compute-driver binary to check capabilities, real input validation and
 operator policy mismatch. Neither test establishes full OpenShell isolation or
 an end-to-end provisioning proof.
 
+`openshell_network::bind` supplies the local data-plane transport for the native
+Docker profile. It checks the full workload container ID, native sandbox/name,
+driver namespace and workspace, selects exactly one owned supervisor, and checks
+its immutable image ID and read-only root filesystem. The SSH host key must match
+the public fingerprint returned by the authenticated OpenShell control API. It
+uses the same `russh` version as the pinned upstream lockfile. SSH channels reach
+only the caller-selected workload loopback port through the stock supervisor's
+boundary connector. Requests on that service reuse one SSH session. The central
+OpenShell gateway carries no application bytes.
+
+The stock supervisor image needs the small Rust `trusted-shim-socket` executable
+at `/opt/trusted-shim/socket`. Compose it with
+[`docker/openshell-supervisor.Dockerfile`](docker/openshell-supervisor.Dockerfile),
+using a verified upstream image digest as `SUPERVISOR_IMAGE` and a static binary
+for the node architecture in the build context. On a Linux GNU build host:
+
+```sh
+rustc --edition=2021 -C target-feature=+crt-static -C opt-level=s -C strip=symbols \
+  src/bin/trusted-shim-socket.rs -o /absolute/external/build-context/trusted-shim-socket
+docker build --build-arg SUPERVISOR_IMAGE=registry/supervisor@sha256:... \
+  -f docker/openshell-supervisor.Dockerfile /absolute/external/build-context
+```
+
+Configure the resulting immutable image in the existing native driver's
+`supervisor_image` setting. Keep the native SSH socket at its default
+`/run/openshell/ssh.sock`. The helper has no listener, accepts no arguments, and
+requires a private socket owned by its supervisor UID. Shim attaches it with
+local Docker exec; it stays inside the trusted supervisor container, never the
+agent workload. It does not change upstream binaries, require a public node port,
+or publish a workload port. Binary stdio is flushed without line buffering.
+
+The returned endpoint is host-loopback only, for the existing outgoing router
+connector. Drop/cancellation drains active local streams; ownership monitoring
+closes the transport when the pinned workload or supervisor disappears or stops.
+This is a privileged library interface, **not an app API**. Callers must supply a
+fresh owned observation and an admitted service port. Automatic service
+publication remains disabled until the daemon binds these inputs to durable
+allocation state and joins native configuration readiness with application
+health. Router grants, revocation and control-snapshot freshness still apply;
+local connectivity during a control outage does not authorize indefinite access.
+
+Fleet's opt-in native Docker acceptance composes this helper with the stock
+supervisor and exercises real HTTP/SSE/WebSocket through the local Data Router,
+including wrong tenant/image/host-key rejection, active-stream revocation,
+cancellation and control-gateway outage. Its proof service and route-grant issuer
+are explicit test fixtures; it is neither a fresh proof nor a cross-machine NAT
+acceptance test.
+
 Canonical namespace IDs map to native workspace names within the stock gateway's
 19-byte limit; the full Fleet identity remains proof-bound. The embedding control
 plane must reject collisions. Explicit nonempty commands avoid the gateway's
