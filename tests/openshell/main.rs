@@ -55,7 +55,6 @@ fn gateway_workspace_mapping_keeps_full_canonical_identity_bound() {
     }
 }
 
-#[path = "support/native_gateway.rs"]
 mod native_gateway;
 
 fn fixture() -> (LaunchRequest, DriverSandbox, String) {

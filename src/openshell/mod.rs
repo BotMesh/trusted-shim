@@ -1,6 +1,13 @@
 //! Calls the unmodified OpenShell compute driver on a private, same-UID Unix
 //! socket. The native driver owns workload/supervisor separation and isolation.
 //! This transport never exposes the Docker socket or substitutes plain Docker.
+pub mod daemon;
+pub(crate) mod data_plane;
+pub mod gateway;
+pub mod lifecycle;
+pub mod network;
+pub mod services;
+
 use crate::{Error, Result};
 use hyper_util::rt::TokioIo;
 use openshell_core::{

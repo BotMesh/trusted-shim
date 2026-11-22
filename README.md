@@ -1,5 +1,17 @@
 # trusted-shim
 
+Fleet’s persistent machine-local runtime for Docker and native OpenShell. Fleet
+owns scheduling and central policy administration; shim owns local execution,
+enforcement and outbound connectors. Rail supplies deterministic policy evaluation.
+
+The image workflow publishes both executables in
+`ghcr.io/attestx/trusted-shim:sha-<full-commit>` (and version tags on `v*`).
+`trusted-shim-runtime` is the service; `trusted-shim-socket` is the static native
+supervisor helper. The image can distribute binaries to Fleet’s node installer;
+keep shim in its own service/cgroup so node upgrades do not stop workloads.
+OpenShell implementation lives in `src/openshell/`, its integration fixtures in
+`tests/openshell/`, and supervisor packaging in `docker/openshell/`.
+
 Existing remote policy receipts can now be verified in Solidity and recorded in
 a mined local-EVM transaction. See [contract acceptance](contracts/README.md) for
 the pinned upstream verifier, negative tests and reproduction commands.
@@ -61,8 +73,9 @@ Fleet scheduling and allocation
     -> router Connector   -> independent data relay
 
 central policy gateway -> approved policy/program + authorization ledger
-shim -> rail evaluation -> remote proof -> cryptographic verification
-     -> central reservation -> single-use grant -> authorized action
+startup: shim -> rail -> remote proof -> verification -> grant -> Create
+action:  preflight evaluation -> durable receipt job + grant -> dispatch
+         receipt job -> remote proof -> verification (background)
 ```
 
 Fleet owns placement, retries and confirmed resource release. Shim owns one
@@ -70,8 +83,9 @@ machine's authorized executions. The independent router carries service payloads
 Fleet's control plane owns infrastructure policy and service grants. Application
 backends retain their own user/session and API-key authorization. OpenShell is
 called through upstream interfaces for native isolation, without forking it;
-its durable provisioning adapter is implemented, while centralized native
-gateway preparation and application readiness are not yet wired into Fleet.
+Fleet wires its durable provisioning adapter to centralized native gateway
+preparation and application readiness. The gateway is an optional Fleet Compose
+service, required for OpenShell workloads.
 
 ## Policy admission
 
@@ -247,8 +261,8 @@ through reservation and consumption on the blocking ledger worker. Fleet checks
 the exact reported execution, current deployment, fresh node session, active
 namespace and held quota allocation. Suspension, release, stale heartbeats and
 replacement therefore reject old credentials even if their TTL has not elapsed.
-The service is mounted in Fleet's gateway; automatic private credential
-provisioning and pre-create execution activation still need integration.
+The service is mounted in Fleet's gateway; Fleet provisions private credentials and activates the exact execution before
+native Create. Credentials are delivered only through the private node channel.
 
 `AuthorizedExecutor` binds a grant to the full request and execution identity,
 consumes it through the ledger before invoking `ActionHandler`, and rejects
@@ -329,10 +343,10 @@ also run in downstream binaries to prevent widening Regorus's deterministic prof
 
 `DockerDriver` implements the machine-local `RuntimeDriver`; `AttestationVerifier`
 remains an interface; the concrete data-plane adapter owns outbound connectors.
-TEE evidence verification and its separate proof guest,
-TEE runtime drivers, OpenShell gateway activation and non-bypassable enforcement
-follow separately. Fleet embeds the central ledger, but automatic private
-provisioning and native launch preparation still need integration.
+TEE evidence verification, its separate proof guest and concrete TEE runtime
+drivers remain follow-ups. Fleet embeds the central ledger and implements private
+provisioning, native launch preparation and gateway readiness. Application action
+hooks still need integration to make preflight enforcement non-bypassable.
 Non-TEE attestation remains `SkippedNonTee`;
 requiring an attestation proof for that outcome is invalid. No permissive fallback
 or local prover is included.
@@ -415,7 +429,7 @@ OpenShell gateway carries no application bytes.
 
 The stock supervisor image needs the small Rust `trusted-shim-socket` executable
 at `/opt/trusted-shim/socket`. Compose it with
-[`docker/openshell-supervisor.Dockerfile`](docker/openshell-supervisor.Dockerfile),
+[`docker/openshell/Dockerfile.supervisor`](docker/openshell/Dockerfile.supervisor),
 using a verified upstream image digest as `SUPERVISOR_IMAGE` and a static binary
 for the node architecture in the build context. On a Linux GNU build host:
 
@@ -423,7 +437,7 @@ for the node architecture in the build context. On a Linux GNU build host:
 rustc --edition=2021 -C target-feature=+crt-static -C opt-level=s -C strip=symbols \
   src/bin/trusted-shim-socket.rs -o /absolute/external/build-context/trusted-shim-socket
 docker build --build-arg SUPERVISOR_IMAGE=registry/supervisor@sha256:... \
-  -f docker/openshell-supervisor.Dockerfile /absolute/external/build-context
+  -f docker/openshell/Dockerfile.supervisor /absolute/external/build-context
 ```
 
 Configure the resulting immutable image in the existing native driver's
@@ -540,7 +554,7 @@ HTTPS delivery for the provisioning envelope.
 
 Use `driver: "openshell"` with the existing `inspect`, `stop` and `delete` daemon
 commands to manage that allocation. Inspection returns `phase`, `present` and
-`platform_ready`, not application readiness. Management uses persisted ownership
+`platform_ready` and, with the service adapter enabled, `application_ready`. Management uses persisted ownership
 without a ledger credential or a live gateway, including after daemon restart.
 The library likewise takes the ledger only in `ManagedNativeDriver::launch`;
 opening ownership state and cleanup never require an authority client. Tests cover
@@ -549,16 +563,16 @@ gateway outage with protocol/proof doubles, without claiming native isolation.
 
 Proof-required admission waits for remote verification before dispatch. Applying
 that mode to every serial tool call adds the proof network's queue, proving and
-round-trip latency to every step. A future asynchronous audit path must remain a
-distinct mode: native permissions enforce before execution, while a later proof
-establishes the recorded policy evaluation. Such a proof alone establishes
+round-trip latency to every step. The implemented preflight path evaluates before execution and queues the
+ZK receipt in the background. Native permissions enforce at execution; the later
+proof establishes the recorded policy evaluation. Such a proof alone establishes
 neither completeness of the execution log nor the external side effect. It must
 not be accepted as the existing pre-execution `ExecutionGrant`.
 
 Keep one authoritative existing runtime config per application and retain dormant
-ACK support. Fleet's runtime adapter will delegate container hard limits to shim
+ACK support. Fleet's opt-in runtime adapter delegates container hard limits to shim
 ([zkm-fleet #95](https://github.com/ProjectZKM/zkm-fleet/issues/95)). Film and ClawUp
-will share the independent data transport. This increment builds on framework
+have opt-in adapters for the independent data transport. This increment builds on framework
 PR #1 and pins companion repository commits for reproducibility.
 
 
@@ -622,8 +636,8 @@ node-owned data taken from Fleet's existing apps.yaml: `gateway_url`, `relay_url
 `token_file`, `public_key_file` and `issuer`. It is not a second runtime catalog.
 The central gateway's authenticated `POST /v1/runtime/registration` accepts
 `{"execution":...,"service":...}` and returns `{"token":"..."}` after checking
-the live allocation and approved policy. This increment supplies that client;
-the production registration gateway is a separate integration. A local test
+the live allocation and approved policy. Fleet embeds the registration gateway and delivers scoped credentials to shim;
+operators must configure the approved issuer and trust roots. A local test
 issuer does not substitute for production authorization.
 
 Shim verifies the Ed25519 registration grant, exact execution/service, issuer,

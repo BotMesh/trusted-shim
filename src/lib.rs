@@ -8,8 +8,7 @@
 //! calls its native private compute-driver API with durable ownership and
 //! proof-grant consumption through the persistent private daemon. The
 //! gateway protocol bindings are stateless; Fleet owns proof jobs, private
-//! delivery and the native readiness join. Application route publication still
-//! needs durable service admission and app health integration. There is no local prover.
+//! delivery and the native readiness join. Application route publication joins durable service admission and app health. There is no local prover.
 
 pub mod admission;
 pub mod attestation;
@@ -23,17 +22,17 @@ pub mod network;
 #[cfg(feature = "openshell")]
 pub mod openshell;
 #[cfg(feature = "openshell")]
-pub mod openshell_daemon;
+pub use openshell::daemon as openshell_daemon;
 #[cfg(feature = "openshell")]
-mod openshell_data_plane;
+pub(crate) use openshell::data_plane as openshell_data_plane;
 #[cfg(feature = "openshell")]
-pub mod openshell_gateway;
+pub use openshell::gateway as openshell_gateway;
 #[cfg(feature = "openshell")]
-pub mod openshell_lifecycle;
+pub use openshell::lifecycle as openshell_lifecycle;
 #[cfg(feature = "openshell")]
-pub mod openshell_network;
+pub use openshell::network as openshell_network;
 #[cfg(feature = "openshell")]
-pub mod openshell_services;
+pub use openshell::services as openshell_services;
 pub mod proof;
 pub mod provisioning;
 pub mod registration;

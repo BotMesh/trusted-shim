@@ -1,0 +1,51 @@
+name: Container image
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  image:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly-2026-09-17
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: |
+          mkdir -p target/image
+          cargo build --locked --release --features openshell --bin trusted-shim-runtime
+          install -m 755 target/release/trusted-shim-runtime target/image/
+          rustc --edition=2021 -C target-feature=+crt-static -C opt-level=s -C strip=symbols src/bin/trusted-shim-socket.rs -o target/image/trusted-shim-socket
+          cp docker/Dockerfile target/image/Dockerfile
+      - name: Build and check image
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          REVISION=$(git rev-parse HEAD)
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "REVISION=$REVISION" >> "$GITHUB_ENV"
+          docker build --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$REVISION" -t "$IMAGE:sha-$REVISION" target/image
+          docker run --rm "$IMAGE:sha-$REVISION" --capabilities
+      - name: Publish to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:sha-$REVISION"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            docker tag "$IMAGE:sha-$REVISION" "$IMAGE:${GITHUB_REF_NAME#v}"
+            docker push "$IMAGE:${GITHUB_REF_NAME#v}"
+          fi

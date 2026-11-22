@@ -1,0 +1,38 @@
+name: OpenShell supervisor image
+on:
+  workflow_dispatch:
+    inputs:
+      supervisor_image:
+        description: Verified stock supervisor image including @sha256 digest
+        required: true
+        type: string
+permissions:
+  contents: read
+  packages: write
+jobs:
+  image:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly-2026-09-17
+      - name: Build static adapter and unchanged supervisor image
+        env:
+          SUPERVISOR_IMAGE: ${{ inputs.supervisor_image }}
+        run: |
+          set -euo pipefail
+          [[ "$SUPERVISOR_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || exit 2
+          mkdir -p target/supervisor-image
+          rustc --edition=2021 -C target-feature=+crt-static -C opt-level=s -C strip=symbols \
+            src/bin/trusted-shim-socket.rs -o target/supervisor-image/trusted-shim-socket
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-openshell-supervisor:sha-$(git rev-parse HEAD)"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build --build-arg "SUPERVISOR_IMAGE=$SUPERVISOR_IMAGE" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            -t "$IMAGE" -f docker/openshell/Dockerfile.supervisor target/supervisor-image
+      - name: Publish to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
