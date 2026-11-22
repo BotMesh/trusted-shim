@@ -30,6 +30,7 @@ pub(crate) fn config() -> TeeConfig {
         platform: "sample".into(),
         evidence_endpoint: "http://127.0.0.1:1/aa/evidence".into(),
         trustee_endpoint: "http://127.0.0.1:1".into(),
+        trustee_tls: None,
         trustee_policy_ids: vec!["default".into()],
         init_data_sha256: "11".repeat(32),
         endpoint_key_sha256: "22".repeat(32),
@@ -48,7 +49,7 @@ pub(crate) fn config() -> TeeConfig {
 }
 
 #[derive(Default)]
-struct ProtocolTrustee;
+pub(crate) struct ProtocolTrustee;
 #[tonic::async_trait]
 impl wire::attestation_service_server::AttestationService for ProtocolTrustee {
     async fn attestation_evaluate(
@@ -154,6 +155,7 @@ impl Lab {
             Trustee::connect(
                 &self.config.trustee_endpoint,
                 self.config.trustee_policy_ids.clone(),
+                self.config.trustee_tls.as_ref(),
             )
             .await
             .unwrap(),

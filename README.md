@@ -406,13 +406,20 @@ a hardware allocation. Production binaries include `ziren` for real Groth16
 receipt verification; there is no no-proof simulation option in the daemon.
 
 Configure the AA `/aa/evidence` endpoint on numeric loopback, the stock Trustee
-v0.19 gRPC API (loopback HTTP or HTTPS), approved attestation policy IDs,
+v0.19 gRPC API (loopback HTTP or mutually authenticated HTTPS), approved attestation policy IDs,
 measurement/init-data/key digests and pinned RA ELF/program/verifying-key identity.
 Proof credentials are explicit private files; an optional signer file supports
 Fleet's token-bound proof signatures. Nothing discovers workspace credentials.
 The proof service and Trustee use reconnecting channels so their outage does not
 prevent daemon restart, inspection or cleanup. Configuration/credential files
-must remain available locally.
+must remain available locally. For HTTPS, `tee.trustee_tls` requires absolute
+`ca_file`, `cert_file` and `key_file` paths. Shim verifies the endpoint hostname
+against the configured CA and presents the node certificate. The private key must
+be owned by the daemon UID, have no group/other permissions and not be a symlink.
+TLS settings cannot be silently ignored on HTTP. Certificate renewal takes effect
+on daemon restart; existing runtimes remain independent of the daemon process.
+Fleet exposes only appraisal to certificates with a node URI SAN through its
+existing HTTPS ingress; AS administration remains private.
 
 The versioned witness is canonical JSON `{binding,evidence}`. Public values are
 `{binding,evidence_sha256}`. `binding` covers mode, platform, measurement, init-data,

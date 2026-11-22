@@ -2,12 +2,45 @@
 use super::{canonical, Binding};
 use crate::{Error, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use std::{path::PathBuf, time::Duration};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 pub mod wire {
     tonic::include_proto!("attestation");
+}
+
+/// Operator-owned node identity. Contents never enter launch records or proofs.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub ca_file: PathBuf,
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+}
+
+pub(super) fn validate_endpoint(endpoint: &str, tls: Option<&TlsConfig>) -> Result<()> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| Error::InvalidContract)?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(Error::InvalidContract);
+    }
+    match (url.scheme(), tls) {
+        ("https", Some(tls))
+            if [&tls.ca_file, &tls.cert_file, &tls.key_file]
+                .iter()
+                .all(|p| p.is_absolute()) =>
+        {
+            Ok(())
+        }
+        ("http", None) if matches!(url.host_str(), Some("127.0.0.1" | "[::1]")) => Ok(()),
+        _ => Err(Error::InvalidContract),
+    }
 }
 
 #[derive(Clone)]
@@ -17,26 +50,25 @@ pub struct Trustee {
 }
 
 impl Trustee {
-    pub async fn connect(endpoint: &str, policies: Vec<String>) -> Result<Self> {
-        let url = reqwest::Url::parse(endpoint).map_err(|_| Error::InvalidContract)?;
-        if !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || url.path() != "/"
-        {
-            return Err(Error::InvalidContract);
-        }
+    pub async fn connect(
+        endpoint: &str,
+        policies: Vec<String>,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
+        validate_endpoint(endpoint, tls)?;
         let mut channel =
             Endpoint::from_shared(endpoint.to_owned()).map_err(|_| Error::InvalidContract)?;
-        match url.scheme() {
-            "https" => {
-                channel = channel
-                    .tls_config(ClientTlsConfig::new().with_native_roots())
-                    .map_err(|_| Error::InvalidContract)?
-            }
-            "http" if matches!(url.host_str(), Some("127.0.0.1" | "[::1]")) => (),
-            _ => return Err(Error::InvalidContract),
+        if let Some(tls) = tls {
+            let ca = super::read_bounded(&tls.ca_file, 256 * 1024, false)?;
+            let cert = super::read_bounded(&tls.cert_file, 256 * 1024, false)?;
+            let key = super::read_private(&tls.key_file, 64 * 1024)?;
+            channel = channel
+                .tls_config(
+                    ClientTlsConfig::new()
+                        .ca_certificate(Certificate::from_pem(ca))
+                        .identity(Identity::from_pem(cert, key)),
+                )
+                .map_err(|_| Error::InvalidContract)?;
         }
         let channel = channel
             .connect_timeout(Duration::from_secs(10))

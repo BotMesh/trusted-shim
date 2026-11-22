@@ -38,6 +38,8 @@ pub struct TeeConfig {
     pub platform: String,
     pub evidence_endpoint: String,
     pub trustee_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trustee_tls: Option<trustee::TlsConfig>,
     pub trustee_policy_ids: Vec<String>,
     /// Digest of measured init-data that confines this shim and its local runtime endpoints.
     pub init_data_sha256: String,
@@ -75,6 +77,7 @@ impl TeeConfig {
         }
     }
     pub fn validate(&self) -> Result<()> {
+        trustee::validate_endpoint(&self.trustee_endpoint, self.trustee_tls.as_ref())?;
         let platform_ok = match self.mode {
             Mode::Simulation => self.platform == "sample",
             Mode::Hardware => matches!(self.platform.as_str(), "snp" | "tdx"),
@@ -290,9 +293,12 @@ impl AttestationGate {
             &config.program_vkey_hash,
         )?;
         let evidence = CocoEvidence::new(config.evidence_endpoint.clone())?;
-        let trustee =
-            trustee::Trustee::connect(&config.trustee_endpoint, config.trustee_policy_ids.clone())
-                .await?;
+        let trustee = trustee::Trustee::connect(
+            &config.trustee_endpoint,
+            config.trustee_policy_ids.clone(),
+            config.trustee_tls.as_ref(),
+        )
+        .await?;
         Self::new(
             state,
             config,
@@ -579,7 +585,6 @@ impl RuntimeDriver for TeeDriver {
     }
 }
 
-#[cfg(feature = "ziren")]
 fn read_bounded(path: &Path, max: u64, private: bool) -> Result<Vec<u8>> {
     use std::io::Read;
     if !path.is_absolute() {
@@ -606,7 +611,6 @@ fn read_bounded(path: &Path, max: u64, private: bool) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-#[cfg(feature = "ziren")]
 fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
     read_bounded(path, max, true)
 }

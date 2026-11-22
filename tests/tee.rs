@@ -21,6 +21,9 @@ use trusted_shim::{
 mod support;
 use support::{config, Lab, ProofDouble, ReceiptDouble};
 
+#[path = "tee/tls.rs"]
+mod tls;
+
 fn request(id: &str) -> LaunchRequest {
     serde_json::from_value(json!({
         "execution":{"namespace":"simulation","workload":"tee","allocation_id":id,"lease_id":"launch","generation":1,"node_id":"test-node"},
@@ -234,7 +237,7 @@ async fn expired_admission_and_changed_profile_do_not_create_a_runtime() {
     }
     assert_eq!(proof.submitted.load(Ordering::SeqCst), 1);
     lab.config.endpoint_key_sha256 = "33".repeat(32);
-    let trustee = Trustee::connect(&lab.config.trustee_endpoint, vec!["default".into()])
+    let trustee = Trustee::connect(&lab.config.trustee_endpoint, vec!["default".into()], None)
         .await
         .unwrap();
     assert!(TeeDriver::new(
@@ -263,7 +266,7 @@ async fn disconnected_services_do_not_prevent_constructing_cleanup_adapters() {
     )
     .is_ok());
     assert!(
-        Trustee::connect("http://127.0.0.1:1", vec!["default".into()])
+        Trustee::connect("http://127.0.0.1:1", vec!["default".into()], None)
             .await
             .is_ok()
     );
