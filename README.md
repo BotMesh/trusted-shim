@@ -39,7 +39,12 @@ are not implemented by this protocol.
 With a relay supporting `POST /v1/connect/{route}/renew`, the connector refreshes
 its registration grant without replacing the transport. User Access grants retain
 their original expiry, policy binding and revocation checks. An unavailable gateway
-can only be tolerated until the last accepted registration grant expires. This
+can only be tolerated until the last accepted registration grant expires. Updated
+embedded gateways issue 30-second registration leases after a live Fleet readiness
+check, and this connector renews around halfway through the remaining lifetime.
+Fleet's five-second native readiness cache adds to that withdrawal window. Relay
+expiry independently drains streams even if this connector cannot contact control.
+Older issued leases retain their original expiry until they age out. This
 does not turn Docker admission into a policy/TEE proof.
 
 Machine-local runtime and trust interfaces below zkm-fleet, with native preflight
