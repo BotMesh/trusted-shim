@@ -1,19 +1,49 @@
 //! Machine-local runtime and trust interfaces below zkm-fleet.
 //!
-//! Policy admission evaluates Rego, requests a remote proof, verifies its exact
-//! public values and consumes a central ledger grant before dispatch. Runtime
-//! drivers and attestation adapters remain interfaces. There is no local prover.
+//! Preflight action admission evaluates Rego and atomically persists a remote
+//! proof job alongside a single-use ledger grant; receipt generation happens in
+//! the background. Strict admission still verifies a proof before granting
+//! runtime creation. Both paths consume exact-request grants before dispatch. Runtime
+//! lifecycle includes an opt-in Docker driver. The optional OpenShell client
+//! calls its native private compute-driver API with durable ownership and
+//! proof-grant consumption through the persistent private daemon. The
+//! gateway protocol bindings are stateless; Fleet owns proof jobs, private
+//! delivery and the native readiness join. Application route publication still
+//! needs durable service admission and app health integration. There is no local prover.
 
 pub mod admission;
 pub mod attestation;
+pub mod daemon;
+pub mod data_plane;
+pub mod docker;
+pub mod ledger;
+pub mod ledger_transport;
+pub mod management;
 pub mod network;
+#[cfg(feature = "openshell")]
+pub mod openshell;
+#[cfg(feature = "openshell")]
+pub mod openshell_daemon;
+#[cfg(feature = "openshell")]
+mod openshell_data_plane;
+#[cfg(feature = "openshell")]
+pub mod openshell_gateway;
+#[cfg(feature = "openshell")]
+pub mod openshell_lifecycle;
+#[cfg(feature = "openshell")]
+pub mod openshell_network;
+#[cfg(feature = "openshell")]
+pub mod openshell_services;
 pub mod proof;
+pub mod provisioning;
+pub mod registration;
 pub mod runtime;
 #[cfg(feature = "ziren")]
 pub mod ziren;
 
 pub use trusted_contracts as contracts;
 pub use trusted_data_router::{Connector, ServiceSpec};
+pub use trusted_rail as rail;
 pub use trusted_rail::{AuthorizationLedger, PolicyProofCodec, RuleEngine};
 
 pub type Result<T> = std::result::Result<T, Error>;
