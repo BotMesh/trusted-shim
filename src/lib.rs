@@ -17,6 +17,7 @@ pub mod data_plane;
 pub mod docker;
 pub mod ledger;
 pub mod ledger_transport;
+pub mod machine;
 pub mod management;
 pub mod network;
 #[cfg(feature = "openshell")]
@@ -37,6 +38,7 @@ pub mod proof;
 pub mod provisioning;
 pub mod registration;
 pub mod runtime;
+pub mod tee;
 #[cfg(feature = "ziren")]
 pub mod ziren;
 

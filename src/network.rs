@@ -34,6 +34,28 @@ impl ZirenNetwork {
         program: ProgramRef,
         elf: Vec<u8>,
     ) -> Result<Self> {
+        let endpoint = Self::endpoint(endpoint)?;
+        let channel = endpoint.connect().await.map_err(|_| Error::Unavailable)?;
+        Self::from_channel(channel, token, program, elf)
+    }
+
+    /// Build a reconnecting channel without requiring the proof service to be up.
+    /// Runtime inspection and cleanup must remain available during proof outages.
+    pub fn connect_lazy(
+        endpoint: &str,
+        token: &str,
+        program: ProgramRef,
+        elf: Vec<u8>,
+    ) -> Result<Self> {
+        Self::from_channel(
+            Self::endpoint(endpoint)?.connect_lazy(),
+            token,
+            program,
+            elf,
+        )
+    }
+
+    fn endpoint(endpoint: &str) -> Result<Endpoint> {
         let uri: tonic::codegen::http::Uri =
             endpoint.parse().map_err(|_| Error::InvalidContract)?;
         let local = matches!(uri.host(), Some("127.0.0.1" | "[::1]"));
@@ -48,11 +70,9 @@ impl ZirenNetwork {
             Some("http") if local => (), // upstream fleet-proof-app binds numeric loopback only
             _ => return Err(Error::InvalidContract),
         }
-        let endpoint = endpoint
+        Ok(endpoint
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30));
-        let channel = endpoint.connect().await.map_err(|_| Error::Unavailable)?;
-        Self::from_channel(channel, token, program, elf)
+            .timeout(Duration::from_secs(30)))
     }
 
     /// Explicit channel injection supports private CA/mTLS and test servers.

@@ -15,7 +15,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -110,6 +110,31 @@ async fn log_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u
 }
 
 impl DockerDriver {
+    pub(crate) fn validate_launch(&self, request: &LaunchRequest) -> Result<()> {
+        self.slot(&request.execution)?;
+        Self::options(request)?;
+        Ok(())
+    }
+
+    pub(crate) fn has_allocations(state: &Path) -> Result<bool> {
+        for entry in available(fs::read_dir(state))? {
+            let path = available(entry)?.path();
+            let Some(slot) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if path.extension().is_some_and(|s| s == "json")
+                && slot.len() == 64
+                && slot.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                let record: Record = serde_json::from_slice(&available(fs::read(path))?)
+                    .map_err(|_| Error::InvalidContract)?;
+                if record.phase != Phase::Deleted {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
     /// Private durable replay ledger survives connector and shim restarts. A
     /// failed/ambiguous upstream dispatch never refunds an invocation.
     pub(crate) async fn consume_http_request(

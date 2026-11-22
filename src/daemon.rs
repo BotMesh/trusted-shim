@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -34,6 +34,8 @@ const MAX_REQUEST: usize = crate::provisioning::MAX_PROVISION_BYTES + 16 * 1024;
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
+    #[serde(default)]
+    pub machine: crate::machine::MachineConfig,
     #[cfg(feature = "openshell")]
     pub openshell: Option<crate::openshell_daemon::OpenShellConfig>,
 }
@@ -43,6 +45,9 @@ pub struct DaemonConfig {
 pub enum DriverKind {
     #[default]
     Docker,
+    Tee,
+    #[serde(rename = "tee-simulation")]
+    TeeSimulation,
     #[cfg(feature = "openshell")]
     Openshell,
 }
@@ -123,7 +128,10 @@ struct NetworkTask {
 }
 
 struct Daemon {
-    driver: DockerDriver,
+    driver: Option<DockerDriver>,
+    tee: Option<crate::tee::TeeDriver>,
+    machine: crate::machine::MachineProfile,
+    machine_config_sha256: String,
     #[cfg(feature = "openshell")]
     openshell: Option<crate::openshell_daemon::OpenShellRuntime>,
     node_id: String,
@@ -138,6 +146,37 @@ fn network_key(execution: &ExecutionIdentity) -> Result<String> {
 }
 
 impl Daemon {
+    fn docker(&self) -> Result<&DockerDriver> {
+        self.driver.as_ref().ok_or(Error::Unsupported)
+    }
+    fn tee(&self, driver: DriverKind) -> Result<&crate::tee::TeeDriver> {
+        let tee = self.tee.as_ref().ok_or(Error::Unsupported)?;
+        let expected = match driver {
+            DriverKind::Tee => "tee",
+            DriverKind::TeeSimulation => "tee-simulation",
+            _ => return Err(Error::Unsupported),
+        };
+        if tee.driver() != expected {
+            return Err(Error::Untrusted);
+        }
+        Ok(tee)
+    }
+    fn local(&self, driver: DriverKind) -> Result<&DockerDriver> {
+        match driver {
+            DriverKind::Docker => self.docker(),
+            DriverKind::Tee | DriverKind::TeeSimulation => Ok(self.tee(driver)?.backend()),
+            #[cfg(feature = "openshell")]
+            _ => Err(Error::Unsupported),
+        }
+    }
+    fn runtime(&self, driver: DriverKind) -> Result<&dyn RuntimeDriver> {
+        match driver {
+            DriverKind::Docker => Ok(self.docker()?),
+            DriverKind::Tee | DriverKind::TeeSimulation => Ok(self.tee(driver)?),
+            #[cfg(feature = "openshell")]
+            _ => Err(Error::Unsupported),
+        }
+    }
     async fn network(&self, record: NetworkRecord) -> Result<Value> {
         let key = network_key(&record.execution)?;
         let bytes = serde_json::to_vec(&record).map_err(|_| Error::InvalidContract)?;
@@ -155,11 +194,21 @@ impl Daemon {
         // connectors cannot silently redirect or duplicate this allocation.
         data_plane::validate_config(&record.config)?;
         match record.driver {
-            DriverKind::Docker => {
-                if self.driver.inspect(&record.execution).await?.state != RuntimeState::Ready {
+            DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
+                if self
+                    .local(record.driver)?
+                    .inspect(&record.execution)
+                    .await?
+                    .state
+                    != RuntimeState::Ready
+                {
                     return Err(Error::Ownership);
                 }
-                drop(self.driver.network_lease(&record.execution).await?);
+                drop(
+                    self.local(record.driver)?
+                        .network_lease(&record.execution)
+                        .await?,
+                );
             }
             #[cfg(feature = "openshell")]
             DriverKind::Openshell => {
@@ -180,8 +229,8 @@ impl Daemon {
         #[cfg(feature = "openshell")]
         let health = Arc::new(crate::openshell_data_plane::Health::default());
         let task = match record.driver {
-            DriverKind::Docker => {
-                let driver = self.driver.clone();
+            DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
+                let driver = self.local(record.driver)?.clone();
                 tokio::spawn(async move {
                     data_plane::serve(&driver, &record.execution, &record.config, worker_stop).await
                 })
@@ -247,13 +296,12 @@ impl Daemon {
         match request.command {
             Command::Capabilities => {
                 let mut value = capabilities();
+                value["drivers"] = json!(self.machine.drivers);
+                value["machine"] = json!(self.machine);
+                value["machine_config_sha256"] = json!(self.machine_config_sha256);
                 #[cfg(feature = "openshell")]
                 if let Some(native) = &self.openshell {
                     value["openshell_config_sha256"] = json!(native.configuration_sha256);
-                    value["drivers"]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(json!("openshell"));
                     value["features"]
                         .as_array_mut()
                         .unwrap()
@@ -273,11 +321,19 @@ impl Daemon {
                             .push(json!("openshell-service-health-v1"));
                     }
                 }
+                if self.tee.is_some() {
+                    value["features"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("tee-startup-v1"));
+                }
                 value["pid"] = json!(std::process::id());
                 Ok(value)
             }
             Command::Launch { request } => {
-                serde_json::to_value(self.driver.launch(&request).await?)
+                let driver: DriverKind = serde_json::from_value(json!(request.driver))
+                    .map_err(|_| Error::Unsupported)?;
+                serde_json::to_value(self.runtime(driver)?.launch(&request).await?)
                     .map_err(|_| Error::InvalidContract)
             }
             #[cfg(feature = "openshell")]
@@ -305,7 +361,9 @@ impl Daemon {
             )
             .map_err(|_| Error::InvalidContract),
             Command::Inspect { execution, driver } => match driver {
-                DriverKind::Docker => serde_json::to_value(self.driver.inspect(&execution).await?),
+                DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
+                    serde_json::to_value(self.runtime(driver)?.inspect(&execution).await?)
+                }
                 #[cfg(feature = "openshell")]
                 DriverKind::Openshell => {
                     let status = self
@@ -335,8 +393,8 @@ impl Daemon {
             .map_err(|_| Error::InvalidContract),
             Command::Stop { execution, driver } => {
                 match driver {
-                    DriverKind::Docker => {
-                        self.driver.stop(&execution).await?;
+                    DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
+                        self.runtime(driver)?.stop(&execution).await?;
                         self.forget_network(&execution).await?;
                     }
                     #[cfg(feature = "openshell")]
@@ -354,8 +412,8 @@ impl Daemon {
             }
             Command::Delete { execution, driver } => {
                 match driver {
-                    DriverKind::Docker => {
-                        self.driver.delete(&execution).await?;
+                    DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
+                        self.runtime(driver)?.delete(&execution).await?;
                         self.forget_network(&execution).await?;
                     }
                     #[cfg(feature = "openshell")]
@@ -456,9 +514,27 @@ pub async fn serve_configured(
     config: DaemonConfig,
     stop: CancellationToken,
 ) -> Result<()> {
-    let driver = DockerDriver::new(state, node_id.clone())?;
+    #[cfg(feature = "openshell")]
+    let has_openshell = config.openshell.is_some();
+    #[cfg(not(feature = "openshell"))]
+    let has_openshell = false;
+    let machine = config
+        .machine
+        .resolve(crate::machine::detect()?, has_openshell)?;
+    let machine_config_sha256 = config.machine.digest()?;
+    if !state.is_absolute() || node_id.is_empty() {
+        return Err(Error::InvalidContract);
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state)
+        .map_err(|_| Error::Unavailable)?;
     let metadata = std::fs::symlink_metadata(state).map_err(|_| Error::Unavailable)?;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
         return Err(Error::Untrusted);
     }
     let lock = OpenOptions::new()
@@ -469,6 +545,32 @@ pub async fn serve_configured(
         .open(state.join("daemon.lock"))
         .map_err(|_| Error::Unavailable)?;
     lock.try_lock_exclusive().map_err(|_| Error::Ownership)?;
+    let driver = if machine.drivers.iter().any(|d| d == "docker") {
+        Some(DockerDriver::new(state, node_id.clone())?)
+    } else {
+        // Keep existing allocations recoverable; changing node labels is not a migration.
+        if DockerDriver::has_allocations(state)? {
+            return Err(Error::Ownership);
+        }
+        None
+    };
+    #[cfg(feature = "ziren")]
+    let tee = match config.machine.tee.clone() {
+        Some(c) => Some(crate::tee::TeeDriver::connect(state, node_id.clone(), c).await?),
+        None => None,
+    };
+    #[cfg(not(feature = "ziren"))]
+    let tee = {
+        if config.machine.tee.is_some() {
+            return Err(Error::Unsupported);
+        }
+        None
+    };
+    if tee.is_none() && state.join("tee/profile.sha256").exists() {
+        // A pending attestation may not have a Docker record yet. Preserve its
+        // cleanup authority as well as the already-created workloads.
+        return Err(Error::Ownership);
+    }
     #[cfg(feature = "openshell")]
     let openshell = config
         .openshell
@@ -491,6 +593,9 @@ pub async fn serve_configured(
         .map_err(|_| Error::Unavailable)?;
     let daemon = Arc::new(Daemon {
         driver,
+        tee,
+        machine,
+        machine_config_sha256,
         #[cfg(feature = "openshell")]
         openshell,
         node_id,

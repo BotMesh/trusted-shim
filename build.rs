@@ -11,10 +11,15 @@ fn main() {
     tonic_prost_build::configure()
         .compile_with_config(
             config,
-            &["proto/stage.proto", "proto/ledger.proto"],
+            &[
+                "proto/stage.proto",
+                "proto/ledger.proto",
+                "proto/attestation.proto",
+            ],
             &["proto"],
         )
         .expect("compile proof and authorization protocols");
     println!("cargo:rerun-if-changed=proto/stage.proto");
     println!("cargo:rerun-if-changed=proto/ledger.proto");
+    println!("cargo:rerun-if-changed=proto/attestation.proto");
 }

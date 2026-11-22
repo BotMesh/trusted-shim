@@ -31,6 +31,17 @@ enum Command {
 
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--probe-machine" {
+        println!(
+            "{}",
+            serde_json::json!({
+                "tee_interfaces": trusted_shim::machine::detect()?,
+                "attestation_verified": false,
+                "tee_runtime_ready": false,
+            })
+        );
+        return Ok(());
+    }
     if matches!(args.len(), 6 | 8)
         && args[1] == "--serve"
         && args[2] == "--state-dir"

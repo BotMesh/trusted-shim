@@ -122,9 +122,13 @@ agent selects. It rejects `runtime.*` operations and cannot convert an existing
 strict request into a native authorization. The gRPC `Reserve` method continues
 to require a valid proof; it does not accept missing evidence as preflight.
 
-The planned TEE startup path is synchronous: prepare the isolated environment,
-obtain the required TEE evidence, submit its RA-verification guest to the proof
-network and verify the receipt before declaring that trust profile ready.
+TEE startup has a synchronous gate: collect CoCo Attestation Agent evidence,
+precheck it through stock Trustee, submit the original evidence to the remote
+RA program and verify its receipt before launching the container. The current
+hardware backend is intended for shim and local Docker **inside** an already
+measured SNP/TDX confidential VM; it does not create that VM or turn host Docker
+into an enclave. The measured init-data must confine shim, its endpoint key and
+local runtime. Trustee's token is not used as a proof or as launch authorization.
 GOAT registration execution is deliberately deferred. The owner-consent interface
 below does not register an agent or add a registration requirement to today's
 Docker path. Ordinary non-TEE registration will require owner authorization and
@@ -349,15 +353,68 @@ verifier. Test ledgers and proof networks are orchestration doubles, not product
 implementations or evidence of successful remote proving. The feature audit must
 also run in downstream binaries to prevent widening Regorus's deterministic profile.
 
-`DockerDriver` implements the machine-local `RuntimeDriver`; `AttestationVerifier`
-remains an interface; the concrete data-plane adapter owns outbound connectors.
-TEE evidence verification, its separate proof guest and concrete TEE runtime
-drivers remain follow-ups. Fleet embeds the central ledger and implements private
+`DockerDriver` and the confidential-VM `TeeDriver` implement machine-local
+`RuntimeDriver`; the data-plane adapter owns outbound connectors. CoCo evidence
+and Trustee gRPC adapters are concrete. Hardware-specific RA guests/collateral
+collection, SGX/Nitro isolation backends and hardware acceptance remain follow-ups. Fleet embeds the central ledger and implements private
 provisioning, native launch preparation and gateway readiness. Application action
 hooks still need integration to make preflight enforcement non-bypassable.
 Non-TEE attestation remains `SkippedNonTee`;
 requiring an attestation proof for that outcome is invalid. No permissive fallback
 or local prover is included.
+
+## Node-selected TEE startup
+
+Fleet passes `shim_machine_labels` and `shim_tee` from the existing `apps.yaml`
+as daemon `machine` options; no second configuration file is introduced.
+`runtime.driver` selects `auto`, `docker`, `openshell`, `tee` or `tee-simulation`.
+`--probe-machine` reports visible SNP/TDX/SGX character devices, never successful
+attestation. Auto uses a configured TEE adapter; detected devices without an
+approved TEE configuration require an explicit operator decision rather than
+silently claiming hardware trust. SGX host capability cannot run ordinary Docker
+as an enclave. Native OpenShell and this TEE startup backend are separate profiles.
+
+`tee.mode=hardware` accepts `snp`/`tdx`, requires the matching guest device and
+immutable workload image digests. `tee.mode=simulation` requires `sample`, needs
+no hardware and advertises only `tee-simulation`. Sample evidence never satisfies
+a hardware allocation. Production binaries include `ziren` for real Groth16
+receipt verification; there is no no-proof simulation option in the daemon.
+
+Configure the AA `/aa/evidence` endpoint on numeric loopback, the stock Trustee
+v0.19 gRPC API (loopback HTTP or HTTPS), approved attestation policy IDs,
+measurement/init-data/key digests and pinned RA ELF/program/verifying-key identity.
+Proof credentials are explicit private files; an optional signer file supports
+Fleet's token-bound proof signatures. Nothing discovers workspace credentials.
+The proof service and Trustee use reconnecting channels so their outage does not
+prevent daemon restart, inspection or cleanup. Configuration/credential files
+must remain available locally.
+
+The versioned witness is canonical JSON `{binding,evidence}`. Public values are
+`{binding,evidence_sha256}`. `binding` covers mode, platform, measurement, init-data,
+endpoint key, full execution identity, launch-request digest, random nonce and
+expiry. The pinned guest must verify **the original hardware evidence**, collateral,
+TCB/freshness policy, measured identity and report-data binding; merely verifying
+an AS token is insufficient. This repository does not yet ship those hardware
+RA guests, so this is not a production TEE-readiness claim.
+
+Jobs are recorded before submission; ambiguous submission is only polled on
+retry. The gate has a five-minute deadline. A crash before submission may need
+operator reconciliation. An expired admission can observe an existing workload
+but cannot create it. State is fenced to its trust profile; changing labels does
+not migrate allocations or permit removing their cleanup driver.
+
+Simulation checks use actual upstream Trustee sample verification and local Docker;
+proof-network/receipt doubles test orchestration and are explicitly not ZK proofs:
+
+```sh
+TRUSTEE_TEST_ENDPOINT=http://127.0.0.1:50004 \
+  cargo test --locked --all-features --test tee -- --include-ignored
+```
+
+Run stock `grpc-as` only on loopback for that test. The checked upstream image is
+`ghcr.io/confidential-containers/staged-images/coco-as-grpc@sha256:f65a0a74972781d5a3a9595f6e1308b86343f940738a0b6a23c270a7e8bd065a`.
+The test AA endpoint emits the upstream sample evidence format; it is a fixture,
+not a hardware attester. No local prover is started.
 
 ## Native OpenShell transport
 

@@ -11,7 +11,8 @@ pub enum ProofRequirement {
 }
 
 /// The control plane approves both program identity and verifying-key identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProgramRef {
     pub kind: ProofKind,
     pub program_sha256: String,

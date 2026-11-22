@@ -1071,6 +1071,7 @@ async fn native_dispatch_at_remote(via_daemon: bool) {
                 let stop = CancellationToken::new();
                 let stopped = stop.clone();
                 let config = DaemonConfig {
+                    machine: Default::default(),
                     openshell: Some(OpenShellConfig {
                         socket: h._dir.path().join("driver.sock"),
                         admission_policy: "approved".into(),
