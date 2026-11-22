@@ -281,16 +281,45 @@ remain fenced after deletion. A changed physical instance is rejected.
 
 This adapter proves provisioning admission only. It does not claim that platform
 `Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
-or provide TEE attestation. Native gateway preparation, Fleet activation,
-private credential provisioning and application endpoint readiness still
-need integration. Native split credentials must never enter an ordinary Fleet App
-spec, workload environment or public response. The runtime CLI advertises Docker
-only, and the adapter rejects application services and action-proof-required
-requests until those boundaries are connected. Tests use an upstream-protocol
+or provide TEE attestation. Fleet's guarded activation/credential API is available;
+automatic native gateway orchestration, delivery from Fleet to a remote node, and
+application endpoint readiness still need integration. Native split credentials
+must never enter an ordinary Fleet App spec, workload environment or public response.
+The adapter rejects application services and action-proof-required requests until
+those boundaries are connected. Tests use an upstream-protocol
 test server. The ignored native admission test also calls the pinned, unmodified
 Docker compute-driver binary to check capabilities, real input validation and
 operator policy mismatch. Neither test establishes full OpenShell isolation or
 an end-to-end provisioning proof.
+
+Build the runtime with `--features openshell` to enable native provisioning inside
+the persistent daemon. Its optional `--options` argument contains only operator
+settings: `{"openshell":{"socket":"/run/openshell/compute.sock",
+"admission_policy":"<upstream acknowledgement>","ledger_endpoint":"https://fleet.example",
+"ledger_ca_file":null}}`. Fleet fills these from its existing `apps.yaml`.
+The socket must be private and owned by the same UID. HTTPS uses system roots or
+the explicitly configured, non-writable CA file; plain HTTP is restricted to numeric
+loopback. A daemon without these settings still advertises Docker only. An enabled
+daemon adds `openshell-provisioning-v1` and a digest of its effective operator settings.
+It can start during a gateway outage without claiming the native driver is healthy.
+
+The private daemon command `{"operation":"provision","payload":...}` accepts a
+`provisioning::ProvisionRequest`, constructed with the exact gateway protobuf,
+canonical launch, Rail request, proof-backed grant and execution-only ledger token.
+The token and native credentials travel over the same-UID Unix socket, never argv,
+status or durable node state. The payload cannot supply a ledger endpoint or driver
+socket. Native validation precedes central Consume and the one permitted Create.
+Daemon request bodies are bounded; losing the caller does not cancel accepted work.
+An ambiguous Consume is retained as authorizing and never retried automatically.
+
+Use `driver: "openshell"` with the existing `inspect`, `stop` and `delete` daemon
+commands to manage that allocation. Inspection returns `phase`, `present` and
+`platform_ready`, not application readiness. Management uses persisted ownership
+without a ledger credential or a live gateway, including after daemon restart.
+The library likewise takes the ledger only in `ManagedNativeDriver::launch`;
+opening ownership state and cleanup never require an authority client. Tests cover
+real daemon sockets, central HTTP/2 Consume, revocation, reply loss, restart and
+gateway outage with protocol/proof doubles, without claiming native isolation.
 
 Proof-required admission waits for remote verification before dispatch. Applying
 that mode to every serial tool call adds the proof network's queue, proving and

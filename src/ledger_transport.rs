@@ -38,7 +38,7 @@ fn encode<T: serde::Serialize>(v: &T, limit: usize) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn grant_to_wire(g: ExecutionGrant) -> Result<wire::Grant> {
+pub(crate) fn grant_to_wire(g: ExecutionGrant) -> Result<wire::Grant> {
     if g.id.is_empty()
         || g.id.len() > 256
         || g.credential.is_empty()
@@ -57,7 +57,7 @@ fn grant_to_wire(g: ExecutionGrant) -> Result<wire::Grant> {
         expires_at: g.validity.expires_at,
     })
 }
-fn grant_from_wire(g: wire::Grant) -> Result<ExecutionGrant> {
+pub(crate) fn grant_from_wire(g: wire::Grant) -> Result<ExecutionGrant> {
     if g.id.is_empty()
         || g.id.len() > 256
         || g.credential.is_empty()
@@ -86,11 +86,9 @@ pub struct RemoteLedger {
     execution: ExecutionIdentity,
 }
 impl RemoteLedger {
-    pub async fn connect(
-        endpoint: &str,
-        token: &str,
-        execution: ExecutionIdentity,
-    ) -> Result<Self> {
+    /// Validate operator configuration without requiring a live gateway. Cleanup
+    /// and existing runtimes remain available during a control-plane outage.
+    pub fn endpoint(endpoint: &str) -> Result<Endpoint> {
         let uri: tonic::codegen::http::Uri = endpoint.parse().map_err(|_| Error::InvalidInput)?;
         if uri.authority().is_none_or(|a| a.as_str().contains('@'))
             || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
@@ -103,14 +101,22 @@ impl RemoteLedger {
             Some("https") => {
                 endpoint = endpoint
                     .tls_config(ClientTlsConfig::new().with_native_roots())
-                    .map_err(|_| Error::InvalidInput)?
+                    .map_err(|_| Error::InvalidInput)?;
             }
             Some("http") if matches!(uri.host(), Some("127.0.0.1" | "[::1]")) => (),
             _ => return Err(Error::InvalidInput),
         }
-        let channel = endpoint
+        Ok(endpoint
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(30)))
+    }
+
+    pub async fn connect(
+        endpoint: &str,
+        token: &str,
+        execution: ExecutionIdentity,
+    ) -> Result<Self> {
+        let channel = Self::endpoint(endpoint)?
             .connect()
             .await
             .map_err(|_| Error::Unavailable)?;

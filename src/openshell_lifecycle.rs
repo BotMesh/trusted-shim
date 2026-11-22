@@ -92,16 +92,10 @@ pub struct ManagedNativeDriver {
     node_id: String,
     connection: Arc<Mutex<Connection>>,
     native: NativeDriver,
-    ledger: Arc<dyn AuthorizationLedger>,
 }
 
 impl ManagedNativeDriver {
-    pub fn open(
-        state: PathBuf,
-        node_id: String,
-        native: NativeDriver,
-        ledger: Arc<dyn AuthorizationLedger>,
-    ) -> Result<Self> {
+    pub fn open(state: PathBuf, node_id: String, native: NativeDriver) -> Result<Self> {
         if !state.is_absolute() || node_id.is_empty() {
             return Err(Error::InvalidContract);
         }
@@ -129,7 +123,6 @@ impl ManagedNativeDriver {
             node_id,
             connection: Arc::new(Mutex::new(connection)),
             native,
-            ledger,
         })
     }
 
@@ -265,6 +258,7 @@ impl ManagedNativeDriver {
         prepared: NativeCreate,
         authorization: &EvaluationRequest,
         grant: &ExecutionGrant,
+        ledger: &dyn AuthorizationLedger,
     ) -> Result<ProvisioningStatus> {
         if request.trust.attestation != AttestationRequirement::SkipNonTee
             || request.trust.attestation_proof != ProofRequirement::NotRequired
@@ -333,7 +327,7 @@ impl ManagedNativeDriver {
         };
         let dispatch = self.native.prepare_dispatch(prepared).await?;
         self.save(&slot, &record, true)?;
-        self.ledger
+        ledger
             .consume(grant, &request.execution, &digest)
             .await
             .map_err(|_| Error::Untrusted)?;

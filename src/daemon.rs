@@ -29,7 +29,23 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 pub const PROTOCOL: u32 = 1;
-const MAX_REQUEST: usize = 1024 * 1024;
+const MAX_REQUEST: usize = crate::provisioning::MAX_PROVISION_BYTES + 16 * 1024;
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    #[cfg(feature = "openshell")]
+    pub openshell: Option<crate::openshell_daemon::OpenShellConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverKind {
+    #[default]
+    Docker,
+    #[cfg(feature = "openshell")]
+    Openshell,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,14 +62,24 @@ pub enum Command {
     Launch {
         request: Box<LaunchRequest>,
     },
+    #[cfg(feature = "openshell")]
+    Provision {
+        payload: Box<crate::provisioning::ProvisionRequest>,
+    },
     Inspect {
         execution: ExecutionIdentity,
+        #[serde(default)]
+        driver: DriverKind,
     },
     Stop {
         execution: ExecutionIdentity,
+        #[serde(default)]
+        driver: DriverKind,
     },
     Delete {
         execution: ExecutionIdentity,
+        #[serde(default)]
+        driver: DriverKind,
     },
     Network {
         execution: ExecutionIdentity,
@@ -82,6 +108,8 @@ struct NetworkTask {
 
 struct Daemon {
     driver: DockerDriver,
+    #[cfg(feature = "openshell")]
+    openshell: Option<crate::openshell_daemon::OpenShellRuntime>,
     node_id: String,
     networks_dir: PathBuf,
     networks: Mutex<HashMap<String, NetworkTask>>,
@@ -168,6 +196,18 @@ impl Daemon {
         match request.command {
             Command::Capabilities => {
                 let mut value = capabilities();
+                #[cfg(feature = "openshell")]
+                if let Some(native) = &self.openshell {
+                    value["openshell_config_sha256"] = json!(native.configuration_sha256);
+                    value["drivers"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("openshell"));
+                    value["features"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("openshell-provisioning-v1"));
+                }
                 value["pid"] = json!(std::process::id());
                 Ok(value)
             }
@@ -175,18 +215,62 @@ impl Daemon {
                 serde_json::to_value(self.driver.launch(&request).await?)
                     .map_err(|_| Error::InvalidContract)
             }
-            Command::Inspect { execution } => {
-                serde_json::to_value(self.driver.inspect(&execution).await?)
-                    .map_err(|_| Error::InvalidContract)
+            #[cfg(feature = "openshell")]
+            Command::Provision { payload } => serde_json::to_value(
+                self.openshell
+                    .as_ref()
+                    .ok_or(Error::Unsupported)?
+                    .provision(*payload)
+                    .await?,
+            )
+            .map_err(|_| Error::InvalidContract),
+            Command::Inspect { execution, driver } => match driver {
+                DriverKind::Docker => serde_json::to_value(self.driver.inspect(&execution).await?),
+                #[cfg(feature = "openshell")]
+                DriverKind::Openshell => serde_json::to_value(
+                    self.openshell
+                        .as_ref()
+                        .ok_or(Error::Unsupported)?
+                        .driver
+                        .inspect(&execution)
+                        .await?,
+                ),
             }
-            Command::Stop { execution } => {
-                self.driver.stop(&execution).await?;
-                self.forget_network(&execution).await?;
+            .map_err(|_| Error::InvalidContract),
+            Command::Stop { execution, driver } => {
+                match driver {
+                    DriverKind::Docker => {
+                        self.driver.stop(&execution).await?;
+                        self.forget_network(&execution).await?;
+                    }
+                    #[cfg(feature = "openshell")]
+                    DriverKind::Openshell => {
+                        self.openshell
+                            .as_ref()
+                            .ok_or(Error::Unsupported)?
+                            .driver
+                            .stop(&execution)
+                            .await?
+                    }
+                }
                 Ok(json!({"stopped": true}))
             }
-            Command::Delete { execution } => {
-                self.driver.delete(&execution).await?;
-                self.forget_network(&execution).await?;
+            Command::Delete { execution, driver } => {
+                match driver {
+                    DriverKind::Docker => {
+                        self.driver.delete(&execution).await?;
+                        self.forget_network(&execution).await?;
+                    }
+                    #[cfg(feature = "openshell")]
+                    DriverKind::Openshell => {
+                        self.openshell
+                            .as_ref()
+                            .ok_or(Error::Unsupported)?
+                            .driver
+                            .delete(&execution)
+                            .await?
+                    }
+                }
                 Ok(json!({"cleaned": true}))
             }
             Command::Network { execution, config } => {
@@ -256,6 +340,15 @@ impl Daemon {
 /// Independently supervised service, accessible only to the owning OS user.
 /// Shutdown closes connectors but never stops containers or releases allocations.
 pub async fn serve(state: &Path, node_id: String, stop: CancellationToken) -> Result<()> {
+    serve_configured(state, node_id, DaemonConfig::default(), stop).await
+}
+
+pub async fn serve_configured(
+    state: &Path,
+    node_id: String,
+    config: DaemonConfig,
+    stop: CancellationToken,
+) -> Result<()> {
     let driver = DockerDriver::new(state, node_id.clone())?;
     let metadata = std::fs::symlink_metadata(state).map_err(|_| Error::Unavailable)?;
     if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
@@ -269,6 +362,13 @@ pub async fn serve(state: &Path, node_id: String, stop: CancellationToken) -> Re
         .open(state.join("daemon.lock"))
         .map_err(|_| Error::Unavailable)?;
     lock.try_lock_exclusive().map_err(|_| Error::Ownership)?;
+    #[cfg(feature = "openshell")]
+    let openshell = config
+        .openshell
+        .map(|c| crate::openshell_daemon::OpenShellRuntime::open(state, node_id.clone(), c))
+        .transpose()?;
+    #[cfg(not(feature = "openshell"))]
+    let _ = config;
     let socket_path = state.join("control.sock");
     match std::fs::remove_file(&socket_path) {
         Ok(()) => {}
@@ -284,6 +384,8 @@ pub async fn serve(state: &Path, node_id: String, stop: CancellationToken) -> Re
         .map_err(|_| Error::Unavailable)?;
     let daemon = Arc::new(Daemon {
         driver,
+        #[cfg(feature = "openshell")]
+        openshell,
         node_id,
         networks_dir,
         networks: Mutex::new(HashMap::new()),

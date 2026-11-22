@@ -510,7 +510,6 @@ impl Harness {
             self.state.clone(),
             "node".into(),
             self.native.clone(),
-            self.ledger.clone(),
         )
         .unwrap()
     }
@@ -530,14 +529,21 @@ async fn managed_native_lifecycle_survives_restart_fences_generations_and_keeps_
     let bytes = s.encode_to_vec();
     let prepared = || NativeCreate::decode(&bytes, &r, &p).unwrap();
     let (a, g) = authorization(&r, &prepared(), "one");
-    let status = h.driver().launch(&r, prepared(), &a, &g).await.unwrap();
+    let status = h
+        .driver()
+        .launch(&r, prepared(), &a, &g, h.ledger.as_ref())
+        .await
+        .unwrap();
     assert_eq!(status.phase, ProvisioningPhase::Created);
     assert!(status.platform_ready);
     let public = serde_json::to_string(&status).unwrap();
     assert!(!public.contains("synthetic"));
     // Reopen durable state with a fresh driver and replay the exact request.
     let recovered = h.driver();
-    recovered.launch(&r, prepared(), &a, &g).await.unwrap();
+    recovered
+        .launch(&r, prepared(), &a, &g, h.ledger.as_ref())
+        .await
+        .unwrap();
     assert_eq!(h.service.created.load(Ordering::SeqCst), 1);
     assert_eq!(h.ledger.consumed.lock().unwrap().len(), 1);
     for field in ["namespace", "workload", "lease_id", "node_id"] {
@@ -584,7 +590,10 @@ async fn managed_native_lifecycle_survives_restart_fences_generations_and_keeps_
     h.service.retain_on_delete.store(false, Ordering::SeqCst);
     recovered.delete(&r.execution).await.unwrap();
     assert!(!recovered.inspect(&r.execution).await.unwrap().present);
-    assert!(recovered.launch(&r, prepared(), &a, &g).await.is_err());
+    assert!(recovered
+        .launch(&r, prepared(), &a, &g, h.ledger.as_ref())
+        .await
+        .is_err());
     let mut next = r.clone();
     next.execution.lease_id = "two".into();
     let mut sandbox = s.clone();
@@ -594,11 +603,17 @@ async fn managed_native_lifecycle_survives_restart_fences_generations_and_keeps_
     let bytes = sandbox.encode_to_vec();
     let native = NativeCreate::decode(&bytes, &next, &p).unwrap();
     let (a, g) = authorization(&next, &native, "two");
-    assert!(recovered.launch(&next, native, &a, &g).await.is_err()); // same generation
+    assert!(recovered
+        .launch(&next, native, &a, &g, h.ledger.as_ref())
+        .await
+        .is_err()); // same generation
     next.execution.generation += 1;
     let native = NativeCreate::decode(&bytes, &next, &p).unwrap();
     let (a, g) = authorization(&next, &native, "two");
-    recovered.launch(&next, native, &a, &g).await.unwrap();
+    recovered
+        .launch(&next, native, &a, &g, h.ledger.as_ref())
+        .await
+        .unwrap();
     assert!(recovered.delete(&r.execution).await.is_err());
     // Inspect persisted SQLite/WAL files, not just the public JSON serializer.
     for entry in std::fs::read_dir(&h.state).unwrap() {
@@ -634,15 +649,27 @@ async fn managed_launch_checks_exact_authorization_before_dispatch_and_never_ref
             g.request_sha256 = trusted_rail::rego::request_digest(&a).unwrap();
             g.execution = a.execution.clone();
         }
-        assert!(h.driver().launch(&r, prepared(), &a, &g).await.is_err());
+        assert!(h
+            .driver()
+            .launch(&r, prepared(), &a, &g, h.ledger.as_ref())
+            .await
+            .is_err());
     }
     assert_eq!(h.service.created.load(Ordering::SeqCst), 0);
     assert!(h.ledger.consumed.lock().unwrap().is_empty());
     let (a, g) = authorization(&r, &prepared(), "one");
     h.ledger.reject.store(true, Ordering::SeqCst);
-    assert!(h.driver().launch(&r, prepared(), &a, &g).await.is_err());
+    assert!(h
+        .driver()
+        .launch(&r, prepared(), &a, &g, h.ledger.as_ref())
+        .await
+        .is_err());
     h.ledger.reject.store(false, Ordering::SeqCst);
-    assert!(h.driver().launch(&r, prepared(), &a, &g).await.is_err());
+    assert!(h
+        .driver()
+        .launch(&r, prepared(), &a, &g, h.ledger.as_ref())
+        .await
+        .is_err());
     assert_eq!(h.service.created.load(Ordering::SeqCst), 0);
     h.driver().delete(&r.execution).await.unwrap();
 }
@@ -656,11 +683,15 @@ async fn ambiguous_create_is_never_repeated_or_released_while_absent() {
     let (a, g) = authorization(&r, &prepared(), "one");
     h.service.lose_create_reply.store(true, Ordering::SeqCst);
     h.service.missing_after_create.store(true, Ordering::SeqCst);
-    assert!(h.driver().launch(&r, prepared(), &a, &g).await.is_err());
+    assert!(h
+        .driver()
+        .launch(&r, prepared(), &a, &g, h.ledger.as_ref())
+        .await
+        .is_err());
     let recovered = h.driver();
     assert!(
         !recovered
-            .launch(&r, prepared(), &a, &g)
+            .launch(&r, prepared(), &a, &g, h.ledger.as_ref())
             .await
             .unwrap()
             .present
@@ -721,6 +752,15 @@ impl trusted_shim::ledger_transport::wire::authorization_ledger_server::Authoriz
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_dispatch_requires_unambiguous_consumption_at_remote_central_ledger() {
+    native_dispatch_at_remote(false).await;
+}
+
+#[tokio::test]
+async fn daemon_provisioning_survives_restarts_and_gateway_outages_without_storing_credentials() {
+    native_dispatch_at_remote(true).await;
+}
+
+async fn native_dispatch_at_remote(via_daemon: bool) {
     use trusted_rail::{rego::*, *};
     use trusted_shim::{
         contracts::ProofKind,
@@ -785,43 +825,173 @@ async fn native_dispatch_requires_unambiguous_consumption_at_remote_central_ledg
                 .await
                 .unwrap();
         });
-        let remote = Arc::new(
-            RemoteLedger::connect(&address, &token, r.execution.clone())
+        if via_daemon {
+            use serde_json::json;
+            use tokio::{
+                io::{AsyncReadExt, AsyncWriteExt},
+                net::UnixStream,
+            };
+            use tokio_util::sync::CancellationToken;
+            use trusted_shim::{
+                daemon::{serve_configured, DaemonConfig},
+                openshell_daemon::OpenShellConfig,
+                provisioning::ProvisionRequest,
+            };
+            let socket = h.state.join("control.sock");
+            let start = || {
+                let state = h.state.clone();
+                let stop = CancellationToken::new();
+                let stopped = stop.clone();
+                let config = DaemonConfig {
+                    openshell: Some(OpenShellConfig {
+                        socket: h._dir.path().join("driver.sock"),
+                        admission_policy: "approved".into(),
+                        ledger_endpoint: address.clone(),
+                        ledger_ca_file: None,
+                    }),
+                };
+                let task = tokio::spawn(async move {
+                    serve_configured(&state, "node".into(), config, stopped).await
+                });
+                (stop, task)
+            };
+            let call = |command| {
+                let socket = socket.clone();
+                async move {
+                    for _ in 0..100 {
+                        if socket.exists() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    let mut stream = UnixStream::connect(socket).await.unwrap();
+                    let bytes = serde_json::to_vec(
+                        &json!({"protocol":1,"node_id":"node","command":command}),
+                    )
+                    .unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    let mut bytes = Vec::new();
+                    stream.read_to_end(&mut bytes).await.unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                }
+            };
+            let (stop, task) = start();
+            let copy = trusted_rail::ExecutionGrant {
+                id: grant.id.clone(),
+                credential: grant.credential.clone(),
+                execution: grant.execution.clone(),
+                request_sha256: grant.request_sha256.clone(),
+                validity: grant.validity.clone(),
+            };
+            let payload = ProvisionRequest::new(
+                r.clone(),
+                &bytes,
+                native_policy.clone(),
+                request.clone(),
+                copy,
+                token.clone(),
+            )
+            .unwrap();
+            let command = json!({"operation":"provision","payload":payload});
+            let caps = call(json!({"operation":"capabilities"})).await;
+            assert!(caps["result"]["features"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("openshell-provisioning-v1")));
+            for changed in ["execution", "native", "token", "endpoint"] {
+                let mut bad = command.clone();
+                match changed {
+                    "execution" => {
+                        bad["payload"]["request"]["execution"]["namespace"] = json!("other")
+                    }
+                    "native" => bad["payload"]["native_policy_sha256"] = json!("f".repeat(64)),
+                    "token" => bad["payload"]["ledger_token"] = json!("f".repeat(64)),
+                    _ => bad["payload"]["ledger_endpoint"] = json!("http://127.0.0.1:1"),
+                }
+                // A rejected Consume is durably fenced, so use malformed tokens
+                // here to exercise pre-dispatch validation without claiming a slot.
+                if changed == "token" {
+                    bad["payload"]["ledger_token"] = json!("malformed");
+                }
+                assert!(call(bad).await.get("error").is_some());
+                assert_eq!(h.service.created.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(call(command.clone()).await.get("error").is_none(), !lose);
+            assert!(central
+                .consume(&grant, &grant.execution, &grant.request_sha256)
                 .await
-                .unwrap(),
-        );
-        let driver = ManagedNativeDriver::open(
-            h.state.clone(),
-            "node".into(),
-            h.native.clone(),
-            remote.clone(),
-        )
-        .unwrap();
-        let result = driver.launch(&r, prepared(), &request, &grant).await;
-        assert_eq!(result.is_ok(), !lose);
-        assert_eq!(h.service.created.load(Ordering::SeqCst), usize::from(!lose));
-        assert!(central
-            .consume(&grant, &grant.execution, &grant.request_sha256)
-            .await
-            .is_err());
-        drop(driver);
-        let driver =
-            ManagedNativeDriver::open(h.state.clone(), "node".into(), h.native.clone(), remote)
-                .unwrap();
-        assert_eq!(
-            driver
-                .launch(&r, prepared(), &request, &grant)
+                .is_err());
+            stop.cancel();
+            task.await.unwrap().unwrap();
+            central.revoke_access(&token).unwrap();
+            server.abort();
+            // Restart the shim with no live authority connection. No second
+            // Consume/Create; inspection and cleanup still use durable ownership.
+            let (stop, task) = start();
+            assert_eq!(call(command).await.get("error").is_none(), !lose);
+            let status =
+                call(json!({"operation":"inspect","driver":"openshell","execution":r.execution}))
+                    .await;
+            assert!(status.get("error").is_none());
+            assert!(status["result"].get("ready").is_none()); // platform is not application readiness
+            assert_eq!(h.service.created.load(Ordering::SeqCst), usize::from(!lose));
+            let mut other = r.execution.clone();
+            other.lease_id = "wrong".into();
+            assert!(
+                call(json!({"operation":"delete","driver":"openshell","execution":other}))
+                    .await
+                    .get("error")
+                    .is_some()
+            );
+            assert_eq!(
+                call(json!({"operation":"delete","driver":"openshell","execution":r.execution}))
+                    .await["result"]["cleaned"],
+                true
+            );
+            stop.cancel();
+            task.await.unwrap().unwrap();
+        } else {
+            let remote = Arc::new(
+                RemoteLedger::connect(&address, &token, r.execution.clone())
+                    .await
+                    .unwrap(),
+            );
+            let driver =
+                ManagedNativeDriver::open(h.state.clone(), "node".into(), h.native.clone())
+                    .unwrap();
+            let result = driver
+                .launch(&r, prepared(), &request, &grant, remote.as_ref())
+                .await;
+            assert_eq!(result.is_ok(), !lose);
+            assert_eq!(h.service.created.load(Ordering::SeqCst), usize::from(!lose));
+            assert!(central
+                .consume(&grant, &grant.execution, &grant.request_sha256)
                 .await
-                .is_ok(),
-            !lose
-        );
-        assert_eq!(h.service.created.load(Ordering::SeqCst), usize::from(!lose));
-        central.revoke_access(&token).unwrap();
-        driver.delete(&r.execution).await.unwrap();
+                .is_err());
+            drop(driver);
+            let driver =
+                ManagedNativeDriver::open(h.state.clone(), "node".into(), h.native.clone())
+                    .unwrap();
+            assert_eq!(
+                driver
+                    .launch(&r, prepared(), &request, &grant, remote.as_ref())
+                    .await
+                    .is_ok(),
+                !lose
+            );
+            assert_eq!(h.service.created.load(Ordering::SeqCst), usize::from(!lose));
+            central.revoke_access(&token).unwrap();
+            driver.delete(&r.execution).await.unwrap();
+        }
         server.abort();
         // Neither the central bearer nor grant secret is persisted on the node.
         for entry in std::fs::read_dir(&h.state).unwrap() {
-            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(path).unwrap();
             assert!(!bytes
                 .windows(token.len())
                 .any(|part| part == token.as_bytes()));
