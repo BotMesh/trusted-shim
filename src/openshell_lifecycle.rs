@@ -56,7 +56,8 @@ impl NativeCreate {
         authorization: &EvaluationRequest,
     ) -> Result<()> {
         if self.launch_sha256 != hash("trusted-shim.launch.v1", request)?
-            || self.sandbox.workspace != request.execution.namespace
+            || self.sandbox.workspace
+                != crate::openshell_gateway::workspace_name(&request.execution.namespace)
             || authorization.execution != request.execution
             || authorization.operation != "runtime.create"
             || authorization.resource != self.authorization_resource()
@@ -89,6 +90,10 @@ pub struct ProvisioningStatus {
     pub phase: ProvisioningPhase,
     pub present: bool,
     pub platform_ready: bool,
+    /// Sanitized native protobuf, for Fleet's control-plane observation only.
+    /// This is not a service route or a declaration of application readiness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_observation_base64: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -259,10 +264,15 @@ impl ManagedNativeDriver {
         Ok(sandbox)
     }
     fn status(record: &Record, sandbox: Option<&DriverSandbox>) -> ProvisioningStatus {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use prost::Message;
         ProvisioningStatus {
             execution: record.execution.clone(),
             sandbox_id: record.sandbox_id.clone(),
             phase: record.phase,
+            native_observation_base64: sandbox
+                .and_then(|s| crate::openshell_gateway::control_observation(s).ok())
+                .map(|s| STANDARD.encode(s.encode_to_vec())),
             present: sandbox.is_some(),
             platform_ready: sandbox.and_then(|s| s.status.as_ref()).is_some_and(|s| {
                 !s.deleting
@@ -392,7 +402,7 @@ impl ManagedNativeDriver {
             authorization_sha256: String::new(),
             sandbox_id: String::new(),
             sandbox_name: String::new(),
-            workspace: execution.namespace.clone(),
+            workspace: crate::openshell_gateway::workspace_name(&execution.namespace),
             phase: ProvisioningPhase::Reserved,
             instance_id: None,
         };

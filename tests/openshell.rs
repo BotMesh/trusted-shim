@@ -23,6 +23,38 @@ use trusted_shim::{
     runtime::LaunchRequest,
 };
 
+#[test]
+fn gateway_workspace_mapping_keeps_full_canonical_identity_bound() {
+    use trusted_shim::openshell_gateway::workspace_name;
+    for namespace in [
+        "test",
+        "a".repeat(32).as_str(),
+        "User.Namespace",
+        "double--hyphen",
+    ] {
+        let (mut launch, mut sandbox, _) = fixture();
+        launch.execution.namespace = namespace.into();
+        let policy = sandbox.spec.as_ref().unwrap().policy.clone().unwrap();
+        let binding = GatewayLaunch::new(launch.clone(), policy).unwrap();
+        let mapped = workspace_name(namespace);
+        assert!(mapped.len() <= 19 && !mapped.contains("--"));
+        sandbox.workspace = mapped.clone();
+        sandbox.name = binding.request().name;
+        sandbox.status.as_mut().unwrap().name = sandbox.name.clone();
+        binding.bind(&sandbox.encode_to_vec()).unwrap();
+        assert_eq!(workspace_name(namespace), mapped);
+        if namespace == "test" {
+            assert_eq!(mapped, namespace);
+        }
+        let mut other = launch;
+        other.execution.namespace.push('x');
+        assert!(
+            NativeCreate::decode(&sandbox.encode_to_vec(), &other, binding.policy_sha256())
+                .is_err()
+        );
+    }
+}
+
 #[path = "support/native_gateway.rs"]
 mod native_gateway;
 
@@ -74,6 +106,37 @@ fn fixture() -> (LaunchRequest, DriverSandbox, String) {
         }),
     };
     (request, sandbox, hash)
+}
+
+#[test]
+fn control_observation_strips_native_credentials_endpoints_and_diagnostics() {
+    let (_, mut s, _) = fixture();
+    let status = s.status.as_mut().unwrap();
+    status.agent_fd = "127.0.0.1:secret".into();
+    status.sandbox_fd = "unix:///private/supervisor".into();
+    status.conditions[0].message = "secret diagnostic".into();
+    status.instance_id = "native-instance".into();
+    status.fence_evidence = Some(DriverFenceEvidence {
+        generation: "generation".into(),
+        evidence_digest: "a".repeat(64),
+        resource_claims: Default::default(),
+    });
+    let safe = trusted_shim::openshell_gateway::control_observation(&s).unwrap();
+    assert!(safe.spec.is_none());
+    let status = safe.status.as_ref().unwrap();
+    assert!(status.agent_fd.is_empty() && status.sandbox_fd.is_empty());
+    assert!(status.conditions[0].message.is_empty());
+    assert_eq!(status.instance_id, "native-instance");
+    assert_eq!(
+        status.fence_evidence,
+        s.status.as_ref().unwrap().fence_evidence
+    );
+    assert_eq!(
+        trusted_shim::openshell_gateway::control_observation(&safe).unwrap(),
+        safe
+    );
+    s.status.as_mut().unwrap().instance_id = "x".repeat(16385);
+    assert!(trusted_shim::openshell_gateway::control_observation(&s).is_err());
 }
 
 #[test]

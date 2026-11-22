@@ -73,6 +73,10 @@ fn private_socket(path: &Path) -> Result<()> {
 }
 
 impl NativeCreate {
+    /// Commitment to the exact private protobuf bytes, safe for durable journals.
+    pub fn native_sha256(&self) -> &str {
+        &self.native_sha256
+    }
     /// Bind the native policy and every canonical workload input to the Fleet
     /// allocation. Resource strings are deliberately canonical at this boundary.
     pub fn decode(
@@ -133,7 +137,7 @@ impl NativeCreate {
             // driver chooses it from its operator configuration. Workspace is
             // the tenant boundary and must match Fleet's canonical namespace.
             || !sandbox.namespace.is_empty()
-            || sandbox.workspace != request.execution.namespace
+            || sandbox.workspace != crate::openshell_gateway::workspace_name(&request.execution.namespace)
             || sandbox.status.as_ref().is_some_and(|s| {
                 // The gateway supplies a pending configuration observation on
                 // create. It cannot supply an existing runtime or readiness.

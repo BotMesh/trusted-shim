@@ -382,8 +382,11 @@ remain fenced after deletion. A changed physical instance is rejected.
 This adapter proves provisioning admission only. It does not claim that platform
 `Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
 or provide TEE attestation. Fleet's guarded activation/credential API is available;
-the native gateway compute extension's connection to Fleet's proof/delivery flow, and
-application endpoint readiness still need integration. Native split credentials
+Fleet's embedded stock-gateway compute extension now connects remote startup
+proofs to private node delivery. Application endpoint readiness still needs
+integration. `control_observation` strips native configuration, credentials, local
+endpoints and condition messages before returning bounded status to Fleet; it
+cannot establish application readiness. Native split credentials
 must never enter an ordinary Fleet App spec, workload environment or public response.
 The adapter rejects application services and action-proof-required requests until
 those boundaries are connected. Tests use an upstream-protocol
@@ -391,6 +394,11 @@ test server. The ignored native admission test also calls the pinned, unmodified
 Docker compute-driver binary to check capabilities, real input validation and
 operator policy mismatch. Neither test establishes full OpenShell isolation or
 an end-to-end provisioning proof.
+
+Canonical namespace IDs map to native workspace names within the stock gateway's
+19-byte limit; the full Fleet identity remains proof-bound. The embedding control
+plane must reject collisions. Explicit nonempty commands avoid the gateway's
+implicit interactive TTY mode, which this profile does not support.
 
 `openshell_gateway::GatewayLaunch` translates an admitted Fleet launch and native
 policy into the stock gateway's public create request. It binds the workspace,

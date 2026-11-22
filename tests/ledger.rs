@@ -94,6 +94,31 @@ async fn serve(l: Arc<SqliteLedger>) -> (String, tokio::task::JoinHandle<()>) {
     (address, task)
 }
 
+#[tokio::test]
+async fn startup_snapshot_and_blocking_reservation_keep_proof_and_epoch_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = open(&dir.path().join("ledger.sqlite"));
+    let (policy, request) = fixture();
+    assert!(ledger.authority_snapshot(&request.execution).is_err());
+    ledger.set_budget("shared", 2).unwrap();
+    stage(&ledger, &policy, &request, "startup");
+    let (approved, context, root) = ledger.authority_snapshot(&request.execution).unwrap();
+    assert_eq!(approved.policy, policy.policy);
+    assert_eq!(context, request.context);
+    assert_eq!(root, request.previous_state_root);
+    let decision = RegorusEngine.evaluate(&approved, &request).unwrap();
+    assert!(ledger.reserve_proven(&decision, b"forged").is_err());
+    let proof = encode_public_values(&decision).unwrap();
+    let grant = ledger.reserve_proven(&decision, &proof).unwrap();
+    ledger
+        .consume(&grant, &request.execution, &decision.request_sha256)
+        .await
+        .unwrap();
+    assert!(ledger.reserve_proven(&decision, &proof).is_err());
+    ledger.revoke(&request.execution).unwrap();
+    assert!(ledger.authority_snapshot(&request.execution).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_credentials_fence_every_identity_dimension_and_consume_once_across_restart() {
     use trusted_shim::{

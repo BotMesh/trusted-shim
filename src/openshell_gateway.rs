@@ -12,6 +12,48 @@ use trusted_rail::rego::commitment;
 
 pub use openshell_core::proto as protocol;
 pub use openshell_core::proto::{compute::v1::DriverSandbox, sandbox::v1::SandboxPolicy};
+pub use openshell_core::{extension_protocol, resource_admission};
+
+/// Stock gateway workspace names are routable labels capped at 19 bytes.
+/// Preserve compatible names; map canonical Fleet IDs without changing the
+/// full execution identity bound by Rail. The control plane must reject any
+/// mapping collision between different canonical namespaces.
+pub fn workspace_name(namespace: &str) -> String {
+    if !namespace.is_empty()
+        && namespace.len() <= 19
+        && namespace
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !namespace.starts_with('-')
+        && !namespace.ends_with('-')
+        && !namespace.contains("--")
+    {
+        return namespace.into();
+    }
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"trusted-shim.openshell.workspace.v1\0");
+    hash.update(namespace.as_bytes());
+    format!("w{}", &hex::encode(hash.finalize())[..18])
+}
+
+/// Safe compute observation for the central gateway. Workload configuration,
+/// credentials, local endpoints and platform diagnostics never enter heartbeats.
+pub fn control_observation(sandbox: &DriverSandbox) -> Result<DriverSandbox> {
+    let mut result = sandbox.clone();
+    result.spec = None;
+    if let Some(s) = result.status.as_mut() {
+        s.agent_fd.clear();
+        s.sandbox_fd.clear();
+        for condition in &mut s.conditions {
+            condition.message.clear();
+        }
+    }
+    if result.encoded_len() > 16 * 1024 {
+        return Err(Error::InvalidContract);
+    }
+    Ok(result)
+}
 
 /// Construct only from the control plane's admitted allocation and policy.
 /// Contains workload environment; deliberately no Debug or Serialize impl.
@@ -36,6 +78,9 @@ impl GatewayLaunch {
             .iter()
             .any(|v| v.is_empty() || v.len() > 256 || v.contains('\0'))
             || launch.image.is_empty()
+            // An omitted command makes the stock gateway request an interactive
+            // TTY. This provisioning profile intentionally excludes TTY launches.
+            || launch.command.is_empty()
             || launch.limits.cpu_millicores.is_none_or(|v| v == 0)
             || launch
                 .limits
@@ -103,7 +148,9 @@ impl GatewayLaunch {
         };
         proto::CreateSandboxRequest {
             name: self.name.clone(),
-            workspace_scope: Some(proto::workspace_selector(&self.launch.execution.namespace)),
+            workspace_scope: Some(proto::workspace_selector(workspace_name(
+                &self.launch.execution.namespace,
+            ))),
             spec: Some(proto::SandboxSpec {
                 command: self.launch.command.clone(),
                 environment: self.launch.environment.clone().into_iter().collect(),

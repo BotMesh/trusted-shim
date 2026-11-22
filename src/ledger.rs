@@ -381,6 +381,36 @@ impl SqliteLedger {
         ))?;
         serde_json::from_str(&r).map_err(|_| Error::Unavailable)
     }
+
+    /// Central control-plane snapshot for constructing a strict startup request.
+    /// Staging and reservation still recheck the active epoch and exact inputs.
+    /// Never expose this authority or let an execution node supply replacements.
+    pub fn authority_snapshot(
+        &self,
+        execution: &ExecutionIdentity,
+    ) -> Result<(PolicyBundle, serde_json::Value, String)> {
+        let c = self.connection.lock().map_err(|_| Error::Unavailable)?;
+        let (policy, context, root): (String, String, String) = db(c.query_row(
+            "SELECT policy,context,root FROM authorities WHERE execution=?1 AND active=1",
+            params![execution_key(execution)?],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ))?;
+        Ok((
+            serde_json::from_str(&policy).map_err(|_| Error::Unavailable)?,
+            serde_json::from_str(&context).map_err(|_| Error::Unavailable)?,
+            root,
+        ))
+    }
+
+    /// Blocking central admission, allowing an embedding scheduler to hold its
+    /// live allocation guard through proof verification and the transaction.
+    pub fn reserve_proven(
+        &self,
+        decision: &DecisionRecord,
+        evidence: &[u8],
+    ) -> Result<ExecutionGrant> {
+        self.reserve_inner(decision, Some(evidence), None)
+    }
     fn credential(&self, id: &str, d: &DecisionRecord) -> Result<Vec<u8>> {
         Ok(self.mac(id, d)?.finalize().into_bytes().to_vec())
     }
