@@ -93,14 +93,13 @@ impl GatewayLaunch {
         // This is the same initial native profile admitted at the node. No
         // unsupported request may silently turn into a weaker public API call.
         if launch.driver != "openshell"
-            || !launch.driver_options.is_null()
-            || !launch.services.is_empty()
             || launch.trust.attestation != AttestationRequirement::SkipNonTee
             || launch.trust.attestation_proof != ProofRequirement::NotRequired
             || launch.trust.policy_proof != ProofRequirement::NotRequired
         {
             return Err(Error::Unsupported);
         }
+        crate::openshell_services::ServiceOptions::from_request(&launch)?;
         let digest = commitment("trusted-shim.openshell.gateway-name.v1", e)
             .map_err(|_| Error::InvalidContract)?;
         let result = Self {

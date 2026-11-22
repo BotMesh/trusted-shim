@@ -108,6 +108,8 @@ struct Record {
     workspace: String,
     phase: ProvisioningPhase,
     instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    services: Option<crate::openshell_services::AdmittedServices>,
 }
 
 /// The directory is node-private and durable across upgrades. Tombstones and
@@ -301,13 +303,12 @@ impl ManagedNativeDriver {
         }
         // This grant proves provisioning policy only. It does not enable a
         // proof-required agent action boundary or attest a non-TEE machine.
-        if request.trust.policy_proof != ProofRequirement::NotRequired
-            || !request.services.is_empty()
-        {
+        if request.trust.policy_proof != ProofRequirement::NotRequired {
             return Err(Error::Unsupported);
         }
         let digest = execution_digest(authorization, grant)?;
         prepared.validate_authorization(request, authorization)?;
+        let services = crate::openshell_services::AdmittedServices::prepare(request, &prepared)?;
         let slot = self.slot(&request.execution)?;
         let _lock = self.lock(&slot).await?;
         if let Some(mut old) = self.read(&slot)? {
@@ -351,6 +352,7 @@ impl ManagedNativeDriver {
             workspace: prepared.sandbox.workspace.clone(),
             phase: ProvisioningPhase::Authorizing,
             instance_id: None,
+            services,
         };
         let dispatch = self.native.prepare_dispatch(prepared).await?;
         self.save(&slot, &record, true)?;
@@ -375,6 +377,73 @@ impl ManagedNativeDriver {
         let mut record = self.owned(&slot, execution)?;
         let observed = self.observe(&slot, &mut record).await?;
         Ok(Self::status(&record, observed.as_ref()))
+    }
+
+    fn network_paths(&self, execution: &ExecutionIdentity) -> Result<(PathBuf, PathBuf)> {
+        self.slot(execution)?;
+        let id = hash("trusted-shim.openshell.network.v1", execution)?;
+        Ok((
+            self.state.join(format!("{id}.native-network.lock")),
+            self.state.join(format!("{id}.native-network.closed")),
+        ))
+    }
+
+    pub(crate) async fn network_lease(
+        &self,
+        execution: &ExecutionIdentity,
+    ) -> Result<crate::openshell_services::NativeNetworkLease> {
+        let slot = self.slot(execution)?;
+        let _lock = self.lock(&slot).await?;
+        let mut record = self.owned(&slot, execution)?;
+        if record.phase != ProvisioningPhase::Created {
+            return Err(Error::Ownership);
+        }
+        let binding = record.services.clone().ok_or(Error::Unsupported)?;
+        let sandbox = self
+            .observe(&slot, &mut record)
+            .await?
+            .ok_or(Error::Ownership)?;
+        if !Self::status(&record, Some(&sandbox)).platform_ready {
+            return Err(Error::Unavailable);
+        }
+        let (path, closed) = self.network_paths(execution)?;
+        let file = Self::private_file(path)?;
+        file.try_lock_exclusive().map_err(|_| Error::Ownership)?;
+        if closed.try_exists().map_err(|_| Error::Unavailable)? {
+            return Err(Error::Ownership);
+        }
+        Ok(crate::openshell_services::NativeNetworkLease {
+            fence: crate::data_plane::NetworkFence {
+                _file: file,
+                closed,
+            },
+            sandbox,
+            binding,
+        })
+    }
+
+    async fn drain_network(&self, execution: &ExecutionIdentity) -> Result<File> {
+        let (path, closed) = self.network_paths(execution)?;
+        Self::private_file(closed)?
+            .sync_all()
+            .map_err(|_| Error::Unavailable)?;
+        File::open(&self.state)
+            .and_then(|f| f.sync_all())
+            .map_err(|_| Error::Unavailable)?;
+        let file = Self::private_file(path)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(file),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await
+                }
+                Err(_) => return Err(Error::Unavailable),
+            }
+        }
     }
 
     /// Hold an admitted allocation before private provisioning material arrives.
@@ -405,6 +474,7 @@ impl ManagedNativeDriver {
             workspace: crate::openshell_gateway::workspace_name(&execution.namespace),
             phase: ProvisioningPhase::Reserved,
             instance_id: None,
+            services: None,
         };
         self.save(&slot, &record, false)?;
         Ok(Self::status(&record, None))
@@ -423,6 +493,7 @@ impl ManagedNativeDriver {
         }
         record.phase = ProvisioningPhase::Deleting;
         self.save(&slot, &record, false)?;
+        let _network = self.drain_network(execution).await?;
         if !record.sandbox_id.is_empty() {
             self.native
                 .delete(&record.sandbox_id, &record.sandbox_name)
@@ -448,6 +519,7 @@ impl ManagedNativeDriver {
         }
         record.phase = ProvisioningPhase::Stopping;
         self.save(&slot, &record, false)?;
+        let _network = self.drain_network(execution).await?;
         if !record.sandbox_id.is_empty() {
             self.native
                 .stop(&record.sandbox_id, &record.sandbox_name)

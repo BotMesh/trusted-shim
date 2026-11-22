@@ -183,6 +183,7 @@ impl client::Handler for HostKey {
 pub struct LocalService {
     address: SocketAddr,
     task: tokio::task::JoinHandle<()>,
+    stop: CancellationToken,
 }
 impl LocalService {
     pub fn address(&self) -> SocketAddr {
@@ -192,13 +193,13 @@ impl LocalService {
         self.task.is_finished()
     }
     pub async fn close(mut self) {
-        self.task.abort();
+        self.stop.cancel();
         let _ = (&mut self.task).await;
     }
 }
 impl Drop for LocalService {
     fn drop(&mut self) {
-        self.task.abort();
+        self.stop.cancel();
     }
 }
 
@@ -214,6 +215,8 @@ pub async fn bind(
     stop: CancellationToken,
 ) -> Result<LocalService> {
     valid_target(&sandbox, supervisor_image, host_key_fingerprint, port)?;
+    // Closing one endpoint must not cancel siblings sharing the caller's token.
+    let stop = stop.child_token();
     if stop.is_cancelled() {
         return Err(Error::Unavailable);
     }
@@ -266,9 +269,13 @@ pub async fn bind(
         container,
         image,
         port,
-        stop,
+        stop.clone(),
     ));
-    Ok(LocalService { address, task })
+    Ok(LocalService {
+        address,
+        task,
+        stop,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

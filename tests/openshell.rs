@@ -109,6 +109,47 @@ fn fixture() -> (LaunchRequest, DriverSandbox, String) {
 }
 
 #[test]
+fn native_service_targets_are_admitted_and_bound_to_the_create_proof() {
+    let (mut launch, sandbox, policy_hash) = fixture();
+    launch.services = serde_json::from_value(serde_json::json!([{
+        "id":{"namespace":"test","workload":"agent","service":"http"},
+        "protocol":"http1","endpoint_ref":"app"
+    }]))
+    .unwrap();
+    launch.driver_options = serde_json::json!({"container_port":8090,"health_path":"/health"});
+    let native = NativeCreate::decode(&sandbox.encode_to_vec(), &launch, &policy_hash).unwrap();
+    let (authorization, _) = authorization(&launch, &native, "services");
+    native
+        .validate_authorization(&launch, &authorization)
+        .unwrap();
+    for changed in [
+        serde_json::json!({"container_port":8091,"health_path":"/health"}),
+        serde_json::json!({"container_port":8090,"health_path":"/different"}),
+    ] {
+        let mut other = launch.clone();
+        other.driver_options = changed;
+        assert!(native
+            .validate_authorization(&other, &authorization)
+            .is_err());
+    }
+    for mutation in 0..9 {
+        let mut bad = launch.clone();
+        match mutation {
+            0 => bad.services[0].id.namespace = "another-tenant".into(),
+            1 => bad.services[0].id.workload = "another-app".into(),
+            2 => bad.services[0].id.service = "control".into(),
+            3 => bad.services[0].endpoint_ref = "http://arbitrary-host".into(),
+            4 => bad.services.push(bad.services[0].clone()),
+            5 => bad.driver_options["container_port"] = 0.into(),
+            6 => bad.driver_options["health_path"] = "//another-host/".into(),
+            7 => bad.driver_options["image"] = "unapproved".into(),
+            _ => bad.services[0].protocol = trusted_data_router::Protocol::Tcp,
+        }
+        assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &bad, &policy_hash).is_err());
+    }
+}
+
+#[test]
 fn control_observation_strips_native_credentials_endpoints_and_diagnostics() {
     let (_, mut s, _) = fixture();
     let status = s.status.as_mut().unwrap();
@@ -687,6 +728,28 @@ impl Drop for Harness {
 }
 
 #[tokio::test]
+async fn native_services_require_authenticated_host_identity_before_consumption() {
+    let h = Harness::new().await;
+    let (mut launch, sandbox, policy) = fixture();
+    launch.services = serde_json::from_value(serde_json::json!([{
+        "id":{"namespace":"test","workload":"agent","service":"http"},
+        "protocol":"http1","endpoint_ref":"app"
+    }]))
+    .unwrap();
+    launch.driver_options = serde_json::json!({"container_port":8090,"health_path":"/health"});
+    let native = NativeCreate::decode(&sandbox.encode_to_vec(), &launch, &policy).unwrap();
+    let (authorization, grant) = authorization(&launch, &native, "services");
+    assert!(matches!(
+        h.driver()
+            .launch(&launch, native, &authorization, &grant, h.ledger.as_ref())
+            .await,
+        Err(trusted_shim::Error::Untrusted)
+    ));
+    assert!(h.ledger.consumed.lock().unwrap().is_empty());
+    assert_eq!(h.service.created.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn managed_native_lifecycle_survives_restart_fences_generations_and_keeps_secrets_out_of_state(
 ) {
     use trusted_shim::openshell_lifecycle::ProvisioningPhase;
@@ -1014,6 +1077,7 @@ async fn native_dispatch_at_remote(via_daemon: bool) {
                         admission_policy: "approved".into(),
                         ledger_endpoint: address.clone(),
                         ledger_ca_file: None,
+                        supervisor_image: None,
                     }),
                 };
                 let task = tokio::spawn(async move {

@@ -25,16 +25,31 @@ pub struct OpenShellConfig {
     pub ledger_endpoint: String,
     #[serde(default)]
     pub ledger_ca_file: Option<PathBuf>,
+    /// Immutable local Docker image ID of the supervisor containing the socket
+    /// helper. Omit to retain provisioning-only operation and its config digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_image: Option<String>,
 }
 
 pub(crate) struct OpenShellRuntime {
     pub driver: ManagedNativeDriver,
     pub configuration_sha256: String,
     endpoint: Endpoint,
+    pub supervisor_image: Option<String>,
 }
 
 impl OpenShellRuntime {
     pub fn open(state: &Path, node_id: String, config: OpenShellConfig) -> Result<Self> {
+        if config.supervisor_image.as_ref().is_some_and(|s| {
+            !s.strip_prefix("sha256:").is_some_and(|id| {
+                id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        }) {
+            return Err(Error::InvalidContract);
+        }
         use sha2::{Digest, Sha256};
         let value = serde_json::to_value(&config).map_err(|_| Error::InvalidContract)?;
         let configuration_sha256 = hex::encode(Sha256::digest(
@@ -74,10 +89,14 @@ impl OpenShellRuntime {
             driver: ManagedNativeDriver::open(state.to_owned(), node_id, native)?,
             endpoint,
             configuration_sha256,
+            supervisor_image: config.supervisor_image,
         })
     }
 
     pub async fn provision(&self, payload: ProvisionRequest) -> Result<ProvisioningStatus> {
+        if !payload.request.services.is_empty() && self.supervisor_image.is_none() {
+            return Err(Error::Unsupported);
+        }
         let native = payload.validate_native()?;
         // A lazy channel leaves idempotent inspection/cleanup independent of a
         // gateway outage. First-time dispatch still requires successful Consume.

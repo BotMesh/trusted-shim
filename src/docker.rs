@@ -441,8 +441,10 @@ impl DockerDriver {
             return Err(Error::Ownership);
         }
         Ok(crate::data_plane::NetworkLease {
-            _file: file,
-            closed,
+            fence: crate::data_plane::NetworkFence {
+                _file: file,
+                closed,
+            },
             services: record.services,
             ingress: record.ingress,
             target: std::net::SocketAddr::from((

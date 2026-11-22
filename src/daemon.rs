@@ -38,13 +38,18 @@ pub struct DaemonConfig {
     pub openshell: Option<crate::openshell_daemon::OpenShellConfig>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
     #[default]
     Docker,
     #[cfg(feature = "openshell")]
     Openshell,
+}
+impl DriverKind {
+    fn is_docker(&self) -> bool {
+        matches!(self, Self::Docker)
+    }
 }
 
 #[derive(Deserialize)]
@@ -89,6 +94,8 @@ pub enum Command {
     Network {
         execution: ExecutionIdentity,
         config: NetworkConfig,
+        #[serde(default)]
+        driver: DriverKind,
     },
 }
 
@@ -103,6 +110,8 @@ pub fn capabilities() -> Value {
 struct NetworkRecord {
     execution: ExecutionIdentity,
     config: NetworkConfig,
+    #[serde(default, skip_serializing_if = "DriverKind::is_docker")]
+    driver: DriverKind,
 }
 
 struct NetworkTask {
@@ -139,15 +148,24 @@ impl Daemon {
                 return Ok(json!({"connected_worker": true}));
             }
         }
-        if self.driver.inspect(&record.execution).await?.state != RuntimeState::Ready {
-            return Err(Error::Ownership);
-        }
         // Validate and acquire the port/ownership fence before acknowledging.
         // The worker takes the same lock when it begins; competing legacy
         // connectors cannot silently redirect or duplicate this allocation.
         data_plane::validate_config(&record.config)?;
-        let probe = self.driver.network_lease(&record.execution).await?;
-        drop(probe);
+        match record.driver {
+            DriverKind::Docker => {
+                if self.driver.inspect(&record.execution).await?.state != RuntimeState::Ready {
+                    return Err(Error::Ownership);
+                }
+                drop(self.driver.network_lease(&record.execution).await?);
+            }
+            #[cfg(feature = "openshell")]
+            DriverKind::Openshell => {
+                let native = self.openshell.as_ref().ok_or(Error::Unsupported)?;
+                native.supervisor_image.as_ref().ok_or(Error::Unsupported)?;
+                drop(native.driver.network_lease(&record.execution).await?);
+            }
+        }
         let mut file =
             tempfile::NamedTempFile::new_in(&self.networks_dir).map_err(|_| Error::Unavailable)?;
         file.write_all(&bytes).map_err(|_| Error::Unavailable)?;
@@ -157,10 +175,30 @@ impl Daemon {
         self.sync_networks()?;
         let stop = CancellationToken::new();
         let worker_stop = stop.clone();
-        let driver = self.driver.clone();
-        let task = tokio::spawn(async move {
-            data_plane::serve(&driver, &record.execution, &record.config, worker_stop).await
-        });
+        let task = match record.driver {
+            DriverKind::Docker => {
+                let driver = self.driver.clone();
+                tokio::spawn(async move {
+                    data_plane::serve(&driver, &record.execution, &record.config, worker_stop).await
+                })
+            }
+            #[cfg(feature = "openshell")]
+            DriverKind::Openshell => {
+                let native = self.openshell.as_ref().ok_or(Error::Unsupported)?;
+                let driver = native.driver.clone();
+                let image = native.supervisor_image.clone().ok_or(Error::Unsupported)?;
+                tokio::spawn(async move {
+                    crate::openshell_data_plane::serve(
+                        &driver,
+                        &record.execution,
+                        &record.config,
+                        &image,
+                        worker_stop,
+                    )
+                    .await
+                })
+            }
+        };
         networks.insert(
             key,
             NetworkTask {
@@ -216,6 +254,12 @@ impl Daemon {
                         .as_array_mut()
                         .unwrap()
                         .push(json!("openshell-allocation-v1"));
+                    if native.supervisor_image.is_some() {
+                        value["features"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!("openshell-local-services-v1"));
+                    }
                 }
                 value["pid"] = json!(std::process::id());
                 Ok(value)
@@ -274,7 +318,8 @@ impl Daemon {
                             .ok_or(Error::Unsupported)?
                             .driver
                             .stop(&execution)
-                            .await?
+                            .await?;
+                        self.forget_network(&execution).await?;
                     }
                 }
                 Ok(json!({"stopped": true}))
@@ -292,13 +337,23 @@ impl Daemon {
                             .ok_or(Error::Unsupported)?
                             .driver
                             .delete(&execution)
-                            .await?
+                            .await?;
+                        self.forget_network(&execution).await?;
                     }
                 }
                 Ok(json!({"cleaned": true}))
             }
-            Command::Network { execution, config } => {
-                self.network(NetworkRecord { execution, config }).await
+            Command::Network {
+                execution,
+                config,
+                driver,
+            } => {
+                self.network(NetworkRecord {
+                    execution,
+                    config,
+                    driver,
+                })
+                .await
             }
         }
     }

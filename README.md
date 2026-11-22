@@ -371,7 +371,8 @@ native create. `ledger_transport::RemoteLedger` reaches the central ledger throu
 an authenticated gateway client
 on a node; its authoritative database must never be copied onto an untrusted node.
 
-SQLite stores only ownership, commitments and lifecycle state, without native
+SQLite stores ownership, commitments, admitted service targets, the public SSH
+host-key fingerprint and lifecycle state, without native
 credentials, environment or the grant. A replay after restart only observes the
 original sandbox. An unanswered create is never resubmitted, and an absent
 snapshot cannot release its reservation while the create may still be in flight.
@@ -383,13 +384,15 @@ This adapter proves provisioning admission only. It does not claim that platform
 `Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
 or provide TEE attestation. Fleet's guarded activation/credential API is available;
 Fleet's embedded stock-gateway compute extension now connects remote startup
-proofs to private node delivery. Application endpoint readiness still needs
-integration. `control_observation` strips native configuration, credentials, local
+proofs to private node delivery. Local HTTP health now gates outbound service
+registration; joining central policy readiness for production publication still
+needs integration. `control_observation` strips native configuration, credentials, local
 endpoints and condition messages before returning bounded status to Fleet; it
 cannot establish application readiness. Native split credentials
 must never enter an ordinary Fleet App spec, workload environment or public response.
-The adapter rejects application services and action-proof-required requests until
-those boundaries are connected. Tests use an upstream-protocol
+The adapter accepts declared HTTP application services; management/credential
+injection, TCP services and action-proof-required requests remain unsupported.
+Tests use an upstream-protocol
 test server. The ignored native admission test also calls the pinned, unmodified
 Docker compute-driver binary to check capabilities, real input validation and
 operator policy mismatch. Neither test establishes full OpenShell isolation or
@@ -419,7 +422,10 @@ docker build --build-arg SUPERVISOR_IMAGE=registry/supervisor@sha256:... \
 ```
 
 Configure the resulting immutable image in the existing native driver's
-`supervisor_image` setting. Keep the native SSH socket at its default
+`supervisor_image` setting, and put its exact local `sha256:<64 hex>` image ID in
+the existing shim OpenShell configuration's optional `supervisor_image` field.
+Omitting this field preserves provisioning-only behavior and the previous daemon
+configuration digest. Keep the native SSH socket at its default
 `/run/openshell/ssh.sock`. The helper has no listener, accepts no arguments, and
 requires a private socket owned by its supervisor UID. Shim attaches it with
 local Docker exec; it stays inside the trusted supervisor container, never the
@@ -430,16 +436,32 @@ The returned endpoint is host-loopback only, for the existing outgoing router
 connector. Drop/cancellation drains active local streams; ownership monitoring
 closes the transport when the pinned workload or supervisor disappears or stops.
 This is a privileged library interface, **not an app API**. Callers must supply a
-fresh owned observation and an admitted service port. Automatic service
-publication remains disabled until the daemon binds these inputs to durable
-allocation state and joins native configuration readiness with application
-health. Router grants, revocation and control-snapshot freshness still apply;
+fresh owned observation and an admitted service port. The daemon's private
+`network` command now accepts `driver: openshell` with the existing `NetworkConfig`;
+it takes no target or SSH identity from that command. `LaunchRequest.services`
+must contain unique, allocation-scoped HTTP1 services with `endpoint_ref: app`.
+Its `driver_options` must be exactly `{"container_port":8090,"health_path":"/health"}`
+(with the application's port/path). These fields participate in the launch
+commitment. The public SSH fingerprint is derived from the exact proof-bound
+native authentication bundle before Consume; private keys are never persisted.
+
+The daemon recovers stored connector records on restart, checks HTTP health
+without redirects or proxy environment, and retries health recovery independently
+of Ray. Stop/delete permanently fence connections and wait for transport drain
+before native cleanup. No host application port is published. A started connector
+worker is not proof of route reachability or policy readiness.
+
+Automatic Fleet publication remains disabled pending authenticated gateway
+configuration/policy readiness. The stock supervisor health socket indicates
+session acceptance **before** asynchronous configuration application, so it cannot
+replace this gate. Router grants, revocation and control-snapshot freshness still apply;
 local connectivity during a control outage does not authorize indefinite access.
 
 Fleet's opt-in native Docker acceptance composes this helper with the stock
 supervisor and exercises real HTTP/SSE/WebSocket through the local Data Router,
 including wrong tenant/image/host-key rejection, active-stream revocation,
-cancellation and control-gateway outage. Its proof service and route-grant issuer
+health denial/recovery, durable daemon restart, cleanup drain and control-gateway outage.
+Its proof service and route-grant issuer
 are explicit test fixtures; it is neither a fresh proof nor a cross-machine NAT
 acceptance test.
 

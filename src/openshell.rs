@@ -117,6 +117,7 @@ impl NativeCreate {
         if sandbox.encoded_len() > 1024 * 1024 || request.driver != "openshell" {
             return Err(Error::InvalidContract);
         }
+        crate::openshell_services::ServiceOptions::from_request(request)?;
         let spec = sandbox.spec.as_ref().ok_or(Error::InvalidContract)?;
         let template = spec.template.as_ref().ok_or(Error::InvalidContract)?;
         let policy = spec.policy.as_ref().ok_or(Error::InvalidContract)?;
@@ -204,7 +205,6 @@ impl NativeCreate {
             || spec.tty
             || spec.await_main_process_attachment
             || spec.isolation_backend.is_some()
-            || !request.driver_options.is_null()
         {
             return Err(Error::Unsupported);
         }

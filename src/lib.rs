@@ -25,11 +25,15 @@ pub mod openshell;
 #[cfg(feature = "openshell")]
 pub mod openshell_daemon;
 #[cfg(feature = "openshell")]
+mod openshell_data_plane;
+#[cfg(feature = "openshell")]
 pub mod openshell_gateway;
 #[cfg(feature = "openshell")]
 pub mod openshell_lifecycle;
 #[cfg(feature = "openshell")]
 pub mod openshell_network;
+#[cfg(feature = "openshell")]
+pub mod openshell_services;
 pub mod proof;
 pub mod provisioning;
 pub mod registration;

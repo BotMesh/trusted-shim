@@ -4003,6 +4003,7 @@ dependencies = [
  "base64 0.22.1",
  "glob",
  "ipnet",
+ "jsonwebtoken 10.4.0",
  "libc",
  "miette",
  "nix 0.29.0",
@@ -4027,6 +4028,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
