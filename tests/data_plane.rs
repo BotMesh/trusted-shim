@@ -38,6 +38,7 @@ async fn real_runtime_drains_network_before_releasing_its_port() {
         .unwrap()
         .success());
     let key = std::fs::read(private).unwrap();
+    std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644)).unwrap();
     let issuer = "test-gateway";
     let relay = Relay::new(
         Verifier::new(&std::fs::read(&public).unwrap(), issuer.into()).unwrap(),
@@ -68,6 +69,8 @@ async fn real_runtime_drains_network_before_releasing_its_port() {
         nbf: grants::now(),
         exp: grants::now() + 120,
         purpose: Purpose::Register,
+        http_request: None,
+        access: None,
         execution: request.execution.clone(),
         service: ServiceId {
             namespace: "film".into(),
@@ -152,6 +155,8 @@ async fn real_runtime_drains_network_before_releasing_its_port() {
         &key,
         &Grant {
             purpose: Purpose::Access,
+            http_request: None,
+            access: None,
             ..grant.clone()
         },
     )

@@ -88,7 +88,53 @@ fn available<T>(result: std::io::Result<T>) -> Result<T> {
     result.map_err(|_| Error::Unavailable)
 }
 
+// Keep draining the pipe so verbose containers cannot deadlock `docker logs`,
+// but retain only the last 128 KiB of each stream (256 KiB total).
+async fn log_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    const LIMIT: usize = 128 * 1024;
+    let mut tail = std::collections::VecDeque::with_capacity(LIMIT);
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        if n == 0 {
+            return Ok(tail.into());
+        }
+        let discard = (tail.len() + n).saturating_sub(LIMIT);
+        tail.drain(..discard);
+        tail.extend(&chunk[..n]);
+    }
+}
+
 impl DockerDriver {
+    /// Private durable replay ledger survives connector and shim restarts. A
+    /// failed/ambiguous upstream dispatch never refunds an invocation.
+    pub(crate) async fn consume_http_request(
+        &self,
+        execution: &ExecutionIdentity,
+        service: &str,
+        id: &str,
+        expires_at: u64,
+    ) -> Result<bool> {
+        let key = hash(&(execution, service, id))?;
+        let path = self.state.join("http-invocations.sqlite");
+        tokio::task::spawn_blocking(move || {
+            let _file=available(OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&path))?;
+            let mut db=rusqlite::Connection::open(path).map_err(|_|Error::Unavailable)?;
+            db.busy_timeout(Duration::from_secs(5)).map_err(|_|Error::Unavailable)?;
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS invocations(id TEXT PRIMARY KEY, expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS invocation_expiry ON invocations(expires);").map_err(|_|Error::Unavailable)?;
+            let transaction=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|Error::Unavailable)?;
+            let now=trusted_router_transport::grants::now();
+            if now>=expires_at{return Err(Error::Untrusted)}
+            transaction.execute("DELETE FROM invocations WHERE expires <= ?1",[now]).map_err(|_|Error::Unavailable)?;
+            let inserted=transaction.execute("INSERT OR IGNORE INTO invocations(id,expires) VALUES(?1,?2)",rusqlite::params![key,expires_at]).map_err(|_|Error::Unavailable)?;
+            transaction.commit().map_err(|_|Error::Unavailable)?;
+            Ok(inserted==1)
+        }).await.map_err(|_|Error::Unavailable)?
+    }
     fn allocate_port(&self, execution: &ExecutionIdentity) -> Result<u16> {
         // Reserve in the durable node state before dropping the OS socket.
         // Docker receives a fixed mapping, so restarts cannot move the target.
@@ -270,6 +316,63 @@ impl DockerDriver {
             .map_err(|_| Error::Unavailable)?
     }
 
+    pub(crate) async fn logs(
+        &self,
+        execution: &ExecutionIdentity,
+        tail: u32,
+        expires_at: u64,
+    ) -> Result<crate::management::LogsResponse> {
+        use base64::Engine as _;
+        let remaining = expires_at.saturating_sub(trusted_router_transport::grants::now());
+        if remaining == 0 || !(1..=5000).contains(&tail) {
+            return Err(Error::Untrusted);
+        }
+        // Bound lock acquisition, ownership checks, and the full read together.
+        tokio::time::timeout(Duration::from_secs(remaining.min(15)), async {
+            let slot = self.slot(execution)?;
+            let _lock = self.lock(&slot).await?;
+            let record = self.owned(&slot, execution)?;
+            if record.phase == Phase::Deleted || Self::container(&slot, &record).await?.is_none() {
+                return Err(Error::Ownership);
+            }
+            let mut child = tokio::process::Command::new("/usr/bin/docker")
+                .arg("--host=unix:///var/run/docker.sock")
+                .args([
+                    "logs",
+                    "--tail",
+                    &tail.to_string(),
+                    "--",
+                    &Self::name(&slot),
+                ])
+                .env_remove("DOCKER_CONTEXT")
+                .env_remove("DOCKER_HOST")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| Error::Unavailable)?;
+            let (stdout, stderr) = tokio::try_join!(
+                log_tail(child.stdout.take().ok_or(Error::Unavailable)?),
+                log_tail(child.stderr.take().ok_or(Error::Unavailable)?),
+            )?;
+            if !child
+                .wait()
+                .await
+                .map_err(|_| Error::Unavailable)?
+                .success()
+            {
+                return Err(Error::Unavailable);
+            }
+            Ok(crate::management::LogsResponse {
+                stdout: base64::engine::general_purpose::STANDARD.encode(stdout),
+                stderr: base64::engine::general_purpose::STANDARD.encode(stderr),
+            })
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+
     pub(crate) async fn restart(
         &self,
         execution: &ExecutionIdentity,
@@ -338,8 +441,10 @@ impl DockerDriver {
             return Err(Error::Ownership);
         }
         Ok(crate::data_plane::NetworkLease {
-            _file: file,
-            closed,
+            fence: crate::data_plane::NetworkFence {
+                _file: file,
+                closed,
+            },
             services: record.services,
             ingress: record.ingress,
             target: std::net::SocketAddr::from((

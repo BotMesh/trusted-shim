@@ -4,17 +4,19 @@
 use crate::{contracts::ExecutionIdentity, docker::DockerDriver, Error, Result};
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::{any, get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use trusted_data_router::ServiceSpec;
-use trusted_router_transport::grants::{Purpose, Verifier};
+use trusted_router_transport::grants::{Grant, Purpose, Verifier};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +25,12 @@ pub struct Ingress {
     pub methods: Vec<String>,
     /// Native authorization stays on the node, read from the owned container.
     pub bearer_env: Option<String>,
+    /// Require body-bound, durably single-use control-plane approval.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub single_use: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl Ingress {
     pub fn validate(&self) -> Result<()> {
@@ -71,6 +79,18 @@ pub struct ExecResponse {
     pub exit_code: i32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogsQuery {
+    tail: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LogsResponse {
+    pub stdout: String,
+    pub stderr: String,
+}
+
 struct Service {
     driver: DockerDriver,
     execution: ExecutionIdentity,
@@ -79,10 +99,10 @@ struct Service {
     ingress: Option<Ingress>,
     target: SocketAddr,
     client: reqwest::Client,
-    slots: tokio::sync::Semaphore,
+    slots: Arc<tokio::sync::Semaphore>,
 }
 impl Service {
-    fn authorize(&self, headers: &HeaderMap) -> std::result::Result<u64, StatusCode> {
+    fn authorize(&self, headers: &HeaderMap) -> std::result::Result<Grant, StatusCode> {
         let token = headers
             .get("x-trusted-route")
             .and_then(|v| v.to_str().ok())
@@ -91,10 +111,13 @@ impl Service {
             .verifier
             .verify(token, Purpose::Access)
             .map_err(|_| StatusCode::FORBIDDEN)?;
-        if grant.execution != self.execution || grant.service != self.declaration.id {
+        if grant.execution != self.execution
+            || grant.service != self.declaration.id
+            || (self.ingress.is_none() && grant.http_request.is_some())
+        {
             return Err(StatusCode::FORBIDDEN);
         }
-        Ok(grant.exp)
+        Ok(grant)
     }
 }
 fn failure(_: Error) -> StatusCode {
@@ -130,11 +153,12 @@ pub async fn bind(
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|_| Error::Unavailable)?,
-        slots: tokio::sync::Semaphore::new(if control { 4 } else { 64 }),
+        slots: Arc::new(tokio::sync::Semaphore::new(if control { 4 } else { 64 })),
     });
     let router = if control {
         Router::new()
             .route("/metadata", get(metadata))
+            .route("/logs", get(logs))
             .route("/exec", post(execute))
             .route("/restart", post(restart))
             .layer(DefaultBodyLimit::max(90 * 1024 * 1024))
@@ -176,7 +200,7 @@ async fn execute(
     headers: HeaderMap,
     Json(request): Json<ExecRequest>,
 ) -> std::result::Result<Json<ExecResponse>, StatusCode> {
-    let expires_at = service.authorize(&headers)?;
+    let expires_at = service.authorize(&headers)?.exp;
     let _slot = service
         .slots
         .try_acquire()
@@ -188,11 +212,31 @@ async fn execute(
         .map(Json)
         .map_err(failure)
 }
+async fn logs(
+    State(service): State<Arc<Service>>,
+    headers: HeaderMap,
+    Query(query): Query<LogsQuery>,
+) -> std::result::Result<Json<LogsResponse>, StatusCode> {
+    let expires_at = service.authorize(&headers)?.exp;
+    if !(1..=5000).contains(&query.tail) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let _slot = service
+        .slots
+        .try_acquire()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    service
+        .driver
+        .logs(&service.execution, query.tail, expires_at)
+        .await
+        .map(Json)
+        .map_err(failure)
+}
 async fn restart(
     State(service): State<Arc<Service>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
-    let expires_at = service.authorize(&headers)?;
+    let expires_at = service.authorize(&headers)?.exp;
     let _slot = service
         .slots
         .try_acquire()
@@ -208,7 +252,12 @@ async fn proxy(
     State(service): State<Arc<Service>>,
     request: Request,
 ) -> std::result::Result<Response, StatusCode> {
-    service.authorize(request.headers())?;
+    let grant = service.authorize(request.headers())?;
+    let slot = service
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     let ingress = service.ingress.as_ref().ok_or(StatusCode::FORBIDDEN)?;
     if !ingress.paths.iter().any(|p| p == request.uri().path())
         || !ingress
@@ -217,6 +266,33 @@ async fn proxy(
             .any(|m| m == request.method().as_str())
     {
         return Err(StatusCode::FORBIDDEN);
+    }
+    let (parts, body) = request.into_parts();
+    let path = parts
+        .uri
+        .path_and_query()
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .as_str()
+        .to_owned();
+    if ingress.single_use && grant.http_request.is_none() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if let Some(binding) = &grant.http_request {
+        if binding.method != parts.method.as_str() || binding.path != path {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        axum::body::to_bytes(body, 16 * 1024 * 1024),
+    )
+    .await
+    .map_err(|_| StatusCode::REQUEST_TIMEOUT)?
+    .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+    if let Some(binding) = &grant.http_request {
+        if hex::encode(Sha256::digest(&body)) != binding.body_sha256 {
+            return Err(StatusCode::FORBIDDEN);
+        }
     }
     let metadata = service
         .driver
@@ -240,12 +316,24 @@ async fn proxy(
     } else {
         None
     };
-    let (parts, body) = request.into_parts();
-    let path = parts
-        .uri
-        .path_and_query()
-        .ok_or(StatusCode::BAD_REQUEST)?
-        .as_str();
+    if trusted_router_transport::grants::now() >= grant.exp {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if let Some(binding) = &grant.http_request {
+        if !service
+            .driver
+            .consume_http_request(
+                &service.execution,
+                &service.declaration.id.service,
+                &binding.id,
+                grant.exp,
+            )
+            .await
+            .map_err(failure)?
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
     let mut upstream = service
         .client
         .request(parts.method, format!("http://{}{path}", service.target));
@@ -258,7 +346,7 @@ async fn proxy(
         upstream = upstream.bearer_auth(bearer);
     }
     let response = upstream
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .body(body)
         .send()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -269,6 +357,11 @@ async fn proxy(
         }
     }
     result
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::from_stream(response.bytes_stream().map(
+            move |chunk| {
+                let _hold = &slot;
+                chunk
+            },
+        )))
         .map_err(|_| StatusCode::BAD_GATEWAY)
 }
