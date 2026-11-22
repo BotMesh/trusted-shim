@@ -5,7 +5,7 @@ use crate::proof::{ProgramRef, ProofReceipt, ReceiptVerifier};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -18,6 +18,53 @@ use trusted_rail::{
 };
 
 type Result<T> = trusted_rail::Result<T>;
+
+/// Operator-selected rights for a single exact execution, never a namespace-wide
+/// credential. Admission can reserve; Execution can consume. Neither can stage
+/// requests, change policy/context, activate leases or change budgets.
+#[derive(Clone, Copy)]
+pub enum LedgerPermission {
+    Admission = 1,
+    Execution = 2,
+    AdmissionAndExecution = 3,
+}
+
+fn access_hash(token: &str) -> Result<String> {
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(Error::Rejected);
+    }
+    Ok(hex::encode(Sha256::digest(token.as_bytes())))
+}
+
+fn check_access(
+    c: &Connection,
+    token: &str,
+    execution: &ExecutionIdentity,
+    permission: LedgerPermission,
+) -> Result<()> {
+    let time = amount(now()?)?;
+    let allowed: bool = db(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ledger_access a JOIN authorities t ON a.execution=t.execution
+         WHERE a.token_hash=?1 AND a.execution=?2 AND (a.permissions & ?3)=?3
+         AND a.not_before<=?4 AND ?4<a.expires_at AND t.active=1)",
+        params![
+            access_hash(token)?,
+            execution_key(execution)?,
+            permission as i64,
+            time
+        ],
+        |r| r.get(0),
+    ))?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::Rejected)
+    }
+}
 fn db<T>(v: rusqlite::Result<T>) -> Result<T> {
     v.map_err(|_| Error::Unavailable)
 }
@@ -51,6 +98,66 @@ pub struct SqliteLedger {
     key: Vec<u8>,
 }
 impl SqliteLedger {
+    /// Central operator API. Deliver the returned secret through the node's
+    /// authenticated private provisioning channel; never an ordinary App spec.
+    /// Only its hash is persisted. Maximum lifetime is one hour; the operator
+    /// must additionally bound it by the current Fleet lease.
+    pub fn issue_access(
+        &self,
+        execution: &ExecutionIdentity,
+        permission: LedgerPermission,
+        validity: &trusted_contracts::Validity,
+    ) -> Result<String> {
+        let time = now()?;
+        if validity.not_before > time
+            || validity.expires_at <= time
+            || validity.expires_at.saturating_sub(validity.not_before) > 3600
+        {
+            return Err(Error::InvalidInput);
+        }
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret).map_err(|_| Error::Unavailable)?;
+        let token = hex::encode(secret);
+        let c = self.connection.lock().map_err(|_| Error::Unavailable)?;
+        let inserted = db(c.execute(
+            "INSERT INTO ledger_access SELECT ?1,execution,?3,?4,?5 FROM authorities WHERE execution=?2 AND active=1",
+            params![access_hash(&token)?, execution_key(execution)?, permission as i64,
+                amount(validity.not_before)?, amount(validity.expires_at)?],
+        ))?;
+        if inserted != 1 {
+            return Err(Error::Rejected);
+        }
+        Ok(token)
+    }
+
+    /// Credential revocation and grant consumption serialize on the same DB.
+    pub fn revoke_access(&self, token: &str) -> Result<()> {
+        let c = self.connection.lock().map_err(|_| Error::Unavailable)?;
+        db(c.execute(
+            "DELETE FROM ledger_access WHERE token_hash=?1",
+            params![access_hash(token)?],
+        ))?;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_authenticated(
+        &self,
+        token: &str,
+        d: &DecisionRecord,
+        proof: &[u8],
+    ) -> Result<ExecutionGrant> {
+        self.reserve_inner(d, Some(proof), Some(token))
+    }
+
+    pub(crate) fn consume_authenticated(
+        &self,
+        token: &str,
+        g: &ExecutionGrant,
+        e: &ExecutionIdentity,
+        digest: &str,
+    ) -> Result<()> {
+        self.consume_inner(g, e, digest, Some(token))
+    }
     /// The caller supplies a private durable directory, approved ELF/key and real
     /// cryptographic verifier. There is no network or local prover in this layer.
     pub fn open(
@@ -92,6 +199,7 @@ impl SqliteLedger {
           CREATE TABLE IF NOT EXISTS budgets(name TEXT PRIMARY KEY, allowance INTEGER NOT NULL, spent INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS revoked(execution TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS authorities(execution TEXT PRIMARY KEY, policy TEXT NOT NULL, context TEXT NOT NULL, root TEXT NOT NULL, budget TEXT NOT NULL REFERENCES budgets(name), epoch INTEGER NOT NULL, active INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS ledger_access(token_hash TEXT PRIMARY KEY, execution TEXT NOT NULL REFERENCES authorities(execution), permissions INTEGER NOT NULL, not_before INTEGER NOT NULL, expires_at INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, execution TEXT NOT NULL REFERENCES authorities(execution), action TEXT NOT NULL, epoch INTEGER NOT NULL, request TEXT NOT NULL, decision TEXT NOT NULL, cost INTEGER NOT NULL, state INTEGER NOT NULL DEFAULT 0, proof BLOB, UNIQUE(execution,action));"))?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         db(tx.execute(
@@ -272,6 +380,25 @@ impl AuthorizationLedger for SqliteLedger {
         decision: &DecisionRecord,
         evidence: Option<&[u8]>,
     ) -> Result<ExecutionGrant> {
+        self.reserve_inner(decision, evidence, None)
+    }
+    async fn consume(
+        &self,
+        grant: &ExecutionGrant,
+        execution: &ExecutionIdentity,
+        digest: &str,
+    ) -> Result<()> {
+        self.consume_inner(grant, execution, digest, None)
+    }
+}
+
+impl SqliteLedger {
+    fn reserve_inner(
+        &self,
+        decision: &DecisionRecord,
+        evidence: Option<&[u8]>,
+        access: Option<&str>,
+    ) -> Result<ExecutionGrant> {
         current(decision)?;
         let evidence = evidence
             .filter(|v| !v.is_empty() && v.len() <= 1024 * 1024)
@@ -281,6 +408,9 @@ impl AuthorizationLedger for SqliteLedger {
         let d = text(decision)?;
         let id: String = {
             let c = self.connection.lock().map_err(|_| Error::Unavailable)?;
+            if let Some(token) = access {
+                check_access(&c, token, &decision.execution, LedgerPermission::Admission)?;
+            }
             db(c.query_row(
                 "SELECT id FROM actions WHERE execution=?1 AND action=?2 AND decision=?3",
                 params![key, decision.action_id, d],
@@ -299,6 +429,9 @@ impl AuthorizationLedger for SqliteLedger {
             .map_err(|_| Error::Rejected)?;
         let mut c = self.connection.lock().map_err(|_| Error::Unavailable)?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        if let Some(token) = access {
+            check_access(&tx, token, &decision.execution, LedgerPermission::Admission)?;
+        }
         let (state,cost,budget):(i64,i64,String)=db(tx.query_row("SELECT a.state,a.cost,t.budget FROM actions a JOIN authorities t ON a.execution=t.execution WHERE a.id=?1 AND t.active=1 AND a.epoch=t.epoch",params![id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))))?;
         current(decision)?;
         if state == 2 {
@@ -326,17 +459,21 @@ impl AuthorizationLedger for SqliteLedger {
             validity: decision.validity.clone(),
         })
     }
-    async fn consume(
+    fn consume_inner(
         &self,
         grant: &ExecutionGrant,
         execution: &ExecutionIdentity,
         digest: &str,
+        access: Option<&str>,
     ) -> Result<()> {
         if grant.execution != *execution || grant.request_sha256 != digest {
             return Err(Error::Rejected);
         }
         let mut c = self.connection.lock().map_err(|_| Error::Unavailable)?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        if let Some(token) = access {
+            check_access(&tx, token, execution, LedgerPermission::Execution)?;
+        }
         let d:String=db(tx.query_row("SELECT a.decision FROM actions a JOIN authorities t ON a.execution=t.execution WHERE a.id=?1 AND a.state=1 AND t.active=1 AND a.epoch=t.epoch",params![grant.id],|r|r.get(0)))?;
         let decision: DecisionRecord = serde_json::from_str(&d).map_err(|_| Error::Unavailable)?;
         current(&decision)?;

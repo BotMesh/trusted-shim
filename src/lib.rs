@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod data_plane;
 pub mod docker;
 pub mod ledger;
+pub mod ledger_transport;
 pub mod management;
 pub mod network;
 #[cfg(feature = "openshell")]

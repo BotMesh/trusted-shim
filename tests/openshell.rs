@@ -600,6 +600,163 @@ async fn ambiguous_create_is_never_repeated_or_released_while_absent() {
     recovered.delete(&r.execution).await.unwrap();
 }
 
+// Real central database and gRPC, with native-driver/proof doubles. This tests
+// dispatch ordering and lost replies, not native isolation or ZK cryptography.
+struct ProvisioningVerifier;
+impl trusted_shim::proof::ReceiptVerifier for ProvisioningVerifier {
+    fn verify(
+        &self,
+        _: &trusted_shim::proof::ProgramRef,
+        receipt: &trusted_shim::proof::ProofReceipt,
+        expected: &[u8],
+    ) -> trusted_shim::Result<()> {
+        if receipt.encoded_receipt == expected {
+            Ok(())
+        } else {
+            Err(trusted_shim::Error::Untrusted)
+        }
+    }
+}
+struct ReplyLoss {
+    inner: trusted_shim::ledger_transport::LedgerService,
+    lose: bool,
+}
+#[tonic::async_trait]
+impl trusted_shim::ledger_transport::wire::authorization_ledger_server::AuthorizationLedger
+    for ReplyLoss
+{
+    async fn reserve(
+        &self,
+        r: Request<trusted_shim::ledger_transport::wire::ReserveRequest>,
+    ) -> Result<Response<trusted_shim::ledger_transport::wire::Grant>, Status> {
+        self.inner.reserve(r).await
+    }
+    async fn consume(
+        &self,
+        r: Request<trusted_shim::ledger_transport::wire::ConsumeRequest>,
+    ) -> Result<Response<trusted_shim::ledger_transport::wire::ConsumeResponse>, Status> {
+        let result = self.inner.consume(r).await?;
+        if self.lose {
+            Err(Status::unavailable("reply lost after commit"))
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_dispatch_requires_unambiguous_consumption_at_remote_central_ledger() {
+    use trusted_rail::{rego::*, *};
+    use trusted_shim::{
+        contracts::ProofKind,
+        ledger::{LedgerPermission, SqliteLedger},
+        ledger_transport::{wire, LedgerService, RemoteLedger},
+        openshell_lifecycle::ManagedNativeDriver,
+        proof::ProgramRef,
+    };
+    for lose in [false, true] {
+        let h = Harness::new().await;
+        let central_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(central_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let central = Arc::new(
+            SqliteLedger::open(
+                &central_dir.path().join("ledger.sqlite"),
+                ProgramRef {
+                    kind: ProofKind::PolicyEvaluation,
+                    program_sha256: "1".repeat(64),
+                    verifying_key_sha256: "2".repeat(64),
+                },
+                Arc::new(ProvisioningVerifier),
+            )
+            .unwrap(),
+        );
+        let (mut r, sandbox, native_policy) = fixture();
+        let mut policy = PolicyBundle { policy: r.policy.clone(), engine: engine_profile(), modules: [("create.rego".into(), "package trusted\ndecision := {\"decision\":\"allow\",\"reason_codes\":[]} if { input.operation == \"runtime.create\" }".into())].into(), data: serde_json::json!({}) };
+        policy.policy.sha256 = policy_digest(&policy).unwrap();
+        r.policy = policy.policy.clone();
+        let bytes = sandbox.encode_to_vec();
+        let prepared = || NativeCreate::decode(&bytes, &r, &native_policy).unwrap();
+        let (request, _) = authorization(&r, &prepared(), "remote-create");
+        central.set_budget("create", 1).unwrap();
+        central
+            .activate(
+                &request.execution,
+                &policy,
+                &request.context,
+                &request.previous_state_root,
+                "create",
+            )
+            .unwrap();
+        central.stage("remote-create", &request, 1).unwrap();
+        let decision = RegorusEngine.evaluate(&policy, &request).unwrap();
+        let grant = central
+            .reserve(&decision, Some(&encode_public_values(&decision).unwrap()))
+            .await
+            .unwrap();
+        let token = central
+            .issue_access(&r.execution, LedgerPermission::Execution, &request.validity)
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let rpc = ReplyLoss {
+            inner: LedgerService::new(central.clone()),
+            lose,
+        };
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(wire::authorization_ledger_server::AuthorizationLedgerServer::new(rpc))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let remote = Arc::new(
+            RemoteLedger::connect(&address, &token, r.execution.clone())
+                .await
+                .unwrap(),
+        );
+        let driver = ManagedNativeDriver::open(
+            h.state.clone(),
+            "node".into(),
+            h.native.clone(),
+            remote.clone(),
+        )
+        .unwrap();
+        let result = driver.launch(&r, prepared(), &request, &grant).await;
+        assert_eq!(result.is_ok(), !lose);
+        assert_eq!(h.service.created.load(Ordering::SeqCst), usize::from(!lose));
+        assert!(central
+            .consume(&grant, &grant.execution, &grant.request_sha256)
+            .await
+            .is_err());
+        drop(driver);
+        let driver =
+            ManagedNativeDriver::open(h.state.clone(), "node".into(), h.native.clone(), remote)
+                .unwrap();
+        assert_eq!(
+            driver
+                .launch(&r, prepared(), &request, &grant)
+                .await
+                .is_ok(),
+            !lose
+        );
+        assert_eq!(h.service.created.load(Ordering::SeqCst), usize::from(!lose));
+        central.revoke_access(&token).unwrap();
+        driver.delete(&r.execution).await.unwrap();
+        server.abort();
+        // Neither the central bearer nor grant secret is persisted on the node.
+        for entry in std::fs::read_dir(&h.state).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            assert!(!bytes
+                .windows(token.len())
+                .any(|part| part == token.as_bytes()));
+            assert!(!bytes
+                .windows(grant.credential.len())
+                .any(|part| part == grant.credential));
+        }
+    }
+}
+
 /// Run against the pinned, unmodified upstream binary. This checks native
 /// negotiation and validation only; it never creates a sandbox or mints launch
 /// credentials. Full isolation still requires an authenticated native gateway.

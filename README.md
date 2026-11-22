@@ -97,6 +97,46 @@ its signing secret, across restarts. This is a single-host SQLite authority;
 multi-host gateway replicas require a shared transactional ledger implementation.
 The operator APIs are library interfaces, not unauthenticated HTTP endpoints.
 
+### Authenticated node-to-ledger access
+
+`ledger_transport::LedgerService` embeds a bounded gRPC service in the existing
+Fleet-controlled policy gateway. It exposes only `Reserve` and `Consume`, using
+the same authoritative `SqliteLedger`; it does not start a gateway process or
+export policy, context, budget, activation or request-staging APIs. The host must
+serve it behind TLS and select its Rustls crypto provider before constructing
+the listener when multiple provider features are linked. The transport does not
+override the host's crypto configuration. `RemoteLedger::connect` requires HTTPS, except numeric
+loopback HTTP; operator-supplied channels support private CA/mTLS. Clients enforce
+30-second call deadlines, bounded messages, exact execution binding and no
+application retries. They never discover credentials or select an agent's URL.
+
+The central operator calls `SqliteLedger::issue_access` for one exact execution
+(namespace, workload, allocation, lease, generation and node), choosing Admission,
+Execution or both. Admission credentials can reserve; Execution credentials can
+consume. Credentials contain 256 random bits, expire within one hour, and only
+their hashes enter the central database. Fleet must also cap validity at the
+allocation lease deadline and deliver secrets through its authenticated private
+provisioning channel, never ordinary App JSON or node reports. Rotation issues
+a replacement credential and revokes the old one without resetting grants or
+budgets. `revoke_access` withdraws one credential; `revoke` fences the allocation.
+
+Credential validity and scope are checked before proof verification and again in
+the reservation transaction. Consumption checks authorization and marks the
+grant spent in the same transaction, so revocation cannot race between these
+steps. Gateway restarts preserve credentials, revoked state, budgets and consumed
+grants. Unknown credentials, wrong scopes, stale authority or transport failures
+never authorize dispatch. A lost response after consumption leaves the grant
+spent: the shim retains its local Authorizing state and does not create a native
+sandbox on retry. This favors reconciliation over duplicate external effects.
+
+Tests run the service over real loopback gRPC and TLS, including concurrent
+consumption, all six execution identity fields, credential rotation/expiry,
+revocation during proof verification, gateway reopen, and OpenShell dispatch
+after an ambiguous reply. These use proof/native-driver doubles for orchestration;
+they do not claim a new remote proof or a native sandbox isolation acceptance.
+The service/client are implemented; mounting them in Fleet's gateway and wiring
+credential provisioning and live lease revocation remain integration work.
+
 `AuthorizedExecutor` binds a grant to the full request and execution identity,
 consumes it through the ledger before invoking `ActionHandler`, and rejects
 substitution, expiry and replay. Execution failure does not refund the grant.
@@ -177,8 +217,8 @@ also run in downstream binaries to prevent widening Regorus's deterministic prof
 `DockerDriver` implements the machine-local `RuntimeDriver`; `AttestationVerifier`
 remains an interface; the concrete data-plane adapter owns outbound connectors.
 TEE evidence verification and its separate proof guest,
-OpenShell/TEE drivers, non-bypassable enforcement and policy gateway
-integration follow separately. Non-TEE attestation remains `SkippedNonTee`;
+TEE runtime drivers, OpenShell gateway activation, non-bypassable enforcement
+and Fleet policy gateway integration follow separately. Non-TEE attestation remains `SkippedNonTee`;
 requiring an attestation proof for that outcome is invalid. No permissive fallback
 or local prover is included.
 
@@ -202,7 +242,8 @@ resource and parameters come from `NativeCreate::authorization_resource` and
 `authorization_parameters`. These bind the complete launch input, native policy
 and exact private protobuf bytes. After remote proof verification, the adapter
 consumes the resulting exact-request grant at the central ledger before calling
-native create. The ledger must be reached through an authenticated gateway client
+native create. `ledger_transport::RemoteLedger` reaches the central ledger through
+an authenticated gateway client
 on a node; its authoritative database must never be copied onto an untrusted node.
 
 SQLite stores only ownership, commitments and lifecycle state, without native
@@ -215,9 +256,9 @@ remain fenced after deletion. A changed physical instance is rejected.
 
 This adapter proves provisioning admission only. It does not claim that platform
 `Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
-or provide TEE attestation. Native gateway preparation, authenticated central
-ledger transport, Fleet activation and application endpoint readiness still need
-integration. Native split credentials must never enter an ordinary Fleet App
+or provide TEE attestation. Native gateway preparation, Fleet activation,
+central-ledger service/credential wiring and application endpoint readiness still
+need integration. Native split credentials must never enter an ordinary Fleet App
 spec, workload environment or public response. The runtime CLI advertises Docker
 only, and the adapter rejects application services and action-proof-required
 requests until those boundaries are connected. Tests use an upstream-protocol
