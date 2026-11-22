@@ -103,16 +103,70 @@ agent selects. It rejects `runtime.*` operations and cannot convert an existing
 strict request into a native authorization. The gRPC `Reserve` method continues
 to require a valid proof; it does not accept missing evidence as preflight.
 
-Startup remains synchronous: create the isolated environment, obtain the required
-TEE evidence, submit its RA-verification guest to the proof network, verify the
-receipt and complete GOAT registration before declaring the agent ready. Ordinary
-non-TEE registration uses owner authorization and agent-key possession, with an
-explicit `unattested` identity; it must never synthesize a successful RA result.
-Concrete multi-TEE RA guests and the GOAT agent registry integration remain work
-to implement. Policy editing currently uses the application/control plane; the
+The planned TEE startup path is synchronous: prepare the isolated environment,
+obtain the required TEE evidence, submit its RA-verification guest to the proof
+network and verify the receipt before declaring that trust profile ready.
+GOAT registration execution is deliberately deferred. The owner-consent interface
+below does not register an agent or add a registration requirement to today's
+Docker path. Ordinary non-TEE registration will require owner authorization and
+agent-key possession, with an explicit `unattested` identity; it must never
+synthesize a successful RA result. Concrete multi-TEE RA guests and the GOAT agent
+registry integration remain TODO. Policy editing currently uses the application/control plane; the
 planned GOAT authority must authenticate owner, chain/contract, policy version,
 digest, finality and revocation before activating its local policy snapshot.
 No chain synchronization or hardware attestation is claimed by preflight.
+
+### Future GOAT registration: user consent interface
+
+`registration::PreparedRegistration` prepares a versioned EIP-712 wallet request
+and verifies an owner's EOA signature with Alloy/k256. The control plane supplies
+the approved chain, future authorization-adapter address and identity registry;
+these must not come from the signature submission. The authenticated product
+owner must independently match the recovered signer. This is a library interface,
+with no chain RPC, wallet custody, transaction submission or readiness mutation.
+
+Prepare the following immutable inputs before asking the user to sign:
+
+- Owner wallet, product agent ID, agent public-key address and exact execution
+  commitment. Preparing an agent key is distinct from enabling its actions; key
+  possession and any TEE binding still require verification by the future adapter.
+- Canonical runtime configuration and policy SHA-256 commitments, plus the agent
+  manifest URI and content hash. The caller must verify those hashes against the
+  approved content. Signatures alone do not authenticate caller-supplied hashes.
+- Trust requirement: `unattested`, or `tee_required` with the approved attestation
+  profile hash. This records the requested trust level, not a successful result.
+- A fresh random 32-byte nonce and a bounded validity window (at most 24 hours).
+  Changing any bound input, including allocation after a scheduling retry,
+  requires a new user signature.
+
+`signing_request()` is the `eth_signTypedData_v4` payload, with decimal-string
+integers to preserve precision in JavaScript wallets. `digest()` is its EIP-712
+digest. Submit `{intent_digest, signature}` through the authenticated private
+control path; signatures are authorization material and must not be logged or
+included in workload metadata. Verification requires canonical 65-byte low-S
+signatures with v=27/28, current validity and the current authenticated owner.
+Contract wallets (ERC-1271) remain unsupported.
+
+`VerifiedOwnerSignature` is deliberately not deserializable and is **only consent**.
+It is not a grant, proof of key possession, RA result or on-chain registration.
+Verification is pure and repeatable; it does not consume the nonce. No deployed
+authorizer address is supplied, and this interface must not be exposed as a live
+registration button until its consumer is implemented and approved.
+
+Registration execution remains TODO: an owner-preserving contract adapter,
+atomic durable nonce consumption/idempotency, signature revocation and current
+policy checks, agent-key possession, RA receipt binding for TEE profiles,
+transaction reconciliation and confirmation handling. Stock ERC-8004
+`register(string)` mints to the transaction sender; it does not accept this owner
+signature. A backend must not relay that call and claim the resulting identity
+belongs to the signing user. See the [ERC-8004 specification](https://eips.ethereum.org/EIPS/eip-8004)
+and [pinned upstream identity registry](https://github.com/erc-8004/erc-8004-contracts/blob/b9e466c250744a7e06b13dff9d3c2844ed64f825/contracts/IdentityRegistryUpgradeable.sol).
+
+Tests independently decode the exported wallet JSON through Alloy's dynamic
+EIP-712 encoder, compare it with the static Solidity-struct digest and verify a
+real test-key signature. They reject every bound-field substitution, cross-chain
+and cross-registry reuse, wrong owners, expired/early consent, high-S and malformed
+signatures. These tests make no network calls and create no on-chain identities.
 
 ### Strict admission for startup
 

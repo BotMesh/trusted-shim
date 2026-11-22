@@ -30,6 +30,7 @@ pub mod openshell_gateway;
 pub mod openshell_lifecycle;
 pub mod proof;
 pub mod provisioning;
+pub mod registration;
 pub mod runtime;
 #[cfg(feature = "ziren")]
 pub mod ziren;
