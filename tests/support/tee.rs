@@ -31,6 +31,7 @@ pub(crate) fn config() -> TeeConfig {
         evidence_endpoint: "http://127.0.0.1:1/aa/evidence".into(),
         trustee_endpoint: "http://127.0.0.1:1".into(),
         trustee_tls: None,
+        dcap: None,
         trustee_policy_ids: vec!["default".into()],
         init_data_sha256: "11".repeat(32),
         endpoint_key_sha256: "22".repeat(32),

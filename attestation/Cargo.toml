@@ -1,0 +1,23 @@
+[package]
+name = "trusted-shim-attestation"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Offline TDX verification for the Ziren launch guest"
+
+[workspace]
+
+[dependencies]
+trusted-attestation-types = { path = "types" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+dcap-rs = { git = "https://github.com/automata-network/automata-dcap-attestation", rev = "5962363a6cce70fa6da70bb412e0a9ababe97d95" }
+# Match Automata's pinned X.509 API; later 0.4 releases changed certificate types.
+x509-verify = { version = "=0.4.6", default-features = false, features = ["std", "p256", "x509"] }
+
+[dev-dependencies]
+alloy-sol-types = "1"

@@ -1,0 +1,13 @@
+[package]
+name = "trusted-attestation-types"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+trusted-contracts = { git = "https://github.com/attestx/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }

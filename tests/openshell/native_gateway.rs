@@ -126,6 +126,7 @@ async fn stock_gateway_mints_private_launch_for_shim_with_workspace_isolation() 
         run_as_group: "1000".into(),
     });
     let policy_hash = deterministic_policy_hash(policy);
+    launch.access_policy_sha256 = Some(policy_hash.clone());
     let binding = Arc::new(GatewayLaunch::new(launch.clone(), policy.clone()).unwrap());
     let service = Service {
         capture: Some(capture.clone()),

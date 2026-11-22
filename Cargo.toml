@@ -5,11 +5,17 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Machine-local runtime, enforcement and remote proof contracts"
 
+[workspace]
+members = ["attestation/types"]
+exclude = ["attestation", "guest", "guest-check"]
+resolver = "2"
+
 [features]
 default = []
 ziren = ["dep:zkm-verifier"]
 
 [dependencies]
+trusted-attestation-types = { path = "attestation/types" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

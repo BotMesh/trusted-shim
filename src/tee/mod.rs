@@ -9,6 +9,7 @@ use crate::{
     Error, Result,
 };
 pub mod trustee;
+pub use trusted_attestation_types::{Binding, Mode};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -23,11 +24,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    Hardware,
-    Simulation,
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DcapConfig {
+    /// Automata Collateral::sol_abi_encode() artifact, refreshed outside the guest.
+    pub collateral_file: PathBuf,
+    pub min_tcb_evaluation_data_number: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -37,10 +39,14 @@ pub struct TeeConfig {
     /// Confidential VM profiles: snp/tdx; sample is admitted only in simulation mode.
     pub platform: String,
     pub evidence_endpoint: String,
+    #[serde(default)]
     pub trustee_endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trustee_tls: Option<trustee::TlsConfig>,
+    #[serde(default)]
     pub trustee_policy_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dcap: Option<DcapConfig>,
     /// Digest of measured init-data that confines this shim and its local runtime endpoints.
     pub init_data_sha256: String,
     /// Runtime endpoint identity must be provisioned inside the measured guest.
@@ -55,9 +61,7 @@ pub struct TeeConfig {
 }
 
 pub fn canonical(value: &impl Serialize) -> Result<Vec<u8>> {
-    let mut value = serde_json::to_value(value).map_err(|_| Error::InvalidContract)?;
-    value.sort_all_objects();
-    serde_json::to_vec(&value).map_err(|_| Error::InvalidContract)
+    trusted_attestation_types::canonical(value).map_err(|_| Error::InvalidContract)
 }
 fn digest(value: &impl Serialize) -> Result<String> {
     Ok(hex::encode(Sha256::digest(canonical(value)?)))
@@ -77,7 +81,28 @@ impl TeeConfig {
         }
     }
     pub fn validate(&self) -> Result<()> {
-        trustee::validate_endpoint(&self.trustee_endpoint, self.trustee_tls.as_ref())?;
+        if self.trustee_endpoint.is_empty() {
+            if self.trustee_tls.is_some()
+                || !self.trustee_policy_ids.is_empty()
+                || self.dcap.is_none()
+            {
+                return Err(Error::InvalidContract);
+            }
+        } else {
+            trustee::validate_endpoint(&self.trustee_endpoint, self.trustee_tls.as_ref())?;
+            if self.trustee_policy_ids.is_empty() {
+                return Err(Error::InvalidContract);
+            }
+        }
+        if let Some(dcap) = &self.dcap {
+            if self.mode != Mode::Hardware
+                || self.platform != "tdx"
+                || !dcap.collateral_file.is_absolute()
+                || dcap.min_tcb_evaluation_data_number == 0
+            {
+                return Err(Error::InvalidContract);
+            }
+        }
         let platform_ok = match self.mode {
             Mode::Simulation => self.platform == "sample",
             Mode::Hardware => matches!(self.platform.as_str(), "snp" | "tdx"),
@@ -90,11 +115,11 @@ impl TeeConfig {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         };
         if !platform_ok
+            || (self.dcap.is_some() && !valid_hash(&self.expected_measurement))
             || !valid_hash(&self.init_data_sha256)
             || !valid_hash(&self.endpoint_key_sha256)
             || !valid_hash(&self.program.program_sha256)
             || !valid_hash(&self.program.verifying_key_sha256)
-            || self.trustee_policy_ids.is_empty()
             || self.trustee_policy_ids.len() > 16
             || self
                 .trustee_policy_ids
@@ -115,23 +140,6 @@ impl TeeConfig {
         }
         Ok(())
     }
-}
-
-/// Public inputs bind the proof to a mode, platform, measured environment,
-/// exact launch request and fresh challenge. A sample proof cannot attest hardware.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Binding {
-    pub domain: String,
-    pub mode: Mode,
-    pub platform: String,
-    pub expected_measurement: String,
-    pub init_data_sha256: String,
-    pub endpoint_key_sha256: String,
-    pub execution: ExecutionIdentity,
-    pub request_sha256: String,
-    pub nonce: String,
-    pub expires_at: u64,
 }
 
 #[async_trait]
@@ -192,8 +200,17 @@ struct Pending {
     config_sha256: String,
     job_id: String,
     evidence: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dcap: Option<DcapPending>,
     submitted: bool,
     authorized: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DcapPending {
+    collateral: Vec<u8>,
+    verification_time: u64,
 }
 
 /// Durable RA admission shared by machine-local runtime backends.
@@ -201,7 +218,7 @@ pub struct AttestationGate {
     config: TeeConfig,
     state: PathBuf,
     evidence: Arc<dyn EvidenceSource>,
-    trustee: trustee::Trustee,
+    trustee: Option<trustee::Trustee>,
     network: Arc<dyn ProofNetwork>,
     verifier: Arc<dyn ReceiptVerifier>,
     serial: tokio::sync::Mutex<()>,
@@ -212,7 +229,7 @@ impl AttestationGate {
         state: &Path,
         config: TeeConfig,
         evidence: Arc<dyn EvidenceSource>,
-        trustee: trustee::Trustee,
+        trustee: impl Into<Option<trustee::Trustee>>,
         network: Arc<dyn ProofNetwork>,
         verifier: Arc<dyn ReceiptVerifier>,
     ) -> Result<Self> {
@@ -260,7 +277,7 @@ impl AttestationGate {
             state,
             config,
             evidence,
-            trustee,
+            trustee: trustee.into(),
             network,
             verifier,
             serial: tokio::sync::Mutex::new(()),
@@ -293,12 +310,18 @@ impl AttestationGate {
             &config.program_vkey_hash,
         )?;
         let evidence = CocoEvidence::new(config.evidence_endpoint.clone())?;
-        let trustee = trustee::Trustee::connect(
-            &config.trustee_endpoint,
-            config.trustee_policy_ids.clone(),
-            config.trustee_tls.as_ref(),
-        )
-        .await?;
+        let trustee = if config.trustee_endpoint.is_empty() {
+            None
+        } else {
+            Some(
+                trustee::Trustee::connect(
+                    &config.trustee_endpoint,
+                    config.trustee_policy_ids.clone(),
+                    config.trustee_tls.as_ref(),
+                )
+                .await?,
+            )
+        };
         Self::new(
             state,
             config,
@@ -395,8 +418,14 @@ impl AttestationGate {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let mut nonce = [0u8; 32];
                 getrandom::getrandom(&mut nonce).map_err(|_| Error::Unavailable)?;
+                let verification_time = now()?;
                 let binding = Binding {
-                    domain: "trusted-shim.remote-attestation.v1".into(),
+                    domain: if self.config.dcap.is_some() {
+                        trusted_attestation_types::DCAP_DOMAIN
+                    } else {
+                        "trusted-shim.remote-attestation.v1"
+                    }
+                    .into(),
                     mode: self.config.mode,
                     platform: self.config.platform.clone(),
                     expected_measurement: self.config.expected_measurement.clone(),
@@ -405,7 +434,7 @@ impl AttestationGate {
                     execution: execution.clone(),
                     request_sha256: request_sha256.clone(),
                     nonce: hex::encode(nonce),
-                    expires_at: now()? + 300,
+                    expires_at: verification_time + 300,
                 };
                 let report_data =
                     hex::decode(digest(&binding)?).map_err(|_| Error::InvalidContract)?;
@@ -413,12 +442,26 @@ impl AttestationGate {
                 if evidence.is_empty() || evidence.len() > 128 * 1024 {
                     return Err(Error::InvalidContract);
                 }
-                self.trustee.evaluate(&binding, &evidence).await?;
+                if let Some(trustee) = &self.trustee {
+                    trustee.evaluate(&binding, &evidence).await?;
+                }
+                let dcap = self
+                    .config
+                    .dcap
+                    .as_ref()
+                    .map(|dcap| {
+                        Ok(DcapPending {
+                            collateral: read_bounded(&dcap.collateral_file, 1024 * 1024, false)?,
+                            verification_time,
+                        })
+                    })
+                    .transpose()?;
                 let pending = Pending {
                     job_id: format!("ra-{}", binding.nonce),
                     binding,
                     config_sha256: config_sha256.clone(),
                     evidence,
+                    dcap,
                     submitted: false,
                     authorized: false,
                 };
@@ -441,15 +484,38 @@ impl AttestationGate {
         if now()? >= pending.binding.expires_at {
             return Err(Error::Untrusted);
         }
-        let public = serde_json::json!({"binding":pending.binding,"evidence_sha256":hex::encode(Sha256::digest(&pending.evidence))});
-        let expected = canonical(&public)?;
+        let (witness, expected) = match (&self.config.dcap, &pending.dcap) {
+            (Some(config), Some(dcap)) => {
+                let witness = trusted_attestation_types::DcapWitness {
+                    binding: pending.binding.clone(),
+                    evidence: pending.evidence.clone(),
+                    collateral: dcap.collateral.clone(),
+                    verification_time: dcap.verification_time,
+                    min_tcb_evaluation_data_number: config.min_tcb_evaluation_data_number,
+                };
+                let public = witness
+                    .expected_public_values()
+                    .map_err(|_| Error::InvalidContract)?;
+                let bytes = canonical(&witness)?;
+                if bytes.len() > trusted_attestation_types::MAX_WITNESS_BYTES {
+                    return Err(Error::InvalidContract);
+                }
+                (bytes, public)
+            }
+            (None, None) => (
+                canonical(
+                    &serde_json::json!({"binding":pending.binding,"evidence":pending.evidence}),
+                )?,
+                canonical(
+                    &serde_json::json!({"binding":pending.binding,"evidence_sha256":hex::encode(Sha256::digest(&pending.evidence))}),
+                )?,
+            ),
+            _ => return Err(Error::Untrusted),
+        };
         if !pending.submitted {
             // Persist BEFORE the RPC; an ambiguous submission is only queried, never resubmitted.
             pending.submitted = true;
             self.save(&path, &pending)?;
-            let witness = canonical(
-                &serde_json::json!({"binding":pending.binding,"evidence":pending.evidence}),
-            )?;
             let id = self
                 .network
                 .submit(&ProofRequest {
@@ -502,7 +568,7 @@ impl TeeDriver {
         node: String,
         config: TeeConfig,
         evidence: Arc<dyn EvidenceSource>,
-        trustee: trustee::Trustee,
+        trustee: impl Into<Option<trustee::Trustee>>,
         network: Arc<dyn ProofNetwork>,
         verifier: Arc<dyn ReceiptVerifier>,
     ) -> Result<Self> {

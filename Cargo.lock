@@ -7280,6 +7280,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-attestation-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "trusted-contracts",
+]
+
+[[package]]
 name = "trusted-contracts"
 version = "0.1.0"
 source = "git+https://github.com/attestx/trusted-data-router?rev=5aa93d4be778cf84714954c6d9f28631524610f7#5aa93d4be778cf84714954c6d9f28631524610f7"
@@ -7383,6 +7395,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
+ "trusted-attestation-types",
  "trusted-contracts",
  "trusted-data-router",
  "trusted-rail",

@@ -18,6 +18,14 @@ jobs:
       - name: Verify OpenShell is present without default features
         run: cargo test --locked --no-default-features --test openshell
       - run: cargo test --locked --workspace --all-features
+      - name: Verify pinned offline DCAP and signed public vectors
+        run: |
+          cargo fmt --manifest-path attestation/Cargo.toml -- --check
+          cargo fmt --manifest-path guest/Cargo.toml -- --check
+          cargo fmt --manifest-path guest-check/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path attestation/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path attestation/Cargo.toml
+          cargo check --locked --manifest-path guest-check/Cargo.toml
       - run: python3 scripts/check_engine_features.py
       - name: Verify real Docker lifecycle and hard limits
         run: |

@@ -24,6 +24,62 @@ use support::{config, Lab, ProofDouble, ReceiptDouble};
 #[path = "tee/tls.rs"]
 mod tls;
 
+#[tokio::test]
+async fn dcap_submits_original_evidence_without_as_and_rejects_failed_proof() {
+    use trusted_shim::{
+        proof::*,
+        tee::{AttestationGate, DcapConfig},
+        Result,
+    };
+    struct RejectNetwork;
+    #[async_trait::async_trait]
+    impl ProofNetwork for RejectNetwork {
+        async fn submit(&self, request: &ProofRequest) -> Result<String> {
+            let witness: trusted_attestation_types::DcapWitness =
+                serde_json::from_slice(&request.witness).unwrap();
+            assert_eq!(
+                witness.binding.domain,
+                trusted_attestation_types::DCAP_DOMAIN
+            );
+            assert_eq!(witness.collateral, b"invalid-test-collateral");
+            assert_eq!(
+                request.expected_public_values,
+                witness.expected_public_values().unwrap()
+            );
+            Ok(request.request_id.clone())
+        }
+        async fn status(&self, _: &str) -> Result<ProofStatus> {
+            Ok(ProofStatus::Failed)
+        }
+    }
+    let lab = Lab::start(false, None).await;
+    let root = tempfile::tempdir().unwrap();
+    let collateral_file = root.path().join("collateral.abi");
+    std::fs::write(&collateral_file, b"invalid-test-collateral").unwrap();
+    let mut cfg = lab.config.clone();
+    cfg.mode = Mode::Hardware;
+    cfg.platform = "tdx".into();
+    cfg.expected_measurement = "55".repeat(32);
+    cfg.trustee_endpoint.clear();
+    cfg.trustee_policy_ids.clear();
+    cfg.dcap = Some(DcapConfig {
+        collateral_file,
+        min_tcb_evaluation_data_number: 20,
+    });
+    let gate = AttestationGate::new(
+        root.path(),
+        cfg.clone(),
+        Arc::new(CocoEvidence::new(cfg.evidence_endpoint).unwrap()),
+        None,
+        Arc::new(RejectNetwork),
+        Arc::new(ReceiptDouble { reject: true }),
+    )
+    .unwrap();
+    let req = request("dcap-no-as");
+    assert!(gate.authorize(&req.execution, &req).await.is_err());
+    assert!(!root.path().join("tee/runtime").exists());
+}
+
 fn request(id: &str) -> LaunchRequest {
     serde_json::from_value(json!({
         "execution":{"namespace":"simulation","workload":"tee","allocation_id":id,"lease_id":"launch","generation":1,"node_id":"test-node"},

@@ -365,8 +365,9 @@ also run in downstream binaries to prevent widening Regorus's deterministic prof
 
 `DockerDriver` and the confidential-VM `TeeDriver` implement machine-local
 `RuntimeDriver`; the data-plane adapter owns outbound connectors. CoCo evidence
-and Trustee gRPC adapters are concrete. Hardware-specific RA guests/collateral
-collection, SGX/Nitro isolation backends and hardware acceptance remain follow-ups. Fleet embeds the central ledger and implements private
+and optional Trustee gRPC adapters are concrete. The TDX guest reuses Automata
+DCAP verification; collateral refresh, SNP guests, SGX/Nitro isolation backends
+and live hardware/proof-network acceptance remain follow-ups. Fleet embeds the central ledger and implements private
 provisioning, native launch preparation and gateway readiness. Application action
 hooks still need integration to make preflight enforcement non-bypassable.
 Non-TEE attestation remains `SkippedNonTee`;
@@ -375,17 +376,17 @@ or local prover is included.
 
 ## Node-selected TEE startup
 
-Shim calls stock Trustee AS through generated bindings from its pinned official
-[gRPC schema](https://github.com/confidential-containers/trustee/blob/22788122660d6e9be3e4bf52704282de5fcc0a2a/protos/attestation.proto).
-The upstream [KBS client SDK](https://github.com/confidential-containers/trustee/blob/v0.19.0/tools/kbs-client/src/lib.rs)
-handles KBS authentication and secret delivery; it is not an AS gRPC client.
-Importing `attestation-service` would embed the verifier service, including its
-policy/storage dependencies. This adapter instead uses the same generated-client
-approach as [upstream KBS](https://github.com/confidential-containers/trustee/blob/v0.19.0/kbs/src/attestation/coco/grpc.rs).
-It supplies challenge/init-data bindings and transport limits; it does not
-reimplement hardware quote verification. A nonempty AS token is only a precheck,
-never authorization or a ZK receipt. The RA guest still needs independently
-verified quote/collateral logic; it is not implemented by this client.
+The Intel TDX path follows [Automata DCAP](https://github.com/automata-network/automata-dcap-attestation):
+the Ziren guest verifies original quote/collateral with pinned upstream Rust code,
+then checks the measured profile, init-data, launch binding and TCB floor. Shim
+submits the witness to the proof network and checks the receipt against the approved
+program/key and exact input commitment. AS is not required for this path.
+See [attestation implementation and tests](attestation/README.md).
+
+The legacy SNP/sample adapter can use stock Trustee AS through generated bindings
+from its pinned official gRPC schema. AS is only a precheck, never a proof or
+launch authorization. Its token cannot replace raw-evidence verification in the
+approved guest. The upstream KBS SDK handles secret delivery, not this AS RPC.
 
 Fleet passes `shim_machine_labels` and `shim_tee` from the existing `apps.yaml`
 as daemon `machine` options; no second configuration file is introduced.
@@ -405,9 +406,11 @@ not a driver advertisement. Sample evidence never satisfies
 a hardware allocation. Production binaries include `ziren` for real Groth16
 receipt verification; there is no no-proof simulation option in the daemon.
 
-Configure the AA `/aa/evidence` endpoint on numeric loopback, the stock Trustee
-v0.19 gRPC API (loopback HTTP or mutually authenticated HTTPS), approved attestation policy IDs,
+Configure the AA `/aa/evidence` endpoint on numeric loopback, approved
 measurement/init-data/key digests and pinned RA ELF/program/verifying-key identity.
+For TDX, set `tee.dcap` to an absolute collateral artifact path and a positive
+minimum TCB evaluation number; omit the Trustee settings. Legacy profiles retain
+the stock Trustee v0.19 API and approved attestation policy IDs.
 Proof credentials are explicit private files; an optional signer file supports
 Fleet's token-bound proof signatures. Nothing discovers workspace credentials.
 The proof service and Trustee use reconnecting channels so their outage does not
@@ -421,13 +424,15 @@ on daemon restart; existing runtimes remain independent of the daemon process.
 Fleet exposes only appraisal to certificates with a node URI SAN through its
 existing HTTPS ingress; AS administration remains private.
 
-The versioned witness is canonical JSON `{binding,evidence}`. Public values are
-`{binding,evidence_sha256}`. `binding` covers mode, platform, measurement, init-data,
-endpoint key, full execution identity, launch-request digest, random nonce and
-expiry. The pinned guest must verify **the original hardware evidence**, collateral,
-TCB/freshness policy, measured identity and report-data binding; merely verifying
-an AS token is insufficient. This repository does not yet ship those hardware
-RA guests, so this is not a production TEE-readiness claim.
+The DCAP witness adds the original collateral, verification time and minimum TCB
+number to `{binding,evidence}`. The guest commits the canonical witness SHA256
+only after all checks succeed. The consumer's expected commitment prevents a
+prover from substituting a weaker profile, an old clock input or another launch.
+`binding` covers mode, platform, complete measured profile, init-data, endpoint key,
+execution identity, launch-request digest, nonce and expiry. The guest checks that
+collateral remains valid through that expiry; shim checks its clock again before
+creation. Legacy profiles keep `{binding,evidence_sha256}` public values and require
+their own approved guest. No SNP hardware guest is shipped yet.
 
 Jobs are recorded before submission; ambiguous submission is only polled on
 retry. The gate has a five-minute deadline. A crash before submission may need
