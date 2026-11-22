@@ -350,6 +350,23 @@ Fleet after testing and confirm its resources are released.
 
 ## Checks and remaining adapters
 
+The current migration baseline is **DockerDriver + the shared OpenShell access
+layer**. Default access remains subject to driver restrictions; user-configured
+rules require OpenShell enforcement. TEE simulation and fixture-based guest tests
+do not qualify a node for hardware-attested production workloads.
+
+Deferred acceptance work:
+
+- [ ] Real TDX: validate a fresh, launch-bound quote and collateral on a measured
+  confidential VM, including OpenShell enforcement and runtime creation.
+- [ ] Startup proof: publish/approve the DCAP guest and obtain and verify its
+  launch-bound receipt through the remote proof network before creating a runtime.
+  Execution-only guest tests and existing policy receipts do not satisfy this gate;
+  do not start a local prover.
+- [ ] AMD SNP: implement full raw-evidence verification in its approved guest and
+  complete hardware plus proof-network startup acceptance. An AS result alone
+  cannot authorize launch.
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
