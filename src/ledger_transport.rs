@@ -232,13 +232,28 @@ impl AuthorizationLedger for RemoteLedger {
 pub struct LedgerService {
     ledger: Arc<SqliteLedger>,
     permits: Arc<Semaphore>,
+    authority: Option<Arc<dyn ExecutionAuthority>>,
+}
+
+/// An embedding scheduler can fence its live allocation state through the
+/// ledger transaction. The guard is acquired on a blocking worker and never
+/// crosses an await. Policy, credential and budget checks remain in the ledger.
+pub trait ExecutionGuard {}
+impl<T> ExecutionGuard for T {}
+pub trait ExecutionAuthority: Send + Sync {
+    fn guard(&self, execution: &ExecutionIdentity) -> Result<Box<dyn ExecutionGuard + '_>>;
 }
 impl LedgerService {
     pub fn new(ledger: Arc<SqliteLedger>) -> Self {
         Self {
             ledger,
             permits: Arc::new(Semaphore::new(16)),
+            authority: None,
         }
+    }
+    pub fn with_authority(mut self, authority: Arc<dyn ExecutionAuthority>) -> Self {
+        self.authority = Some(authority);
+        self
     }
     /// Mount beside the existing gateway's control services, behind TLS. This
     /// does not start a listener, another gateway process, or a local prover.
@@ -301,13 +316,20 @@ impl wire::authorization_ledger_server::AuthorizationLedger for LedgerService {
     ) -> std::result::Result<Response<wire::Grant>, Status> {
         let token = token(&r)?;
         let r = r.into_inner();
-        let decision =
+        let decision: DecisionRecord =
             decode(&r.decision_json, trusted_rail::rego::MAX_PUBLIC_BYTES).map_err(status)?;
         if r.proof_evidence.is_empty() || r.proof_evidence.len() > MAX_PROOF {
             return Err(Status::invalid_argument("invalid evidence size"));
         }
+        let authority = self.authority.clone();
         let grant = self
-            .run(move |l| l.reserve_authenticated(&token, &decision, &r.proof_evidence))
+            .run(move |l| {
+                let _guard = authority
+                    .as_ref()
+                    .map(|a| a.guard(&decision.execution))
+                    .transpose()?;
+                l.reserve_authenticated(&token, &decision, &r.proof_evidence)
+            })
             .await?;
         Ok(Response::new(grant_to_wire(grant).map_err(status)?))
     }
@@ -323,8 +345,15 @@ impl wire::authorization_ledger_server::AuthorizationLedger for LedgerService {
         )
         .map_err(status)?;
         let execution = decode(&r.execution_json, MAX_IDENTITY).map_err(status)?;
-        self.run(move |l| l.consume_authenticated(&token, &grant, &execution, &r.request_sha256))
-            .await?;
+        let authority = self.authority.clone();
+        self.run(move |l| {
+            let _guard = authority
+                .as_ref()
+                .map(|a| a.guard(&execution))
+                .transpose()?;
+            l.consume_authenticated(&token, &grant, &execution, &r.request_sha256)
+        })
+        .await?;
         Ok(Response::new(wire::ConsumeResponse {}))
     }
 }

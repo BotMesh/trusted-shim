@@ -262,7 +262,9 @@ async fn remote_revocation_expiry_and_malformed_auth_fail_closed() {
             tonic::Code::InvalidArgument
         );
     }
-    l.revoke_access(&token).unwrap();
+    use sha2::{Digest, Sha256};
+    l.revoke_access_id(&hex::encode(Sha256::digest(token.as_bytes())))
+        .unwrap();
     assert!(client
         .consume(&g, &g.execution, &g.request_sha256)
         .await

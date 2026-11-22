@@ -95,7 +95,10 @@ refund them. Policy/context changes invalidate pending grants. Revocation is
 durable even when it arrives before activation. Preserve the database, including
 its signing secret, across restarts. This is a single-host SQLite authority;
 multi-host gateway replicas require a shared transactional ledger implementation.
-The operator APIs are library interfaces, not unauthenticated HTTP endpoints.
+The library's operator APIs must be exposed only through authenticated control
+administration. Fleet embeds them in its existing gateway with administrator-only
+routes, an approved guest manifest, and a private ledger under its data directory.
+Ordinary namespace tokens cannot set policy, budgets or stage authoritative inputs.
 
 ### Authenticated node-to-ledger access
 
@@ -114,8 +117,8 @@ The central operator calls `SqliteLedger::issue_access` for one exact execution
 (namespace, workload, allocation, lease, generation and node), choosing Admission,
 Execution or both. Admission credentials can reserve; Execution credentials can
 consume. Credentials contain 256 random bits, expire within one hour, and only
-their hashes enter the central database. Fleet must also cap validity at the
-allocation lease deadline and deliver secrets through its authenticated private
+their hashes enter the central database. An embedding scheduler must also cap
+validity at any fixed allocation lease deadline and deliver secrets through its authenticated private
 provisioning channel, never ordinary App JSON or node reports. Rotation issues
 a replacement credential and revokes the old one without resetting grants or
 budgets. `revoke_access` withdraws one credential; `revoke` fences the allocation.
@@ -134,8 +137,13 @@ consumption, all six execution identity fields, credential rotation/expiry,
 revocation during proof verification, gateway reopen, and OpenShell dispatch
 after an ambiguous reply. These use proof/native-driver doubles for orchestration;
 they do not claim a new remote proof or a native sandbox isolation acceptance.
-The service/client are implemented; mounting them in Fleet's gateway and wiring
-credential provisioning and live lease revocation remain integration work.
+`LedgerService::with_authority` lets Fleet retain its live scheduler state fence
+through reservation and consumption on the blocking ledger worker. Fleet checks
+the exact reported execution, current deployment, fresh node session, active
+namespace and held quota allocation. Suspension, release, stale heartbeats and
+replacement therefore reject old credentials even if their TTL has not elapsed.
+The service is mounted in Fleet's gateway; automatic private credential
+provisioning and pre-create execution activation still need integration.
 
 `AuthorizedExecutor` binds a grant to the full request and execution identity,
 consumes it through the ledger before invoking `ActionHandler`, and rejects
@@ -217,8 +225,10 @@ also run in downstream binaries to prevent widening Regorus's deterministic prof
 `DockerDriver` implements the machine-local `RuntimeDriver`; `AttestationVerifier`
 remains an interface; the concrete data-plane adapter owns outbound connectors.
 TEE evidence verification and its separate proof guest,
-TEE runtime drivers, OpenShell gateway activation, non-bypassable enforcement
-and Fleet policy gateway integration follow separately. Non-TEE attestation remains `SkippedNonTee`;
+TEE runtime drivers, OpenShell gateway activation and non-bypassable enforcement
+follow separately. Fleet embeds the central ledger, but automatic private
+provisioning and native launch preparation still need integration.
+Non-TEE attestation remains `SkippedNonTee`;
 requiring an attestation proof for that outcome is invalid. No permissive fallback
 or local prover is included.
 
@@ -257,7 +267,7 @@ remain fenced after deletion. A changed physical instance is rejected.
 This adapter proves provisioning admission only. It does not claim that platform
 `Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
 or provide TEE attestation. Native gateway preparation, Fleet activation,
-central-ledger service/credential wiring and application endpoint readiness still
+private credential provisioning and application endpoint readiness still
 need integration. Native split credentials must never enter an ordinary Fleet App
 spec, workload environment or public response. The runtime CLI advertises Docker
 only, and the adapter rejects application services and action-proof-required

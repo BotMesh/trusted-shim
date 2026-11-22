@@ -27,6 +27,7 @@ pub mod ziren;
 
 pub use trusted_contracts as contracts;
 pub use trusted_data_router::{Connector, ServiceSpec};
+pub use trusted_rail as rail;
 pub use trusted_rail::{AuthorizationLedger, PolicyProofCodec, RuleEngine};
 
 pub type Result<T> = std::result::Result<T, Error>;

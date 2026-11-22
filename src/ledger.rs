@@ -132,11 +132,21 @@ impl SqliteLedger {
 
     /// Credential revocation and grant consumption serialize on the same DB.
     pub fn revoke_access(&self, token: &str) -> Result<()> {
+        self.revoke_access_id(&access_hash(token)?)
+    }
+
+    /// Operator-facing revocation identifier is SHA-256 of the bearer. It is
+    /// safe to put this identifier in audit records; never log the bearer.
+    pub fn revoke_access_id(&self, id: &str) -> Result<()> {
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(Error::InvalidInput);
+        }
         let c = self.connection.lock().map_err(|_| Error::Unavailable)?;
-        db(c.execute(
-            "DELETE FROM ledger_access WHERE token_hash=?1",
-            params![access_hash(token)?],
-        ))?;
+        db(c.execute("DELETE FROM ledger_access WHERE token_hash=?1", params![id]))?;
         Ok(())
     }
 
