@@ -457,6 +457,26 @@ operator reconciliation. An expired admission can observe an existing workload
 but cannot create it. State is fenced to its trust profile; changing labels does
 not migrate allocations or permit removing their cleanup driver.
 
+When the daemon advertises `runtime-resume-tee-v1`, a crashed `tee` or
+`tee-simulation` runtime can be resumed in place as a Docker one is. It starts only
+behind a fresh admission: new evidence and a proof, for exactly the request digest
+its launch was admitted with.
+- **Each restart is a numbered start** with its own admission record and nonce; the
+  binding format is unchanged. Only the current restart's record is kept, beside the
+  launch's.
+- **One admission starts the container once.** The start is marked used before
+  Docker starts the container. A retried or interrupted restart continues its unused,
+  unexpired start without submitting another proof. A failed, rejected or expired
+  admission leaves the container stopped.
+- **While a restart is admitted,** `inspect` reports `starting`, and a concurrent
+  `resume` returns that status. The admission continues if the caller stops waiting,
+  and a stop or delete during it stays final.
+- **Restarts and launches share** the node's single admission slot, and each has the
+  five-minute deadline once it holds the slot.
+- **The launch's TEE configuration is required.** After any change to the TEE
+  configuration, a crashed runtime stays down until it is cleaned up and launched as
+  a new generation.
+
 Simulation checks use actual upstream Trustee sample verification and local Docker;
 proof-network/receipt doubles test orchestration and are explicitly not ZK proofs:
 
@@ -777,6 +797,12 @@ state before acknowledging release. Keep both Fleet's allocation journal and
 shim's state across restarts and upgrades; never delete them to retry an operation.
 A crashed process can leave a private temporary env file; protect the state directory
 with the same access and retention controls as runtime credentials.
+
+The persistent daemon also accepts `resume`, which it advertises as `runtime-resume-v1`.
+It starts a Running allocation's own exited container again in place, keeping its
+state, after checking the committed limits again. A running container is left alone.
+It never recreates a missing container, and it refuses a stopped or deleted allocation,
+so a stop or delete stays final. The one-shot binary has no `resume`.
 
 Run real Docker acceptance separately (only test containers are created/removed):
 
