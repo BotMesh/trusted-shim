@@ -398,3 +398,179 @@ async fn daemon_recovers_simulation_configuration_without_contacting_proof_servi
         }
     }
 }
+
+#[tokio::test]
+async fn resume_of_an_unlaunched_execution_submits_no_proof() {
+    let lab = Lab::start(false, None).await;
+    let root = tempfile::tempdir().unwrap();
+    let proof = Arc::new(ProofDouble::default());
+    let driver = lab.driver(root.path(), proof.clone(), false).await;
+    assert!(driver.resume(&request("never").execution).await.is_err());
+    assert_eq!(proof.submitted.load(Ordering::SeqCst), 0);
+}
+
+fn docker(args: &[&str]) -> String {
+    let out = std::process::Command::new("docker")
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+struct Container(String);
+impl Drop for Container {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.0])
+            .output();
+    }
+}
+
+/// The admission records of `start`, as the gate stores them.
+fn admission(root: &std::path::Path, start: u64) -> Value {
+    let suffix = match start {
+        0 => ".json".to_string(),
+        n => format!(".start-{n}.json"),
+    };
+    let path = std::fs::read_dir(root.join("tee"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            name.ends_with(&suffix) && (start != 0 || name.len() == 64 + ".json".len())
+        })
+        .unwrap();
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires local Docker and preloaded alpine:3.21; receipts are orchestration doubles"]
+async fn simulated_resume_readmits_before_restarting_in_place() {
+    let lab = Lab::start(false, None).await;
+    let root = tempfile::tempdir().unwrap();
+    let proof = Arc::new(ProofDouble::default());
+    let request = request(root.path().file_name().unwrap().to_str().unwrap());
+    let execution = &request.execution;
+    let driver = lab.driver(root.path(), proof.clone(), false).await;
+    let launched = driver.launch(&request).await.unwrap();
+    let _cleanup = Container(launched.runtime_id.clone());
+    let id = docker(&["inspect", "-f", "{{.Id}}", &launched.runtime_id]);
+    let submitted = || proof.submitted.load(Ordering::SeqCst);
+
+    // A running runtime is left as it is, without a new admission.
+    assert_eq!(
+        driver.resume(execution).await.unwrap().state,
+        RuntimeState::Ready
+    );
+    assert_eq!(submitted(), 1);
+
+    docker(&["kill", &launched.runtime_id]);
+    assert_eq!(
+        driver.inspect(execution).await.unwrap().state,
+        RuntimeState::Stopped
+    );
+
+    // A failed proof leaves it stopped. Retrying while that admission is
+    // still current only queries it again; it never submits a second proof.
+    proof.fail_proof.store(true, Ordering::SeqCst);
+    assert!(driver.resume(execution).await.is_err());
+    assert!(driver.resume(execution).await.is_err());
+    assert_eq!(submitted(), 2);
+    assert_eq!(
+        driver.inspect(execution).await.unwrap().state,
+        RuntimeState::Stopped
+    );
+
+    // Once it has expired, the next restart claims a new start of its own.
+    let mut failed = admission(root.path(), 1);
+    failed["binding"]["expires_at"] = json!(1);
+    let failed_path = std::fs::read_dir(root.path().join("tee"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_str().unwrap().ends_with(".start-1.json"))
+        .unwrap();
+    std::fs::write(&failed_path, serde_json::to_vec(&failed).unwrap()).unwrap();
+    proof.fail_proof.store(false, Ordering::SeqCst);
+    let resumed = driver.resume(execution).await.unwrap();
+    assert_eq!(resumed.state, RuntimeState::Ready);
+    assert_eq!(submitted(), 3);
+    // The same container, admitted afresh for exactly the launch's request.
+    assert_eq!(
+        docker(&["inspect", "-f", "{{.Id}}", &resumed.runtime_id]),
+        id
+    );
+    let (launch, restart) = (admission(root.path(), 0), admission(root.path(), 2));
+    assert_eq!(
+        launch["binding"]["request_sha256"],
+        restart["binding"]["request_sha256"]
+    );
+    assert_ne!(launch["binding"]["nonce"], restart["binding"]["nonce"]);
+    assert_eq!(restart["authorized"], true);
+
+    // An admission starts the container once: another crash needs another.
+    docker(&["kill", &launched.runtime_id]);
+    assert_eq!(
+        driver.resume(execution).await.unwrap().state,
+        RuntimeState::Ready
+    );
+    assert_eq!(submitted(), 4);
+    // However often it restarts, only the current restart's record is kept.
+    let restarts = std::fs::read_dir(root.path().join("tee"))
+        .unwrap()
+        .filter(|e| {
+            let name = e.as_ref().unwrap().file_name();
+            name.to_str().unwrap().contains(".start-")
+        })
+        .count();
+    assert_eq!(restarts, 1);
+    admission(root.path(), 3);
+
+    // A stopped allocation is never resumed and costs no proof.
+    driver.stop(execution).await.unwrap();
+    assert!(driver.resume(execution).await.is_err());
+    assert_eq!(submitted(), 4);
+    driver.delete(execution).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires local Docker and preloaded alpine:3.21; receipts are orchestration doubles"]
+async fn simulated_stop_during_a_resume_admission_is_final() {
+    let lab = Lab::start(false, None).await;
+    let root = tempfile::tempdir().unwrap();
+    let proof = Arc::new(ProofDouble::default());
+    let request = request(root.path().file_name().unwrap().to_str().unwrap());
+    let execution = &request.execution;
+    let driver = lab.driver(root.path(), proof.clone(), false).await;
+    let launched = driver.launch(&request).await.unwrap();
+    let _cleanup = Container(launched.runtime_id.clone());
+    docker(&["kill", &launched.runtime_id]);
+    proof.hold.store(true, Ordering::SeqCst);
+    let (resumed, ()) = tokio::join!(driver.resume(execution), async {
+        while proof.submitted.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // The admission holds no lock: inspect answers, and reports the restart.
+        assert_eq!(
+            driver.inspect(execution).await.unwrap().state,
+            RuntimeState::Starting
+        );
+        // A concurrent resume joins nothing new.
+        assert_eq!(
+            driver.resume(execution).await.unwrap().state,
+            RuntimeState::Starting
+        );
+        driver.stop(execution).await.unwrap();
+        proof.hold.store(false, Ordering::SeqCst);
+    });
+    assert!(resumed.is_err());
+    assert_eq!(proof.submitted.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        docker(&["inspect", "-f", "{{.State.Running}}", &launched.runtime_id]),
+        "false"
+    );
+    assert_eq!(
+        driver.inspect(execution).await.unwrap().state,
+        RuntimeState::Stopped
+    );
+    driver.delete(execution).await.unwrap();
+}
