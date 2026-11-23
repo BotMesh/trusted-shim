@@ -727,6 +727,11 @@ impl DockerDriver {
         {
             return Err(Error::InvalidContract);
         }
+        // Native OpenShell attachments; this path keeps its own driver_options
+        // gpus/volumes. Never silently ignore an allocation's devices or storage.
+        if !request.gpus.is_empty() || !request.mounts.is_empty() {
+            return Err(Error::Unsupported);
+        }
         let options: DockerOptions = serde_json::from_value(if request.driver_options.is_null() {
             json!({})
         } else {

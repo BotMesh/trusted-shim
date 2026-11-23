@@ -41,6 +41,16 @@ async fn unsupported_trust_and_driver_requirements_never_create_state() {
     r.access_policy_sha256 = Some("ab".repeat(32));
     assert!(matches!(driver.launch(&r).await, Err(Error::Unsupported)));
     r.access_policy_sha256 = None;
+    // Native OpenShell attachments are never silently dropped by this path,
+    // and their omission keeps the existing launch serialization unchanged.
+    assert!(serde_json::to_value(&r).unwrap().get("gpus").is_none());
+    assert!(serde_json::to_value(&r).unwrap().get("mounts").is_none());
+    r.gpus = vec!["0".into()];
+    assert!(matches!(driver.launch(&r).await, Err(Error::Unsupported)));
+    r.gpus.clear();
+    r.mounts = vec![serde_json::from_value(json!({"name":"state","target":"/state"})).unwrap()];
+    assert!(matches!(driver.launch(&r).await, Err(Error::Unsupported)));
+    r.mounts.clear();
     r.driver_options = json!({"privileged":true});
     assert!(matches!(
         driver.launch(&r).await,

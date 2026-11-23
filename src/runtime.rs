@@ -45,6 +45,25 @@ pub struct LaunchRequest {
     pub services: Vec<ServiceSpec>,
     #[serde(default)]
     pub driver_options: serde_json::Value,
+    /// Host GPU ids Fleet/Ray granted to this exact allocation. The native
+    /// driver receives exactly these CDI devices, never a count-only request.
+    /// Omission preserves existing launch commitments and recovery journals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<String>,
+    /// Durable storage that outlives generations of this workload. The node
+    /// derives each volume from the execution's namespace/workload and `name`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<DurableMount>,
+}
+
+/// A named, node-local volume scoped to one workload; never a host path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableMount {
+    pub name: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

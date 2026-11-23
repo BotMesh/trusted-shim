@@ -116,6 +116,7 @@ impl GatewayLaunch {
             return Err(Error::Unsupported);
         }
         crate::openshell_services::ServiceOptions::from_request(&launch)?;
+        crate::openshell::attachments::validate(&launch)?;
         let result = Self {
             // Stock gateway routable names are limited to 19 characters. This
             // is a lookup hint, not authority: the full execution remains bound
@@ -135,6 +136,7 @@ impl GatewayLaunch {
     /// extension. This is not a call to a machine-local Docker driver. The
     /// gateway remains responsible for minting its own launch credentials.
     pub fn request(&self) -> proto::CreateSandboxRequest {
+        use crate::openshell::attachments;
         let string = |v: String| Value {
             kind: Some(Kind::StringValue(v)),
         };
@@ -168,9 +170,17 @@ impl GatewayLaunch {
                 command: self.launch.command.clone(),
                 environment: self.launch.environment.clone().into_iter().collect(),
                 policy: Some(self.policy.clone()),
+                resource_requirements: attachments::gpu_count(&self.launch).map(|count| {
+                    proto::ResourceRequirements {
+                        gpu: Some(proto::GpuResourceRequirements { count: Some(count) }),
+                    }
+                }),
                 template: Some(proto::SandboxTemplate {
                     image: self.launch.image.clone(),
                     resources: Some(resources),
+                    // Validated in `new`; translation of admitted inputs only.
+                    driver_config: attachments::public_driver_config(&self.launch)
+                        .expect("validated attachments"),
                     ..Default::default()
                 }),
                 ..Default::default()

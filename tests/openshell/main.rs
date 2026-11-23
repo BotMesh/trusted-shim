@@ -1543,3 +1543,356 @@ fn user_access_policy_is_independent_of_driver_and_cannot_be_dropped_or_substitu
         request.access_policy_sha256 = Some(hash.clone());
     }
 }
+
+fn attachments() -> (LaunchRequest, DriverSandbox, String) {
+    use prost_types::{value::Kind, ListValue, Struct, Value};
+    let (mut r, mut s, p) = fixture();
+    r.gpus = vec!["0".into(), "3".into()];
+    r.mounts = serde_json::from_value(serde_json::json!([
+        {"name":"models","target":"/models","read_only":true},
+        {"name":"state","target":"/var/lib/agent"}
+    ]))
+    .unwrap();
+    let text = |v: &str| Value {
+        kind: Some(Kind::StringValue(v.into())),
+    };
+    let list = |values: Vec<Value>| Value {
+        kind: Some(Kind::ListValue(ListValue { values })),
+    };
+    // Built independently of the adapter: upstream's documented Docker schema.
+    let volume = |name: &str, target: &str, read_only: bool| Value {
+        kind: Some(Kind::StructValue(Struct {
+            fields: [
+                ("type".into(), text("volume")),
+                (
+                    "source".into(),
+                    text(
+                        &trusted_shim::openshell::attachments::volume_name(
+                            &r,
+                            &serde_json::from_value(
+                                serde_json::json!({"name":name,"target":target}),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                ),
+                ("target".into(), text(target)),
+                (
+                    "read_only".into(),
+                    Value {
+                        kind: Some(Kind::BoolValue(read_only)),
+                    },
+                ),
+            ]
+            .into(),
+        })),
+    };
+    let spec = s.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(ResourceRequirements {
+        gpu: Some(GpuResourceRequirements { count: Some(2) }),
+    });
+    spec.template.as_mut().unwrap().driver_config = Some(Struct {
+        fields: [
+            (
+                "cdi_devices".into(),
+                list(vec![text("nvidia.com/gpu=0"), text("nvidia.com/gpu=3")]),
+            ),
+            (
+                "mounts".into(),
+                list(vec![
+                    volume("models", "/models", true),
+                    volume("state", "/var/lib/agent", false),
+                ]),
+            ),
+        ]
+        .into(),
+    });
+    (r, s, p)
+}
+
+#[test]
+fn native_gpus_and_durable_mounts_are_exactly_the_fleet_grant() {
+    use prost_types::{value::Kind, Value};
+    let (r, s, p) = attachments();
+    assert!(NativeCreate::decode(&s.encode_to_vec(), &r, &p).is_ok());
+
+    // The public request carries the same grant in the driver-keyed envelope.
+    let policy = s.spec.as_ref().unwrap().policy.clone().unwrap();
+    let public = GatewayLaunch::new(r.clone(), policy.clone())
+        .unwrap()
+        .request()
+        .spec
+        .unwrap();
+    assert_eq!(
+        public.resource_requirements.unwrap().gpu.unwrap().count,
+        Some(2)
+    );
+    let envelope = public.template.unwrap().driver_config.unwrap();
+    assert_eq!(envelope.fields.len(), 1);
+    assert_eq!(
+        envelope.fields["docker"].kind,
+        Some(Kind::StructValue(
+            s.spec
+                .as_ref()
+                .unwrap()
+                .template
+                .as_ref()
+                .unwrap()
+                .driver_config
+                .clone()
+                .unwrap()
+        ))
+    );
+
+    let config = |s: &mut DriverSandbox| {
+        s.spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config
+            .as_mut()
+            .unwrap()
+            .fields
+            .clone()
+    };
+    for change in 0..9 {
+        let mut s = s.clone();
+        let mut fields = config(&mut s);
+        let spec = s.spec.as_mut().unwrap();
+        match change {
+            // A driver-chosen default could pick a GPU Ray gave someone else.
+            0 => {
+                spec.resource_requirements.as_mut().unwrap().gpu =
+                    Some(GpuResourceRequirements { count: None })
+            }
+            1 => spec.resource_requirements = None,
+            2 => {
+                fields.insert(
+                    "cdi_devices".into(),
+                    Value {
+                        kind: Some(Kind::ListValue(prost_types::ListValue {
+                            values: vec![
+                                Value {
+                                    kind: Some(Kind::StringValue("nvidia.com/gpu=0".into())),
+                                },
+                                Value {
+                                    kind: Some(Kind::StringValue("nvidia.com/gpu=1".into())),
+                                },
+                            ],
+                        })),
+                    },
+                );
+            }
+            3 => {
+                fields.remove("mounts");
+            }
+            4 => {
+                fields.remove("cdi_devices");
+            }
+            5 => {
+                fields.insert(
+                    "extra".into(),
+                    Value {
+                        kind: Some(Kind::BoolValue(true)),
+                    },
+                );
+            }
+            6 => spec.template.as_mut().unwrap().driver_config = None,
+            7 => {
+                // Another workload's volume, even in the same namespace.
+                let mut other = r.clone();
+                other.execution.workload = "other".into();
+                let mut mounts = fields["mounts"].clone();
+                if let Some(Kind::ListValue(list)) = mounts.kind.as_mut() {
+                    if let Some(Kind::StructValue(v)) = list.values[0].kind.as_mut() {
+                        v.fields.insert(
+                            "source".into(),
+                            Value {
+                                kind: Some(Kind::StringValue(
+                                    trusted_shim::openshell::attachments::volume_name(
+                                        &other,
+                                        &r.mounts[0],
+                                    )
+                                    .unwrap(),
+                                )),
+                            },
+                        );
+                    }
+                }
+                fields.insert("mounts".into(), mounts);
+            }
+            _ => {
+                spec.resource_requirements.as_mut().unwrap().gpu =
+                    Some(GpuResourceRequirements { count: Some(1) })
+            }
+        }
+        if !matches!(change, 0 | 1 | 6 | 8) {
+            spec.template
+                .as_mut()
+                .unwrap()
+                .driver_config
+                .as_mut()
+                .unwrap()
+                .fields = fields;
+        }
+        assert!(
+            NativeCreate::decode(&s.encode_to_vec(), &r, &p).is_err(),
+            "variation {change} must be rejected"
+        );
+    }
+
+    // A launch without attachments admits no driver config or GPU request.
+    let (plain, mut native, p) = fixture();
+    native
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = s
+        .spec
+        .as_ref()
+        .unwrap()
+        .template
+        .as_ref()
+        .unwrap()
+        .driver_config
+        .clone();
+    assert!(NativeCreate::decode(&native.encode_to_vec(), &plain, &p).is_err());
+
+    // Volumes survive replacement generations and allocations of one workload.
+    let name = |r: &LaunchRequest| {
+        trusted_shim::openshell::attachments::volume_name(r, &r.mounts[0]).unwrap()
+    };
+    let mut next = r.clone();
+    next.execution.generation += 1;
+    next.execution.allocation_id = "agent-1".into();
+    next.execution.lease_id = "two".into();
+    assert_eq!(name(&next), name(&r));
+    for (field, value) in [("namespace", "other"), ("workload", "other")] {
+        let mut other = r.clone();
+        match field {
+            "namespace" => other.execution.namespace = value.into(),
+            _ => other.execution.workload = value.into(),
+        }
+        assert_ne!(name(&other), name(&r));
+    }
+
+    // Shapes that cannot be safely translated are rejected before any proof.
+    for bad in 0..7 {
+        let mut b = r.clone();
+        match bad {
+            0 => b.gpus.push("0".into()),
+            1 => b.gpus = vec!["0/../1".into()],
+            2 => b.mounts[0].name = "Models".into(),
+            3 => b.mounts[0].target = "models".into(),
+            4 => b.mounts[0].target = "/models/../etc".into(),
+            5 => b.mounts[1].target = "/models".into(),
+            _ => b.mounts[1].name = "models".into(),
+        }
+        assert!(
+            GatewayLaunch::new(b.clone(), policy.clone()).is_err(),
+            "shape {bad}"
+        );
+        assert!(
+            NativeCreate::decode(&s.encode_to_vec(), &b, &p).is_err(),
+            "shape {bad}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires OPENSHELL_NATIVE_DRIVER_SOCKET for an unmodified driver with allow_driver_config"]
+async fn unmodified_native_driver_admits_shim_provisioned_workload_volumes() {
+    let socket =
+        std::env::var_os("OPENSHELL_NATIVE_DRIVER_SOCKET").expect("private native driver socket");
+    let admission = openshell_core::resource_admission::DriverAdmissionConfig {
+        allow_driver_config: true,
+        ..Default::default()
+    };
+    let native = NativeDriver::new(socket.into(), admission.acknowledgement()).unwrap();
+    let (mut r, mut s, p) = attachments();
+    // No CDI GPU inventory is assumed here; GPU admission needs a GPU node.
+    r.gpus.clear();
+    let spec = s.spec.as_mut().unwrap();
+    spec.resource_requirements = None;
+    let template = spec.template.as_mut().unwrap();
+    template
+        .driver_config
+        .as_mut()
+        .unwrap()
+        .fields
+        .remove("cdi_devices");
+    r.image = "alpine:3.21".into();
+    template.image = r.image.clone();
+    // Unique tenant per run; every volume below is removed at the end.
+    let tenant = format!("vol{}", std::process::id());
+    r.execution.namespace = tenant.clone();
+    s.workspace = tenant.clone();
+    let names: Vec<_> = r
+        .mounts
+        .iter()
+        .map(|m| trusted_shim::openshell::attachments::volume_name(&r, m).unwrap())
+        .collect();
+    let fields = &mut template.driver_config.as_mut().unwrap().fields;
+    // Rebuild the expected sources for this run's tenant.
+    if let Some(prost_types::value::Kind::ListValue(list)) =
+        fields.get_mut("mounts").and_then(|m| m.kind.as_mut())
+    {
+        for (value, name) in list.values.iter_mut().zip(&names) {
+            if let Some(prost_types::value::Kind::StructValue(v)) = value.kind.as_mut() {
+                v.fields.insert(
+                    "source".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(name.clone())),
+                    },
+                );
+            }
+        }
+    }
+    // Remove every test volume even if an assertion panics.
+    struct Volumes(Vec<String>);
+    impl Drop for Volumes {
+        fn drop(&mut self) {
+            for name in &self.0 {
+                let _ = std::process::Command::new("docker")
+                    .args(["volume", "rm", "-f", name])
+                    .output();
+            }
+        }
+    }
+    let mut cleanup = Volumes(names.clone());
+    let approved = NativeCreate::decode(&s.encode_to_vec(), &r, &p).unwrap();
+    // Upstream admission refuses volumes that do not exist yet.
+    assert!(native.validate(&approved).await.is_err());
+    native.ensure_volumes(&r).await.unwrap();
+    native.ensure_volumes(&r).await.unwrap(); // idempotent
+    native.validate(&approved).await.unwrap();
+
+    // A same-named volume squatted without this workspace's labels is never
+    // adopted, relabeled or admitted.
+    let mut squat = r.clone();
+    squat.execution.workload = "squatted".into();
+    let squatted =
+        trusted_shim::openshell::attachments::volume_name(&squat, &squat.mounts[0]).unwrap();
+    cleanup.0.extend(
+        squat
+            .mounts
+            .iter()
+            .map(|m| trusted_shim::openshell::attachments::volume_name(&squat, m).unwrap()),
+    );
+    assert!(std::process::Command::new("docker")
+        .args(["volume", "create", &squatted])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(matches!(
+        native.ensure_volumes(&squat).await,
+        Err(trusted_shim::Error::Untrusted)
+    ));
+}

@@ -388,6 +388,9 @@ impl ManagedNativeDriver {
             instance_id: None,
             services,
         };
+        // Idempotent and never consumes authority; upstream admission inspects
+        // these volumes, so they must exist before native validation.
+        self.native.ensure_volumes(request).await?;
         let dispatch = self.native.prepare_dispatch(prepared).await?;
         self.save(&slot, &record, true)?;
         ledger

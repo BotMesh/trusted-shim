@@ -495,7 +495,28 @@ the upstream extension contract and checks the operator's resource admission
 policy and CPU/memory limit capabilities. `NativeCreate` binds the native policy
 hash, namespace/workspace, image, command, environment and hard limits to the
 approved launch inputs. Fleet/Ray own resource requests; the native Docker
-driver receives only hard limits because it rejects resource request fields. Unmapped GPU, identity, namespace and platform options fail closed.
+driver receives only hard limits because it rejects resource request fields. Unmapped identity, namespace and platform options fail closed.
+
+GPUs and durable storage are `LaunchRequest.gpus` / `LaunchRequest.mounts`
+(omitted when empty, so existing launch commitments are unchanged). Fleet binds
+`gpus` to the device ids Ray granted the allocation and `mounts` to the admitted
+app manifest. The shim translates them into the upstream Docker driver's own
+`driver_config`: one `cdi_devices` entry `nvidia.com/gpu=<id>` per granted id
+(plus `gpu.count` equal to that number, never a driver-chosen default), and one
+`type: volume` mount per entry. Volume names are derived as
+`fleet-<commitment(namespace, workload, name)>`, stable across generations but
+unnameable by another workload. `NativeCreate` requires the native sandbox to
+carry exactly that translation and nothing else; host binds, tmpfs, image mounts
+and foreign devices are rejected.
+
+Attachments require the node's driver to run with `allow_driver_config=true` in
+its admission policy; the acknowledged policy is checked before any volume is
+touched. Before dispatch the shim idempotently creates each missing volume as a
+plain `local` volume carrying the policy's `required_labels` (with
+`${workspace}` substituted) and `trusted-shim.openshell/volume=v1`. An existing
+volume is used only if it is a plain local volume with that label that upstream
+resource admission already accepts; otherwise the launch is rejected as
+untrusted. Runtime deletion never removes these volumes.
 Inspect, stop and delete require the exact sandbox ID and name; deletion is
 confirmed by a subsequent lookup. Mutations are never automatically retried.
 

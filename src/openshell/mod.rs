@@ -2,6 +2,7 @@
 //! socket. The native driver owns workload/supervisor separation and isolation.
 //! This transport never exposes the Docker socket or substitutes plain Docker.
 pub mod access;
+pub mod attachments;
 pub mod daemon;
 pub(crate) mod data_plane;
 pub mod gateway;
@@ -123,6 +124,7 @@ impl NativeCreate {
         credentials_required: bool,
     ) -> Result<()> {
         crate::access::native_policy(request, policy_sha256)?;
+        attachments::validate(request)?;
         if sandbox.encoded_len() > 1024 * 1024
             || !matches!(
                 request.driver.as_str(),
@@ -205,14 +207,19 @@ impl NativeCreate {
         {
             return Err(Error::Untrusted);
         }
-        // Fleet must explicitly map Ray's GPU allocation and every external
-        // attachment before those features can be exposed by this adapter.
-        if spec
+        // GPUs and storage must be exactly Fleet's grant: the CDI devices Ray
+        // assigned with a matching count (never a driver-chosen default) and
+        // the workload-scoped volumes. Nothing else may enter driver_config.
+        let gpu = spec
             .resource_requirements
             .as_ref()
-            .is_some_and(|r| r.gpu.is_some())
-            || template.driver_config.is_some()
-            || template.platform_config.is_some()
+            .and_then(|r| r.gpu.as_ref());
+        if gpu.map(|g| g.count) != attachments::gpu_count(request).map(Some)
+            || template.driver_config != attachments::driver_config(request)?
+        {
+            return Err(Error::Untrusted);
+        }
+        if template.platform_config.is_some()
             || template.user_namespaces.is_some()
             || !template.agent_socket_path.is_empty()
             || !template.labels.is_empty()
@@ -298,6 +305,12 @@ impl NativeDriver {
             .await
             .map_err(|_| Error::Untrusted)?;
         Ok(NativeDispatch { client, approved })
+    }
+
+    /// Provision this launch's workload-scoped volumes before native admission,
+    /// which requires them to exist with this node's admission labels.
+    pub async fn ensure_volumes(&self, request: &crate::runtime::LaunchRequest) -> Result<()> {
+        attachments::ensure_volumes(request, &self.admission_policy).await
     }
 
     /// Read-only admission check; never consumes a grant or creates resources.
