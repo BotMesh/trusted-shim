@@ -38,7 +38,7 @@ trusted-rail = { git = "https://github.com/attestx/trusted-rail", rev = "cfd13f2
 
 fs2 = "0.4"
 tempfile = "3"
-trusted-router-transport = { git = "https://github.com/attestx/trusted-data-router", rev = "ee5f97cf8eb4eeb4e0051f83d7d1a8ca207178b0" }
+trusted-router-transport = { git = "https://github.com/attestx/trusted-data-router", rev = "d489e4156255075d1c7863040507398055fea270" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.8"

@@ -10,6 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Build pinned Chisel helper from the locked Router revision
+        run: |
+          scripts/build_tunnel_helper.sh "$RUNNER_TEMP/trusted-router-tunnel"
+          echo "TRUSTED_ROUTER_TUNNEL_BINARY=$RUNNER_TEMP/trusted-router-tunnel" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
