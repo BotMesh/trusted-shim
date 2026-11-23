@@ -405,6 +405,26 @@ fn native_launch_binds_policy_resources_command_and_environment() {
 }
 
 #[test]
+fn native_launch_refuses_a_cpu_weight_it_cannot_enforce() {
+    // The native driver takes CPU and memory hard limits only. A requested
+    // CPU weight is refused, never dropped from the create.
+    let (mut r, s, p) = fixture();
+    let policy = s.spec.as_ref().unwrap().policy.clone().unwrap();
+    r.limits.cpu_shares = Some(64);
+    assert!(matches!(
+        NativeCreate::decode(&s.encode_to_vec(), &r, &p),
+        Err(trusted_shim::Error::Unsupported)
+    ));
+    assert!(matches!(
+        GatewayLaunch::new(r.clone(), policy.clone()),
+        Err(trusted_shim::Error::Unsupported)
+    ));
+    r.limits.cpu_shares = None;
+    assert!(NativeCreate::decode(&s.encode_to_vec(), &r, &p).is_ok());
+    assert!(GatewayLaunch::new(r, policy).is_ok());
+}
+
+#[test]
 fn gateway_binding_fences_every_allocation_field_and_requires_native_credentials() {
     let (launch, mut sandbox, _) = fixture();
     let policy = sandbox.spec.as_ref().unwrap().policy.clone().unwrap();
