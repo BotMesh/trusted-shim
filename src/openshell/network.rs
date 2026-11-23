@@ -165,6 +165,54 @@ async fn supervisor(sandbox: &DriverSandbox, image: &str) -> Result<String> {
     Ok((*container).to_owned())
 }
 
+/// Bounded tail of the owned workload container's own output (the agent and
+/// its supervisor launcher). Read-only: never exec, environment or files. The
+/// exact running container is re-verified against the observation per call.
+pub(crate) async fn logs(
+    sandbox: &DriverSandbox,
+    tail: u32,
+    expires_at: u64,
+) -> Result<crate::management::LogsResponse> {
+    use base64::Engine as _;
+    let remaining = expires_at.saturating_sub(trusted_router_transport::grants::now());
+    if remaining == 0 || !(1..=5000).contains(&tail) {
+        return Err(Error::Untrusted);
+    }
+    tokio::time::timeout(Duration::from_secs(remaining.min(15)), async {
+        let workload = &sandbox.status.as_ref().ok_or(Error::Ownership)?.instance_id;
+        if workload.is_empty() {
+            return Err(Error::Ownership);
+        }
+        owned(&inspect(workload).await?, sandbox, "sandbox")?;
+        let tail = tail.to_string();
+        let mut child = docker()
+            .args(["logs", "--tail", &tail, "--", workload])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| Error::Unavailable)?;
+        let (stdout, stderr) = tokio::try_join!(
+            crate::docker::log_tail(child.stdout.take().ok_or(Error::Unavailable)?),
+            crate::docker::log_tail(child.stderr.take().ok_or(Error::Unavailable)?),
+        )?;
+        if !child
+            .wait()
+            .await
+            .map_err(|_| Error::Unavailable)?
+            .success()
+        {
+            return Err(Error::Unavailable);
+        }
+        Ok(crate::management::LogsResponse {
+            stdout: base64::engine::general_purpose::STANDARD.encode(stdout),
+            stderr: base64::engine::general_purpose::STANDARD.encode(stderr),
+        })
+    })
+    .await
+    .map_err(|_| Error::Unavailable)?
+}
+
 struct HostKey(String);
 impl client::Handler for HostKey {
     type Error = russh::Error;

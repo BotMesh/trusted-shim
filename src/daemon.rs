@@ -353,6 +353,10 @@ impl Daemon {
                             .as_array_mut()
                             .unwrap()
                             .push(json!("openshell-tcp-services-v1"));
+                        value["features"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!("openshell-ingress-v1"));
                     }
                 }
                 if self.tee.is_some() {

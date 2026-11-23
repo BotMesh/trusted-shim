@@ -122,6 +122,7 @@ async fn serve_once(
     let lease = driver.network_lease(execution).await?;
     let children = CancellationToken::new();
     let _cancel = children.clone().drop_guard();
+    let sandbox = lease.sandbox.clone();
     let service = crate::openshell_network::bind(
         lease.sandbox,
         supervisor_image,
@@ -147,6 +148,7 @@ async fn serve_once(
         ready = health => ready,
     };
     let mut tasks = tokio::task::JoinSet::new();
+    let mut servers = Vec::new();
     let result = async {
         ready?;
         application.mark();
@@ -158,13 +160,34 @@ async fn serve_once(
             .build()
             .map_err(|_| Error::Unavailable)?;
         for spec in lease.binding.services {
+            // Ingress rules and logs-only control sit in front of the same
+            // supervisor-forwarded target; plain services reach it directly.
+            let target = if spec.endpoint_ref == "app" {
+                service.address()
+            } else {
+                let (target, server) = crate::management::bind_runtime(
+                    crate::management::Runtime::Native(Box::new(crate::management::NativeTarget {
+                        sandbox: sandbox.clone(),
+                        journal: driver.invocation_journal(),
+                    })),
+                    execution.clone(),
+                    spec.clone(),
+                    verifier.clone(),
+                    lease.binding.options.ingress.get(&spec.id.service).cloned(),
+                    service.address(),
+                    children.clone(),
+                )
+                .await?;
+                servers.push(server);
+                target
+            };
             tasks.spawn(data_plane::connect_service(
                 config.clone(),
                 verifier.clone(),
                 client.clone(),
                 execution.clone(),
                 spec,
-                service.address(),
+                target,
                 children.clone(),
             ));
         }
@@ -191,6 +214,11 @@ async fn serve_once(
     application.clear();
     children.cancel();
     while tasks.join_next().await.is_some() {}
+    // Idle HTTP listeners too, before the shared target and lease are released.
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
     service.close().await;
     // Cleanup waits for this guard: transport shutdown precedes native deletion.
     drop(lease.fence);
@@ -208,6 +236,7 @@ mod tests {
             container_port: 22,
             health_path: "/".into(),
             health_tcp_banner: Some("SSH-2.0-".into()),
+            ingress: Default::default(),
         };
         // An accepted tunnel can subsequently close, return unrelated bytes,
         // or stall because the supervisor never connected to the workload.

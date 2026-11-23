@@ -615,6 +615,22 @@ the workload accepted the connection. Silent TCP protocols need another health
 adapter and remain unsupported. `openshell-tcp-services-v1` advertises this
 capability so Fleet does not place these services on older shims.
 
+Native HTTP services can also use restricted ingress and a logs-only `control`
+service. Give an application service `endpoint_ref: ingress:<service>` and a
+matching `driver_options.ingress` rule (at most eight) with the same `paths`,
+`methods` and optional `single_use` as Docker ingress; `bearer_env` is rejected,
+because a native node holds no copy of the application's credential. The shim
+instead forwards the caller's own `Authorization` header, and the application
+authenticates it. Single-use approvals commit to the allocation's private
+`native-http-invocations.sqlite` journal before forwarding, exactly as on
+Docker. Declare at most one `control` service (`endpoint_ref: control`,
+`protocol: http1`, also beside TCP applications) for `GET /logs?tail=N` with
+Docker's bounds, read from the freshly observed owned workload container. Native
+control has no exec, restart or metadata routes: administrative exec goes
+through the stock gateway, and lifecycle changes stay Fleet allocation
+operations. The rules are part of the launch commitment. `openshell-ingress-v1`
+advertises this support.
+
 The daemon recovers stored connector records on restart, checks application health
 without redirects or proxy environment, and retries health recovery independently
 of Ray. Stop/delete permanently fence connections and wait for transport drain

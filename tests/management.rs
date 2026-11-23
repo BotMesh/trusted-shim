@@ -491,3 +491,228 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
     admin_task.abort();
     app_task.abort();
 }
+
+/// Native listeners need no Docker: control serves only logs, and ingress
+/// forwards the caller's own credential with durable single-use approval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_listener_is_logs_only_and_forwards_the_callers_credential() {
+    use sha2::{Digest, Sha256};
+    let tmp = tempfile::tempdir().unwrap();
+    let keyfile = tmp.path().join("key");
+    let public = tmp.path().join("public");
+    assert!(Command::new("openssl")
+        .args(["genpkey", "-algorithm", "ED25519", "-out"])
+        .arg(&keyfile)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("openssl")
+        .args(["pkey", "-in"])
+        .arg(&keyfile)
+        .args(["-pubout", "-out"])
+        .arg(&public)
+        .status()
+        .unwrap()
+        .success());
+    let key = std::fs::read(keyfile).unwrap();
+    std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let verifier = Verifier::from_file(public, "test".into()).unwrap();
+
+    // The application: echoes the Authorization it received, counts calls.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                headers
+                    .get("authorization")
+                    .map(|v| v.to_str().unwrap().to_owned())
+                    .unwrap_or_default()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let app_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let execution: trusted_shim::contracts::ExecutionIdentity = serde_json::from_value(json!({
+        "namespace":"clawup","workload":"agent-native","allocation_id":"a1","lease_id":"lease",
+        "generation":1,"node_id":"local"}))
+    .unwrap();
+    let spec = |service: &str, endpoint: &str| -> trusted_shim::ServiceSpec {
+        serde_json::from_value(json!({"id":{"namespace":"clawup","workload":"agent-native",
+            "service":service},"protocol":"http1","endpoint_ref":endpoint}))
+        .unwrap()
+    };
+    let (control_spec, chat_spec) = (spec("control", "control"), spec("chat", "ingress:chat"));
+    let grant = |service: &trusted_shim::ServiceSpec| Grant {
+        iss: "test".into(),
+        aud: grants::AUDIENCE.into(),
+        sub: "test-admin".into(),
+        nbf: grants::now(),
+        exp: grants::now() + 120,
+        purpose: Purpose::Access,
+        http_request: None,
+        access: None,
+        execution: execution.clone(),
+        service: service.id.clone(),
+        policy: PolicyRef {
+            issuer: "test".into(),
+            policy_id: "route-acl".into(),
+            version: 1,
+            sha256: "ab".repeat(32),
+        },
+    };
+    let control = grants::sign(&key, &grant(&control_spec)).unwrap();
+    let chat = grants::sign(&key, &grant(&chat_spec)).unwrap();
+    let journal = tmp.path().join("native-http-invocations.sqlite");
+    let stop = CancellationToken::new();
+    let bind = |declaration: trusted_shim::ServiceSpec, ingress: Option<management::Ingress>| {
+        management::bind_native(
+            Default::default(),
+            journal.clone(),
+            execution.clone(),
+            declaration,
+            verifier.clone(),
+            ingress,
+            target,
+            stop.clone(),
+        )
+    };
+    let rule: management::Ingress =
+        serde_json::from_value(json!({"paths":["/v1/chat/completions"],"methods":["POST"]}))
+            .unwrap();
+
+    // A node holds no application credential to inject.
+    let mut injected = rule.clone();
+    injected.bearer_env = Some("OPENCLAW_GATEWAY_TOKEN".into());
+    assert!(bind(chat_spec.clone(), Some(injected)).await.is_err());
+
+    // Native control is logs only: no exec, restart or metadata surface.
+    let http = reqwest::Client::new();
+    let (admin, admin_task) = bind(control_spec.clone(), None).await.unwrap();
+    for (method, path) in [
+        ("POST", "/exec"),
+        ("POST", "/restart"),
+        ("GET", "/metadata"),
+    ] {
+        let status = http
+            .request(method.parse().unwrap(), format!("http://{admin}{path}"))
+            .header("x-trusted-route", &control)
+            .json(&json!({"command":["true"],"timeout_seconds":1}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status == 404 || status == 405, "{path}: {status}");
+    }
+    for (token, query, status) in [
+        (None, "tail=10", 401),
+        (Some(&chat), "tail=10", 403),
+        (Some(&control), "tail=0", 400),
+        (Some(&control), "tail=5001", 400),
+    ] {
+        let mut request = http.get(format!("http://{admin}/logs?{query}"));
+        if let Some(token) = token {
+            request = request.header("x-trusted-route", token);
+        }
+        assert_eq!(request.send().await.unwrap().status(), status, "{query}");
+    }
+    // An unobserved sandbox is never resolved to some other container.
+    assert!(!http
+        .get(format!("http://{admin}/logs?tail=10"))
+        .header("x-trusted-route", &control)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // Ingress forwards exactly the caller's own credential, or none.
+    let (app_addr, app_listener) = bind(chat_spec.clone(), Some(rule.clone())).await.unwrap();
+    let url = format!("http://{app_addr}/v1/chat/completions");
+    for authorization in [Some("Bearer caller-token"), None] {
+        let mut request = http.post(&url).header("x-trusted-route", &chat).body("{}");
+        if let Some(value) = authorization {
+            request = request.header("authorization", value);
+        }
+        let response = request.send().await.unwrap().error_for_status().unwrap();
+        assert_eq!(response.text().await.unwrap(), authorization.unwrap_or(""));
+    }
+    for (method, path, token) in [
+        ("GET", "/v1/chat/completions", &chat),
+        ("POST", "/admin", &chat),
+        ("POST", "/v1/chat/completions", &control),
+    ] {
+        let status = http
+            .request(method.parse().unwrap(), format!("http://{app_addr}{path}"))
+            .header("x-trusted-route", token)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 403, "{method} {path}");
+    }
+    app_listener.abort();
+
+    // Single-use approval is body-bound and survives a listener restart.
+    let mut once = rule;
+    once.single_use = true;
+    let (bound_addr, bound_task) = bind(chat_spec.clone(), Some(once.clone())).await.unwrap();
+    let bound_url = format!("http://{bound_addr}/v1/chat/completions");
+    let mut bound = grant(&chat_spec);
+    bound.http_request = Some(grants::HttpRequestBinding {
+        id: "aa".repeat(32),
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        body_sha256: hex::encode(Sha256::digest(b"approved")),
+    });
+    let capability = grants::sign(&key, &bound).unwrap();
+    for (token, body) in [(&chat, "approved"), (&capability, "changed")] {
+        let status = http
+            .post(&bound_url)
+            .header("x-trusted-route", token)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 403, "{body}");
+    }
+    let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+    let attempts = futures::future::join_all((0..20).map(|_| {
+        http.post(&bound_url)
+            .header("x-trusted-route", &capability)
+            .header("authorization", "Bearer caller-token")
+            .body("approved")
+            .send()
+    }))
+    .await;
+    let codes: Vec<_> = attempts
+        .into_iter()
+        .map(|r| r.unwrap().status().as_u16())
+        .collect();
+    assert_eq!(codes.iter().filter(|&&v| v == 200).count(), 1, "{codes:?}");
+    assert_eq!(codes.iter().filter(|&&v| v == 409).count(), 19, "{codes:?}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+    bound_task.abort();
+    let (again, again_task) = bind(chat_spec, Some(once)).await.unwrap();
+    assert_eq!(
+        http.post(format!("http://{again}/v1/chat/completions"))
+            .header("x-trusted-route", &capability)
+            .body("approved")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    stop.cancel();
+    for task in [admin_task, again_task, app_task] {
+        task.abort();
+    }
+}

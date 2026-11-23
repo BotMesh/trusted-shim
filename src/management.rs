@@ -1,6 +1,8 @@
 //! Node-local administration and manifest-selected HTTP ingress. No scheduler
 //! or agent-type branches. Unproved Docker administration is not a PolicyEngine
 //! execution grant; proof-required runtimes remain rejected by the Docker driver.
+//! Native OpenShell runtimes expose only bounded reads and request-bound ingress
+//! here: their exec runs through the stock gateway, under OpenShell policy.
 use crate::{contracts::ExecutionIdentity, docker::DockerDriver, Error, Result};
 use axum::{
     body::Body,
@@ -18,12 +20,13 @@ use tokio_util::sync::CancellationToken;
 use trusted_data_router::ServiceSpec;
 use trusted_router_transport::grants::{Grant, Purpose, Verifier};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ingress {
     pub paths: Vec<String>,
     pub methods: Vec<String>,
-    /// Native authorization stays on the node, read from the owned container.
+    /// Docker only: the bearer is read from the owned container's environment.
+    /// Native launches forward the caller's own `Authorization` instead.
     pub bearer_env: Option<String>,
     /// Require body-bound, durably single-use control-plane approval.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -91,8 +94,34 @@ pub struct LogsResponse {
     pub stderr: String,
 }
 
+/// What one listener controls.
+#[derive(Clone)]
+pub(crate) enum Runtime {
+    /// Full administration; ingress injects the container's own bearer.
+    Docker(DockerDriver),
+    /// Logs only; ingress forwards the caller's own `Authorization`.
+    Native(Box<NativeTarget>),
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeTarget {
+    /// The fresh owned observation of this allocation's network lease.
+    pub sandbox: openshell_core::proto::compute::v1::DriverSandbox,
+    /// The native allocation's single-use request journal.
+    pub journal: std::path::PathBuf,
+}
+
+impl Runtime {
+    fn docker(&self) -> std::result::Result<&DockerDriver, StatusCode> {
+        match self {
+            Self::Docker(driver) => Ok(driver),
+            Self::Native(_) => Err(StatusCode::NOT_FOUND),
+        }
+    }
+}
+
 struct Service {
-    driver: DockerDriver,
+    driver: Runtime,
     execution: ExecutionIdentity,
     declaration: ServiceSpec,
     verifier: Verifier,
@@ -136,8 +165,62 @@ pub async fn bind(
     target: SocketAddr,
     stop: CancellationToken,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    bind_runtime(
+        Runtime::Docker(driver),
+        execution,
+        declaration,
+        verifier,
+        ingress,
+        target,
+        stop,
+    )
+    .await
+}
+
+/// A native allocation's listener: logs-only control, and ingress that forwards
+/// the caller's own `Authorization`. `sandbox` is the fresh owned observation of
+/// the allocation; `journal` holds its single-use request state.
+#[allow(clippy::too_many_arguments)]
+pub async fn bind_native(
+    sandbox: openshell_core::proto::compute::v1::DriverSandbox,
+    journal: std::path::PathBuf,
+    execution: ExecutionIdentity,
+    declaration: ServiceSpec,
+    verifier: Verifier,
+    ingress: Option<Ingress>,
+    target: SocketAddr,
+    stop: CancellationToken,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    bind_runtime(
+        Runtime::Native(Box::new(NativeTarget { sandbox, journal })),
+        execution,
+        declaration,
+        verifier,
+        ingress,
+        target,
+        stop,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn bind_runtime(
+    driver: Runtime,
+    execution: ExecutionIdentity,
+    declaration: ServiceSpec,
+    verifier: Verifier,
+    ingress: Option<Ingress>,
+    target: SocketAddr,
+    stop: CancellationToken,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let control = declaration.endpoint_ref == "control" && declaration.id.service == "control";
     if !control && ingress.is_none() {
+        return Err(Error::InvalidContract);
+    }
+    // A native node holds no application credential to inject.
+    if matches!(driver, Runtime::Native(_))
+        && ingress.as_ref().is_some_and(|i| i.bearer_env.is_some())
+    {
         return Err(Error::InvalidContract);
     }
     let state = Arc::new(Service {
@@ -155,7 +238,12 @@ pub async fn bind(
             .map_err(|_| Error::Unavailable)?,
         slots: Arc::new(tokio::sync::Semaphore::new(if control { 4 } else { 64 })),
     });
-    let router = if control {
+    let native = matches!(state.driver, Runtime::Native(_));
+    let router = if control && native {
+        Router::new()
+            .route("/logs", get(logs))
+            .layer(DefaultBodyLimit::max(1024))
+    } else if control {
         Router::new()
             .route("/metadata", get(metadata))
             .route("/logs", get(logs))
@@ -190,6 +278,7 @@ async fn metadata(
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     service
         .driver
+        .docker()?
         .metadata(&service.execution)
         .await
         .map(Json)
@@ -207,6 +296,7 @@ async fn execute(
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     service
         .driver
+        .docker()?
         .execute(&service.execution, request, expires_at)
         .await
         .map(Json)
@@ -225,12 +315,18 @@ async fn logs(
         .slots
         .try_acquire()
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
-    service
-        .driver
-        .logs(&service.execution, query.tail, expires_at)
-        .await
-        .map(Json)
-        .map_err(failure)
+    match &service.driver {
+        Runtime::Docker(driver) => {
+            driver
+                .logs(&service.execution, query.tail, expires_at)
+                .await
+        }
+        Runtime::Native(target) => {
+            crate::openshell_network::logs(&target.sandbox, query.tail, expires_at).await
+        }
+    }
+    .map(Json)
+    .map_err(failure)
 }
 async fn restart(
     State(service): State<Arc<Service>>,
@@ -243,6 +339,7 @@ async fn restart(
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     service
         .driver
+        .docker()?
         .restart(&service.execution, expires_at)
         .await
         .map_err(failure)?;
@@ -294,12 +391,13 @@ async fn proxy(
             return Err(StatusCode::FORBIDDEN);
         }
     }
-    let metadata = service
-        .driver
-        .metadata(&service.execution)
-        .await
-        .map_err(failure)?;
     let bearer = if let Some(name) = &ingress.bearer_env {
+        let metadata = service
+            .driver
+            .docker()?
+            .metadata(&service.execution)
+            .await
+            .map_err(failure)?;
         let prefix = format!("{name}=");
         Some(
             metadata["environment"]
@@ -320,17 +418,32 @@ async fn proxy(
         return Err(StatusCode::FORBIDDEN);
     }
     if let Some(binding) = &grant.http_request {
-        if !service
-            .driver
-            .consume_http_request(
-                &service.execution,
-                &service.declaration.id.service,
-                &binding.id,
-                grant.exp,
-            )
-            .await
-            .map_err(failure)?
-        {
+        let consumed = match &service.driver {
+            Runtime::Docker(driver) => {
+                driver
+                    .consume_http_request(
+                        &service.execution,
+                        &service.declaration.id.service,
+                        &binding.id,
+                        grant.exp,
+                    )
+                    .await
+            }
+            Runtime::Native(target) => {
+                let key = trusted_rail::rego::commitment(
+                    "trusted-shim.native.http-request.v1",
+                    &(
+                        &service.execution,
+                        &service.declaration.id.service,
+                        &binding.id,
+                    ),
+                )
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                crate::docker::consume_once(target.journal.clone(), key, grant.exp).await
+            }
+        }
+        .map_err(failure)?;
+        if !consumed {
             return Err(StatusCode::CONFLICT);
         }
     }
@@ -340,6 +453,13 @@ async fn proxy(
     for name in ["content-type", "accept"] {
         if let Some(value) = parts.headers.get(name) {
             upstream = upstream.header(name, value);
+        }
+    }
+    // Native applications authenticate their callers themselves; the node holds
+    // no copy of their credentials. Docker keeps injecting its own bearer only.
+    if matches!(service.driver, Runtime::Native(_)) {
+        if let Some(value) = parts.headers.get("authorization") {
+            upstream = upstream.header("authorization", value);
         }
     }
     if let Some(bearer) = bearer {

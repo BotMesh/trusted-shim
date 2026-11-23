@@ -13,6 +13,11 @@ pub struct ServiceOptions {
     /// accept. Stock supervisor SSH acknowledges channels before target connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_tcp_banner: Option<String>,
+    /// Request-bound HTTP rules for `ingress:<service>` endpoints, from the
+    /// admitted manifest. Native rules never name a node-held bearer: the
+    /// application authenticates the caller's own `Authorization` itself.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
 }
 
 impl ServiceOptions {
@@ -28,7 +33,26 @@ impl ServiceOptions {
         }
         let value: Self = serde_json::from_value(request.driver_options.clone())
             .map_err(|_| Error::InvalidContract)?;
-        let protocol = &request.services[0].protocol;
+        // `control` is the optional logs-only management service, always HTTP.
+        let (control, application): (Vec<_>, Vec<_>) = request
+            .services
+            .iter()
+            .partition(|s| s.id.service == "control");
+        let protocol = &application.first().ok_or(Error::InvalidContract)?.protocol;
+        if control.len() > 1
+            || control
+                .iter()
+                .any(|s| s.endpoint_ref != "control" || s.protocol != Protocol::Http1)
+            || value.ingress.len() > 8
+            || value.ingress.iter().any(|(name, rule)| {
+                rule.validate().is_err()
+                    || rule.bearer_env.is_some()
+                    || *protocol != Protocol::Http1
+                    || !application.iter().any(|s| &s.id.service == name)
+            })
+        {
+            return Err(Error::InvalidContract);
+        }
         let health_valid = match protocol {
             Protocol::Http1 => value.health_tcp_banner.is_none(),
             Protocol::Tcp => {
@@ -55,9 +79,14 @@ impl ServiceOptions {
             || request.services.iter().any(|s| {
                 s.id.namespace != request.execution.namespace
                     || s.id.workload != request.execution.workload
-                    || s.endpoint_ref != "app"
-                    || &s.protocol != protocol
-                    || s.id.service == "control"
+                    || (s.id.service != "control"
+                        && (&s.protocol != protocol
+                            || s.endpoint_ref
+                                != if value.ingress.contains_key(&s.id.service) {
+                                    format!("ingress:{}", s.id.service)
+                                } else {
+                                    "app".into()
+                                }))
                     || s.id.service.is_empty()
                     || s.id.service.len() > 64
                     || !s

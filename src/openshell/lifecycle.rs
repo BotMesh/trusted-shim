@@ -428,6 +428,10 @@ impl ManagedNativeDriver {
         ))
     }
 
+    /// Durable single-use journal for this node's native request-bound ingress.
+    pub(crate) fn invocation_journal(&self) -> PathBuf {
+        self.state.join("native-http-invocations.sqlite")
+    }
     pub(crate) async fn network_lease(
         &self,
         execution: &ExecutionIdentity,

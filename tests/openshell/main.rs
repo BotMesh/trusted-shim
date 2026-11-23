@@ -203,6 +203,70 @@ fn native_tcp_services_bind_protocol_and_readiness_to_authorization() {
 }
 
 #[test]
+fn native_ingress_and_logs_control_are_admitted_only_as_declared() {
+    let (mut launch, sandbox, hash) = fixture();
+    launch.services = serde_json::from_value(serde_json::json!([
+        {"id":{"namespace":"test","workload":"agent","service":"chat"},"protocol":"http1","endpoint_ref":"ingress:chat"},
+        {"id":{"namespace":"test","workload":"agent","service":"api"},"protocol":"http1","endpoint_ref":"app"},
+        {"id":{"namespace":"test","workload":"agent","service":"control"},"protocol":"http1","endpoint_ref":"control"}
+    ]))
+    .unwrap();
+    launch.driver_options = serde_json::json!({"container_port":18789,"health_path":"/health",
+        "ingress":{"chat":{"paths":["/v1/chat/completions"],"methods":["POST"],"single_use":true}}});
+    let native = NativeCreate::decode(&sandbox.encode_to_vec(), &launch, &hash).unwrap();
+    let options = trusted_shim::openshell_services::ServiceOptions::from_request(&launch)
+        .unwrap()
+        .unwrap();
+    assert!(options.ingress["chat"].single_use && options.ingress["chat"].bearer_env.is_none());
+    // The rules are part of the authorized launch, not a later network choice.
+    let (authorization, _) = authorization(&launch, &native, "ingress");
+    native
+        .validate_authorization(&launch, &authorization)
+        .unwrap();
+    let mut widened = launch.clone();
+    widened.driver_options["ingress"]["chat"]["paths"] =
+        serde_json::json!(["/v1/chat/completions", "/admin"]);
+    assert!(native
+        .validate_authorization(&widened, &authorization)
+        .is_err());
+    for mutation in 0..10 {
+        let mut bad = launch.clone();
+        match mutation {
+            // A node holds no application credential to inject.
+            0 => {
+                bad.driver_options["ingress"]["chat"]["bearer_env"] =
+                    "OPENCLAW_GATEWAY_TOKEN".into()
+            }
+            1 => bad.services[0].endpoint_ref = "app".into(),
+            2 => bad.services[1].endpoint_ref = "ingress:api".into(),
+            3 => bad.services[2].endpoint_ref = "app".into(),
+            4 => bad.services[2].protocol = trusted_data_router::Protocol::Tcp,
+            5 => bad.services.push(bad.services[2].clone()),
+            6 => {
+                bad.driver_options["ingress"]["missing"] =
+                    bad.driver_options["ingress"]["chat"].clone()
+            }
+            7 => bad.driver_options["ingress"]["chat"]["paths"] = serde_json::json!(["/a/../b"]),
+            8 => bad.services.clear(),
+            _ => bad.services.drain(..2).for_each(drop),
+        }
+        assert!(
+            NativeCreate::decode(&sandbox.encode_to_vec(), &bad, &hash).is_err(),
+            "{mutation}"
+        );
+    }
+    // Ingress is HTTP only; logs-only control stays HTTP beside a TCP service.
+    let mut tcp = launch.clone();
+    tcp.services.remove(0);
+    tcp.services[0].protocol = trusted_data_router::Protocol::Tcp;
+    tcp.driver_options =
+        serde_json::json!({"container_port":22,"health_path":"/","health_tcp_banner":"SSH-2.0-"});
+    NativeCreate::decode(&sandbox.encode_to_vec(), &tcp, &hash).unwrap();
+    tcp.driver_options["ingress"] = serde_json::json!({"api":{"paths":["/"],"methods":["GET"]}});
+    assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &tcp, &hash).is_err());
+}
+
+#[test]
 fn control_observation_strips_native_credentials_endpoints_and_diagnostics() {
     let (_, mut s, _) = fixture();
     let status = s.status.as_mut().unwrap();
