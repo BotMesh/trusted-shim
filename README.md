@@ -446,7 +446,10 @@ number to `{binding,evidence}`. The guest commits the canonical witness SHA256
 only after all checks succeed. The consumer's expected commitment prevents a
 prover from substituting a weaker profile, an old clock input or another launch.
 `binding` covers mode, platform, complete measured profile, init-data, endpoint key,
-execution identity, launch-request digest, nonce and expiry. The guest checks that
+execution identity, launch-request digest, nonce and expiry. The launch request
+carries its `limits`, so the digest covers the CPU and memory limits and the CPU
+weight the workload is admitted with; the inner Docker driver refuses a container
+whose `HostConfig` differs from them. The guest checks that
 collateral remains valid through that expiry; shim checks its clock again before
 creation. Legacy profiles keep `{binding,evidence_sha256}` public values and require
 their own approved guest. No SNP hardware guest is shipped yet.
@@ -515,7 +518,8 @@ the upstream extension contract and checks the operator's resource admission
 policy and CPU/memory limit capabilities. `NativeCreate` binds the native policy
 hash, namespace/workspace, image, command, environment and hard limits to the
 approved launch inputs. Fleet/Ray own resource requests; the native Docker
-driver receives only hard limits because it rejects resource request fields. Unmapped identity, namespace and platform options fail closed.
+driver receives only hard limits because it rejects resource request fields. It has
+no CPU weight, so a launch that sets `limits.cpu_shares` is refused. Unmapped identity, namespace and platform options fail closed.
 
 GPUs and durable storage are `LaunchRequest.gpus` / `LaunchRequest.mounts`
 (omitted when empty, so existing launch commitments are unchanged). Fleet binds
@@ -787,6 +791,17 @@ settings. Environment is passed in a mode-0600 temporary env file, never argv;
 multiline env values are rejected. Local host administrators and Docker owners
 remain trusted.
 
+`limits.cpu_shares` is an optional relative CPU weight: Docker's `--cpu-shares`,
+which becomes cgroup v2 `cpu.weight`. It is not a cap. Under contention, CPU is
+divided in proportion to weight, so a workload with a low weight gets a small
+share next to workloads at the default weight of 1024, and otherwise uses what
+they leave idle. Values must be within Docker's 2–262144; others are rejected,
+not clamped. Without the field, no flag is passed and Docker reports
+`CpuShares` 0. Like the hard limits, the weight requires daemon support, is
+checked before start, on inspect and on resume, and is reported back in the
+status limits. An absent weight is not serialized, so a request without it keeps
+its digest. The daemon and `--capabilities` advertise `runtime-cpu-shares-v1`.
+
 Each allocation has an exclusive file lock, atomically fsynced journal and Docker
 ownership labels binding the complete request and execution. Recovery reuses the
 same container; changed requests, stale leases and generations are rejected.
@@ -811,7 +826,7 @@ docker pull alpine:3.21
 cargo test --locked --test docker -- --ignored
 ```
 
-It covers concurrent idempotent launch, hard limits, process recovery, request
+It covers concurrent idempotent launch, hard limits, the CPU weight, process recovery, request
 substitution, stale cleanup, tombstones and refusal to recreate a lost execution.
 
 ## Outbound service connections
