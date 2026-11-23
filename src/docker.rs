@@ -1124,3 +1124,55 @@ impl RuntimeDriver for DockerDriver {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(limits: Value) -> LaunchRequest {
+        serde_json::from_value(json!({
+            "execution": {"namespace":"test", "workload":"docker", "allocation_id":"unit",
+                "lease_id":"one", "generation":1, "node_id":"test-node"},
+            "driver":"docker", "image":"alpine:3.21", "command":["sleep","300"],
+            "environment":{}, "limits":limits,
+            "policy":{"issuer":"test","policy_id":"no-policy-claim","version":0,"sha256":""},
+            "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required",
+                "attestation_proof":"not_required"},
+            "services":[], "driver_options":{"stop_timeout_s":1}
+        }))
+        .unwrap()
+    }
+
+    fn record(request: &LaunchRequest) -> Record {
+        Record {
+            execution: request.execution.clone(),
+            request_sha256: hash(request).unwrap(),
+            limits: request.limits.clone(),
+            phase: Phase::Running,
+            stop_timeout_s: 1,
+            port: None,
+            allocated_port: false,
+            services: Vec::new(),
+            ingress: Default::default(),
+        }
+    }
+
+    /// The digest in the journal and the `trusted-shim.request` label. A launch
+    /// replays only while it is unchanged.
+    #[test]
+    fn replay_identity_of_an_unchanged_request_is_stable() {
+        let r = request(json!({"cpu_millicores":250,"memory_bytes":33554432}));
+        assert_eq!(
+            hash(&r).unwrap(),
+            "dd4e15c723fe2f6c7d1ea97a7df6244b273aab7a5122ed5588f1557ec04f389d"
+        );
+        let journal = serde_json::to_vec(&record(&r)).unwrap();
+        let value: Value = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(
+            value["limits"],
+            json!({"cpu_millicores":250,"memory_bytes":33554432})
+        );
+        let loaded: Record = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(serde_json::to_vec(&loaded).unwrap(), journal);
+    }
+}

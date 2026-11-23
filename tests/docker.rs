@@ -59,6 +59,33 @@ async fn unsupported_trust_and_driver_requirements_never_create_state() {
     assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
 }
 
+/// The Docker journal and label digest, the TEE binding and the policy grant
+/// digest all serialize the launch request. A request that sets none of the
+/// optional fields keeps these exact bytes, so existing allocations replay.
+#[test]
+fn launch_request_without_optional_fields_keeps_its_serialized_form() {
+    let mut r = request("pinned");
+    let bytes = serde_json::to_vec(&r).unwrap();
+    assert_eq!(
+        serde_json::to_value(&r).unwrap()["limits"],
+        json!({"cpu_millicores":250,"memory_bytes":33554432})
+    );
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&bytes)),
+        "a22f1177d8efd59ac9e4a4493e2fa6b88317dcfb77f621d4e00227313e3f2675"
+    );
+    r.limits.cpu_millicores = None;
+    r.limits.memory_bytes = None;
+    assert_eq!(
+        serde_json::to_value(&r).unwrap()["limits"],
+        json!({"cpu_millicores":null,"memory_bytes":null})
+    );
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(serde_json::to_vec(&r).unwrap())),
+        "370b3ff5d498a3fe5cb5bedf0105762231ee3a2aeeba95b01747fa00a1a01263"
+    );
+}
+
 fn inspect(name: &str) -> serde_json::Value {
     let out = Command::new("/usr/bin/docker")
         .args(["--host=unix:///var/run/docker.sock", "inspect", name])
