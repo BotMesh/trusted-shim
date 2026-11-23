@@ -3,7 +3,9 @@
 use crate::{
     attestation::AttestationRequirement,
     proof::ProofRequirement,
-    runtime::{LaunchRequest, ResourceLimits, RuntimeDriver, RuntimeState, RuntimeStatus},
+    runtime::{
+        ExitStatus, LaunchRequest, ResourceLimits, RuntimeDriver, RuntimeState, RuntimeStatus,
+    },
     Error, Result,
 };
 use async_trait::async_trait;
@@ -38,6 +40,12 @@ pub struct DockerOptions {
     pub stop_timeout_s: Option<u32>,
     /// HTTP surfaces approved in the existing application manifest.
     pub ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
+    /// A run that ends when its process exits, such as a batch job. It has
+    /// no port or services, and its container is never started again: not by
+    /// `resume`, and not by a replayed launch. It is kept, with its exit
+    /// status and logs, until `delete`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub run_to_completion: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -66,6 +74,9 @@ struct Record {
     services: Vec<trusted_data_router::ServiceSpec>,
     #[serde(default)]
     ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
+    /// Omitted when false, so existing journals keep their bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    run_to_completion: bool,
 }
 
 /// Private state must survive upgrades, deletion and restart. A tombstone fences
@@ -485,7 +496,9 @@ impl DockerDriver {
         execution: &ExecutionIdentity,
     ) -> Result<(Record, Value)> {
         let record = self.owned(slot, execution)?;
-        if record.phase != Phase::Running {
+        // A run to completion ends when its process does; a retry is a new
+        // execution.
+        if record.phase != Phase::Running || record.run_to_completion {
             return Err(Error::Ownership);
         }
         let container = Self::container(slot, &record)
@@ -758,12 +771,27 @@ impl DockerDriver {
         if matches!(r.phase, Phase::Stopped | Phase::Deleted) && state == RuntimeState::Ready {
             state = RuntimeState::Stopping;
         }
+        let exit = container
+            .filter(|_| state == RuntimeState::Stopped)
+            .and_then(Self::exit);
         Ok(RuntimeStatus {
             execution: r.execution.clone(),
             runtime_id: Self::name(slot),
             state,
             effective_limits,
             port: r.port,
+            exit,
+        })
+    }
+
+    /// An exited container's exit status, from `docker inspect`.
+    fn exit(container: &Value) -> Option<ExitStatus> {
+        let state = &container["State"];
+        Some(ExitStatus {
+            code: state["ExitCode"].as_i64()?,
+            oom_killed: state["OOMKilled"].as_bool()?,
+            started_at: state["StartedAt"].as_str()?.to_owned(),
+            finished_at: state["FinishedAt"].as_str()?.to_owned(),
         })
     }
 
@@ -826,6 +854,15 @@ impl DockerDriver {
                 .volumes
                 .iter()
                 .any(|s| !s.starts_with('/') || !s.contains(":"))
+        {
+            return Err(Error::InvalidContract);
+        }
+        // A run to completion is reached by nothing: it ends on its own.
+        if options.run_to_completion
+            && (options.port.is_some()
+                || options.container_port.is_some()
+                || !options.ingress.is_empty()
+                || !request.services.is_empty())
         {
             return Err(Error::InvalidContract);
         }
@@ -974,6 +1011,7 @@ impl RuntimeDriver for DockerDriver {
                     allocated_port: options.port == Some(0),
                     services: request.services.clone(),
                     ingress: options.ingress.clone(),
+                    run_to_completion: options.run_to_completion,
                 };
                 self.save(&slot, &r)?;
                 r
@@ -1099,6 +1137,7 @@ impl RuntimeDriver for DockerDriver {
                 allocated_port: false,
                 services: Vec::new(),
                 ingress: Default::default(),
+                run_to_completion: false,
             },
         };
         let _network = self.drain_network(execution).await?;
@@ -1122,5 +1161,116 @@ impl RuntimeDriver for DockerDriver {
         }
         self.release_port(&r)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn request(driver_options: Value, services: Value) -> LaunchRequest {
+        serde_json::from_value(json!({
+            "execution": {"namespace":"test", "workload":"docker", "allocation_id":"unit",
+                "lease_id":"one", "generation":1, "node_id":"test-node"},
+            "driver":"docker", "image":"alpine:3.21", "command":["true"],
+            "environment":{}, "limits":{"cpu_millicores":250,"memory_bytes":33554432},
+            "policy":{"issuer":"test","policy_id":"no-policy-claim","version":0,"sha256":""},
+            "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required",
+                "attestation_proof":"not_required"},
+            "services":services, "driver_options":driver_options
+        }))
+        .unwrap()
+    }
+
+    fn record(run_to_completion: bool) -> Record {
+        let r = request(json!({}), json!([]));
+        Record {
+            execution: r.execution.clone(),
+            request_sha256: hash(&r).unwrap(),
+            limits: r.limits.clone(),
+            phase: Phase::Running,
+            stop_timeout_s: 1,
+            port: None,
+            allocated_port: false,
+            services: Vec::new(),
+            ingress: Default::default(),
+            run_to_completion,
+        }
+    }
+
+    fn container(state: Value) -> Value {
+        json!({"State":state,"HostConfig":{"NanoCpus":250_000_000u64,
+            "Memory":33_554_432u64,"MemorySwap":33_554_432u64}})
+    }
+
+    #[test]
+    fn an_exited_container_reports_how_it_ended() {
+        let exited = container(json!({"Status":"exited","ExitCode":137,"OOMKilled":true,
+            "StartedAt":"2026-11-23T10:00:00.1Z","FinishedAt":"2026-11-23T10:05:00.2Z"}));
+        let status = DockerDriver::status("slot", &record(false), Some(&exited)).unwrap();
+        assert_eq!(status.state, RuntimeState::Stopped);
+        assert_eq!(
+            status.exit,
+            Some(ExitStatus {
+                code: 137,
+                oom_killed: true,
+                started_at: "2026-11-23T10:00:00.1Z".into(),
+                finished_at: "2026-11-23T10:05:00.2Z".into(),
+            })
+        );
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire["exit"],
+            json!({"code":137,"oom_killed":true,"started_at":"2026-11-23T10:00:00.1Z",
+                "finished_at":"2026-11-23T10:05:00.2Z"})
+        );
+
+        // A process that hasn't ended has no exit status, and the field is
+        // left out, so a status reads as it did.
+        for state in [
+            json!({"Status":"running","ExitCode":0,"OOMKilled":false,
+                "StartedAt":"2026-11-23T10:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}),
+            json!({"Status":"created","ExitCode":0,"OOMKilled":false,
+                "StartedAt":"0001-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}),
+        ] {
+            let status =
+                DockerDriver::status("slot", &record(false), Some(&container(state))).unwrap();
+            assert_eq!(status.exit, None);
+            assert!(serde_json::to_value(&status).unwrap().get("exit").is_none());
+        }
+        let missing = DockerDriver::status("slot", &record(false), None).unwrap();
+        assert_eq!(missing.exit, None);
+        let incomplete = container(json!({"Status":"exited","ExitCode":1}));
+        let status = DockerDriver::status("slot", &record(false), Some(&incomplete)).unwrap();
+        assert_eq!(status.exit, None);
+    }
+
+    #[test]
+    fn a_run_to_completion_has_no_surface_and_keeps_other_journals_unchanged() {
+        DockerDriver::options(&request(json!({"run_to_completion":true}), json!([]))).unwrap();
+        let app = json!([{"id":{"namespace":"test","workload":"docker","service":"app"},
+            "endpoint_ref":"app","protocol":"http1"}]);
+        for (options, services) in [
+            (json!({"run_to_completion":true,"port":8080}), app.clone()),
+            (json!({"run_to_completion":true,"port":8080}), json!([])),
+            (
+                json!({"run_to_completion":true,"port":0,"container_port":8080}),
+                json!([]),
+            ),
+            (json!({"run_to_completion":true}), app),
+        ] {
+            assert!(matches!(
+                DockerDriver::options(&request(options, services)),
+                Err(Error::InvalidContract)
+            ));
+        }
+        assert!(serde_json::to_value(record(false))
+            .unwrap()
+            .get("run_to_completion")
+            .is_none());
+        assert_eq!(
+            serde_json::to_value(record(true)).unwrap()["run_to_completion"],
+            true
+        );
     }
 }

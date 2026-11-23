@@ -93,6 +93,8 @@ uses only what a node advertises.
 | `runtime-management-v1` | The administrator `control` service: metadata, logs, exec, restart |
 | `single-use-ingress-v1` | Ingress rules with `single_use: true` |
 | `runtime-resume-v1` | `resume` for Docker runtimes |
+| `runtime-exit-status-v1` | `exit`: how an exited container's process ended, including an OOM kill |
+| `runtime-run-to-completion-v1` | `driver_options.run_to_completion`: a run that ends with its process, such as a batch job |
 | `openshell-access-v1` | The OpenShell access layer |
 | `tee-startup-v1` | This node has a TEE driver |
 | `runtime-resume-tee-v1` | `resume` for TEE runtimes, behind a fresh admission |

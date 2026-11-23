@@ -39,6 +39,15 @@ file rather than the command line, and ports bind host loopback only. Plain
 Docker is not a policy boundary for an agent's shell, so requests that need a
 policy proof or attestation are refused on this path rather than downgraded.
 
+### Runs to completion
+
+A batch job is a run to completion: it has no port or services, and it ends when
+its process does. Its container is never started again, not by `resume` and not
+by a replayed launch, so each retry is a new execution that Fleet schedules. The
+container is kept until `delete`, so Fleet can still read how it ended (its exit
+code, whether the OOM killer ended it, and when) and collect its logs. Any
+runtime reports that exit status once its process has ended.
+
 ### Resume after a crash
 
 A crashed container keeps its writable layer. Fleet can therefore ask shim to
