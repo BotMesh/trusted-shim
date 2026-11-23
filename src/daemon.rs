@@ -91,7 +91,8 @@ pub enum Command {
         #[serde(default)]
         driver: DriverKind,
     },
-    /// Starts an exited Docker runtime again in place; see `DockerDriver::resume`.
+    /// Starts an exited runtime again in place; see `DockerDriver::resume`, and
+    /// `TeeDriver::resume` for a TEE runtime, which is admitted afresh first.
     Resume {
         execution: ExecutionIdentity,
         #[serde(default)]
@@ -370,6 +371,10 @@ impl Daemon {
                         .as_array_mut()
                         .unwrap()
                         .push(json!("tee-startup-v1"));
+                    value["features"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("runtime-resume-tee-v1"));
                 }
                 value["pid"] = json!(std::process::id());
                 Ok(value)
@@ -457,16 +462,17 @@ impl Daemon {
                 .map_err(|_| Error::InvalidContract)
             }
             Command::Resume { execution, driver } => {
-                // Docker only: a TEE runtime would need fresh attestation, and
-                // native OpenShell lifecycle stays a Fleet allocation operation.
-                if !matches!(
-                    self.lifecycle_driver(&execution, driver)?,
-                    DriverKind::Docker
-                ) {
-                    return Err(Error::Unsupported);
-                }
-                serde_json::to_value(self.docker()?.resume(&execution).await?)
-                    .map_err(|_| Error::InvalidContract)
+                // Native OpenShell lifecycle stays a Fleet allocation operation.
+                // A TEE restart is admitted afresh and can take the admission's
+                // whole budget; it continues if the caller stops waiting.
+                let status = match self.lifecycle_driver(&execution, driver)? {
+                    DriverKind::Docker => self.docker()?.resume(&execution).await?,
+                    DriverKind::Tee | DriverKind::TeeSimulation => {
+                        self.tee(driver)?.resume(&execution).await?
+                    }
+                    DriverKind::LegacyOpenShell => return Err(Error::Unsupported),
+                };
+                serde_json::to_value(status).map_err(|_| Error::InvalidContract)
             }
             Command::Stop { execution, driver } => {
                 match self.lifecycle_driver(&execution, driver)? {

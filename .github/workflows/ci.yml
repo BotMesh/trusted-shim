@@ -40,7 +40,7 @@ jobs:
           docker pull alpine:3.21
           cargo test --locked --test docker -- --ignored
           cargo test --locked --test daemon -- --ignored
-          cargo test --locked --all-features --test tee simulated_startup -- --ignored
+          cargo test --locked --all-features --test tee simulated_ -- --ignored
           docker pull python:3.12-slim
           cargo test --locked --test data_plane -- --ignored
           cargo test --locked --test management -- --ignored

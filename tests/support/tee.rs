@@ -171,6 +171,10 @@ impl Lab {
 pub(crate) struct ProofDouble {
     pub(crate) submitted: AtomicUsize,
     pub(crate) fail_submit: AtomicBool,
+    /// Every submitted proof fails.
+    pub(crate) fail_proof: AtomicBool,
+    /// Submitted proofs stay pending while set.
+    pub(crate) hold: AtomicBool,
     public: Mutex<Option<(String, Vec<u8>)>>,
 }
 #[async_trait]
@@ -192,6 +196,12 @@ impl ProofNetwork for ProofDouble {
     async fn status(&self, id: &str) -> Result<ProofStatus> {
         let (job_id, bytes) = self.public.lock().unwrap().clone().unwrap();
         assert_eq!(id, job_id);
+        if self.hold.load(Ordering::SeqCst) {
+            return Ok(ProofStatus::Pending);
+        }
+        if self.fail_proof.load(Ordering::SeqCst) {
+            return Ok(ProofStatus::Failed);
+        }
         Ok(ProofStatus::Complete(ProofReceipt {
             job_id,
             encoded_receipt: bytes,

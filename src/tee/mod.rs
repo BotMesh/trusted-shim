@@ -5,7 +5,7 @@ use crate::{
     contracts::{ExecutionIdentity, ProofKind},
     docker::DockerDriver,
     proof::*,
-    runtime::{LaunchRequest, RuntimeDriver, RuntimeStatus},
+    runtime::{LaunchRequest, RuntimeDriver, RuntimeState, RuntimeStatus},
     Error, Result,
 };
 pub mod trustee;
@@ -206,6 +206,16 @@ struct Pending {
     authorized: bool,
 }
 
+/// The admission an in-place restart is on. `used` is set before the container
+/// is started, so one admission never starts it twice; the next restart then
+/// claims a new one.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Starts {
+    start: u64,
+    used: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DcapPending {
@@ -335,13 +345,24 @@ impl AttestationGate {
     pub fn driver(&self) -> &'static str {
         self.config.driver()
     }
-    fn path(&self, execution: &ExecutionIdentity) -> Result<PathBuf> {
-        Ok(self.state.join(format!("{}.json", digest(execution)?)))
+    /// The admission record of an execution's `start`: 0 is its launch, each
+    /// in-place restart after it has the next number and its own nonce.
+    fn path(&self, execution: &ExecutionIdentity, start: u64) -> Result<PathBuf> {
+        let id = digest(execution)?;
+        Ok(self.state.join(match start {
+            0 => format!("{id}.json"),
+            n => format!("{id}.start-{n}.json"),
+        }))
     }
-    fn save(&self, path: &Path, pending: &Pending) -> Result<()> {
+    fn starts_path(&self, execution: &ExecutionIdentity) -> Result<PathBuf> {
+        Ok(self
+            .state
+            .join(format!("{}.starts.json", digest(execution)?)))
+    }
+    fn save(&self, path: &Path, value: &impl Serialize) -> Result<()> {
         let mut file =
             tempfile::NamedTempFile::new_in(&self.state).map_err(|_| Error::Unavailable)?;
-        file.write_all(&serde_json::to_vec(pending).map_err(|_| Error::InvalidContract)?)
+        file.write_all(&serde_json::to_vec(value).map_err(|_| Error::InvalidContract)?)
             .map_err(|_| Error::Unavailable)?;
         file.as_file().sync_all().map_err(|_| Error::Unavailable)?;
         file.persist(path).map_err(|_| Error::Unavailable)?;
@@ -390,19 +411,120 @@ impl AttestationGate {
         execution: &ExecutionIdentity,
         operation: &(impl Serialize + Sync),
     ) -> Result<AttestationAdmission> {
+        self.authorize_start(execution, 0, digest(operation)?).await
+    }
+
+    /// Admits one start of an execution whose launch bound `request_sha256`.
+    /// Each start has its own record, so a restart gets fresh evidence and a
+    /// proof of its own; the binding format the guest verifies is unchanged.
+    pub(crate) async fn authorize_start(
+        &self,
+        execution: &ExecutionIdentity,
+        start: u64,
+        request_sha256: String,
+    ) -> Result<AttestationAdmission> {
+        // The budget starts once this node's single admission slot is held, so
+        // waiting behind another admission does not use it up.
+        let _serial = self.serial.lock().await;
         tokio::time::timeout(
             Duration::from_secs(300),
-            self.authorize_inner(execution, digest(operation)?),
+            self.authorize_inner(execution, start, request_sha256),
         )
         .await
         .map_err(|_| Error::Unavailable)?
     }
+
+    /// The request an execution's launch was admitted with, under this same
+    /// configuration. A restart is admitted for exactly that request. After any
+    /// change to the TEE configuration, the launch's admission no longer
+    /// matches, so a crashed runtime stays down until it is launched again.
+    pub(crate) fn launched_request(&self, execution: &ExecutionIdentity) -> Result<String> {
+        let pending = self
+            .read_pending(&self.path(execution, 0)?)?
+            .ok_or(Error::Ownership)?;
+        if !pending.authorized
+            || pending.binding.execution != *execution
+            || pending.config_sha256 != digest(&self.config)?
+        {
+            return Err(Error::Untrusted);
+        }
+        Ok(pending.binding.request_sha256)
+    }
+
+    /// The start a restart is admitted under. It continues the current one
+    /// while that is unused and its admission can still complete, so a
+    /// retried or interrupted restart resumes the same proof instead of
+    /// submitting another; otherwise it durably claims the next number.
+    pub(crate) async fn claim_start(&self, execution: &ExecutionIdentity) -> Result<u64> {
+        let _serial = self.serial.lock().await;
+        let path = self.starts_path(execution)?;
+        let current = self.read_starts(&path)?;
+        if let Some(Starts { start, used: false }) = current {
+            match self.read_pending(&self.path(execution, start)?)? {
+                None => return Ok(start),
+                Some(pending) if now()? < pending.binding.expires_at => return Ok(start),
+                Some(_) => (),
+            }
+        }
+        let start = current
+            .as_ref()
+            .map_or(Some(1), |c| c.start.checked_add(1))
+            .ok_or(Error::InvalidContract)?;
+        // The previous restart's admission is spent or expired: remove it, so an
+        // execution keeps at most one, however often it crashes. Removing it
+        // first is safe: if the counter is not advanced, that start is claimed
+        // again with a new record and a new nonce.
+        if let Some(previous) = &current {
+            match std::fs::remove_file(self.path(execution, previous.start)?) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(_) => return Err(Error::Unavailable),
+            }
+        }
+        self.save(&path, &Starts { start, used: false })?;
+        Ok(start)
+    }
+
+    /// Spends an admitted start immediately before its container is started.
+    /// A start that fails after this point is never retried with the same
+    /// admission.
+    pub(crate) async fn use_start(&self, execution: &ExecutionIdentity, start: u64) -> Result<()> {
+        let _serial = self.serial.lock().await;
+        let path = self.starts_path(execution)?;
+        match self.read_starts(&path)? {
+            Some(Starts {
+                start: s,
+                used: false,
+            }) if s == start => self.save(&path, &Starts { start, used: true }),
+            _ => Err(Error::Ownership),
+        }
+    }
+
+    fn read_starts(&self, path: &Path) -> Result<Option<Starts>> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|_| Error::InvalidContract),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(Error::Unavailable),
+        }
+    }
+    fn read_pending(&self, path: &Path) -> Result<Option<Pending>> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|_| Error::InvalidContract),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(Error::Unavailable),
+        }
+    }
+
     async fn authorize_inner(
         &self,
         execution: &ExecutionIdentity,
+        start: u64,
         request_sha256: String,
     ) -> Result<AttestationAdmission> {
-        let _serial = self.serial.lock().await;
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -411,7 +533,7 @@ impl AttestationGate {
             .open(self.state.join("launch.lock"))
             .map_err(|_| Error::Unavailable)?;
         lock.try_lock_exclusive().map_err(|_| Error::Ownership)?;
-        let path = self.path(execution)?;
+        let path = self.path(execution, start)?;
         let config_sha256 = digest(&self.config)?;
         let mut pending: Pending = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| Error::InvalidContract)?,
@@ -561,6 +683,18 @@ impl AttestationGate {
 pub struct TeeDriver {
     gate: AttestationGate,
     backend: DockerDriver,
+    /// Executions whose in-place restart is being admitted.
+    resuming: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// Holds an execution's place in `TeeDriver::resuming` until its restart ends.
+struct Resuming<'a>(&'a TeeDriver, String);
+impl Drop for Resuming<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.0.resuming.lock() {
+            set.remove(&self.1);
+        }
+    }
 }
 impl TeeDriver {
     pub fn new(
@@ -576,6 +710,7 @@ impl TeeDriver {
         Ok(Self {
             backend: DockerDriver::new(gate.state.join("runtime"), node)?,
             gate,
+            resuming: Default::default(),
         })
     }
     #[cfg(feature = "ziren")]
@@ -584,6 +719,7 @@ impl TeeDriver {
         Ok(Self {
             backend: DockerDriver::new(gate.state.join("runtime"), node)?,
             gate,
+            resuming: Default::default(),
         })
     }
     pub fn driver(&self) -> &'static str {
@@ -632,6 +768,48 @@ impl TeeDriver {
         }
         self.launch_admitted(request).await
     }
+
+    /// Starts a Running allocation's own exited container again in place, as
+    /// `DockerDriver::resume` does, but only behind a fresh admission: new
+    /// evidence and a verified proof for the request the launch was admitted
+    /// with. Nothing about the workload can change on a restart.
+    ///
+    /// The admission runs without the slot's lock, so `inspect` stays
+    /// responsive and reports `starting`; a stop or delete during it is final,
+    /// because the start re-checks the allocation under that lock. A failed or
+    /// expired admission leaves the container stopped. One restart runs at a
+    /// time per execution: a concurrent call reports the current status.
+    /// A restart requires the TEE configuration the launch was admitted under;
+    /// see `AttestationGate::launched_request`.
+    pub async fn resume(&self, execution: &ExecutionIdentity) -> Result<RuntimeStatus> {
+        let key = digest(execution)?;
+        if !self
+            .resuming
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .insert(key.clone())
+        {
+            return self.inspect(execution).await;
+        }
+        let _resuming = Resuming(self, key);
+        // Only the admission is timed. Nothing cancels the restart once its
+        // start is spent, so an admission is never wasted on a timeout.
+        self.resume_inner(execution).await
+    }
+
+    async fn resume_inner(&self, execution: &ExecutionIdentity) -> Result<RuntimeStatus> {
+        if let Some(status) = self.backend.resume_status(execution).await? {
+            return Ok(status);
+        }
+        let request_sha256 = self.gate.launched_request(execution)?;
+        let start = self.gate.claim_start(execution).await?;
+        self.gate
+            .authorize_start(execution, start, request_sha256)
+            .await?
+            .ensure_fresh()?;
+        self.gate.use_start(execution, start).await?;
+        self.backend.resume(execution).await
+    }
 }
 #[async_trait]
 impl RuntimeDriver for TeeDriver {
@@ -641,7 +819,17 @@ impl RuntimeDriver for TeeDriver {
             .map_err(|_| Error::Unavailable)?
     }
     async fn inspect(&self, execution: &ExecutionIdentity) -> Result<RuntimeStatus> {
-        self.backend.inspect(execution).await
+        let mut status = self.backend.inspect(execution).await?;
+        if status.state == RuntimeState::Stopped
+            && self
+                .resuming
+                .lock()
+                .map_err(|_| Error::Unavailable)?
+                .contains(&digest(execution)?)
+        {
+            status.state = RuntimeState::Starting;
+        }
+        Ok(status)
     }
     async fn stop(&self, execution: &ExecutionIdentity) -> Result<()> {
         self.backend.stop(execution).await

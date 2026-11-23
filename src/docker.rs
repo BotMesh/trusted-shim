@@ -451,13 +451,7 @@ impl DockerDriver {
     pub async fn resume(&self, execution: &ExecutionIdentity) -> Result<RuntimeStatus> {
         let slot = self.slot(execution)?;
         let _lock = self.lock(&slot).await?;
-        let record = self.owned(&slot, execution)?;
-        if record.phase != Phase::Running {
-            return Err(Error::Ownership);
-        }
-        let container = Self::container(&slot, &record)
-            .await?
-            .ok_or(Error::Ownership)?;
+        let (record, container) = self.resumable(&slot, execution).await?;
         // Re-checks the committed limits before anything is started again.
         if Self::status(&slot, &record, Some(&container))?.state == RuntimeState::Stopped {
             Self::docker(&["start".into(), Self::name(&slot)]).await?;
@@ -467,6 +461,37 @@ impl DockerDriver {
             &record,
             Self::container(&slot, &record).await?.as_ref(),
         )
+    }
+
+    /// What `resume` would do, without doing it: `None` when it would start the
+    /// exited container, otherwise the status it would leave unchanged. It
+    /// applies the same checks, so a TEE resume admits only what `resume` starts.
+    pub(crate) async fn resume_status(
+        &self,
+        execution: &ExecutionIdentity,
+    ) -> Result<Option<RuntimeStatus>> {
+        let slot = self.slot(execution)?;
+        let _lock = self.lock(&slot).await?;
+        let (record, container) = self.resumable(&slot, execution).await?;
+        let status = Self::status(&slot, &record, Some(&container))?;
+        Ok((status.state != RuntimeState::Stopped).then_some(status))
+    }
+
+    /// A Running allocation's own record and existing container. Called with
+    /// the slot's lock held.
+    async fn resumable(
+        &self,
+        slot: &str,
+        execution: &ExecutionIdentity,
+    ) -> Result<(Record, Value)> {
+        let record = self.owned(slot, execution)?;
+        if record.phase != Phase::Running {
+            return Err(Error::Ownership);
+        }
+        let container = Self::container(slot, &record)
+            .await?
+            .ok_or(Error::Ownership)?;
+        Ok((record, container))
     }
 
     fn network_paths(&self, execution: &ExecutionIdentity) -> Result<(PathBuf, PathBuf)> {
