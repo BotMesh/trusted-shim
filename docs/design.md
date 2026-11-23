@@ -53,6 +53,17 @@ lock, so `inspect` reports `stopping` meanwhile and nothing queues behind it. Th
 container is stopped by its id, which never names a later generation's
 container. Delete removes a container that outlasts its grace period.
 
+### Networks
+
+A container is on Docker's default bridge network unless its launch chooses
+another. `none` leaves it loopback only, with no egress, port or services, for a
+job that needs no network. `host` puts it in the host's own network namespace,
+where it listens on its port itself and can reach every service on the host,
+loopback included, so only a trusted workload should get it. A TEE runtime
+refuses `host`: in the confidential VM it would reach the attestation agent,
+which serves evidence on loopback. A chosen network is part of the committed
+launch, and inspect refuses a container whose network differs.
+
 ### Resume after a crash
 
 A crashed container keeps its writable layer. Fleet can therefore ask shim to
