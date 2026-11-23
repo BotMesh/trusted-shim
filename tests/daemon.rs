@@ -154,6 +154,37 @@ async fn disconnected_client_and_daemon_restart_do_not_restart_the_container() {
     }
     assert_eq!(call(&socket, launch).await, status);
     assert_eq!(snapshot(), before);
+    // Only the supervisor's explicit resume brings a crashed runtime back.
+    let resume = envelope(json!({"operation":"resume","execution":execution}));
+    assert_eq!(
+        call(&socket, resume.clone()).await["result"]["state"],
+        "ready"
+    );
+    assert_eq!(snapshot(), before);
+    assert!(std::process::Command::new("docker")
+        .args(["kill", &name])
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        call(&socket, inspect.clone()).await["result"]["state"],
+        "stopped"
+    );
+    assert_eq!(
+        call(&socket, resume.clone()).await["result"]["state"],
+        "ready"
+    );
+    assert_eq!(snapshot()["Running"], true);
+    assert_eq!(
+        call(
+            &socket,
+            envelope(json!({"operation":"stop","execution":execution}))
+        )
+        .await["result"]["stopped"],
+        true
+    );
+    assert!(call(&socket, resume).await.get("error").is_some());
+    assert_eq!(snapshot()["Running"], false);
     assert_eq!(
         call(
             &socket,
