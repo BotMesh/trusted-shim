@@ -42,6 +42,16 @@ async fn private_protocol_survives_clients_and_rejects_incompatible_takeover() {
     let request = json!({"protocol":1,"node_id":"node-one","command":{"operation":"capabilities"}});
     let before = call(&socket, request.clone()).await;
     assert_eq!(before["result"]["protocol"], 1);
+    // Fleet resumes a crashed runtime only where the daemon advertises it.
+    assert!(before["result"]["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runtime-resume-v1")));
+    // Resume is Docker-only: a TEE runtime is never restarted without attestation.
+    let tee_resume = json!({"protocol":1,"node_id":"node-one","command":{"operation":"resume",
+        "execution":{"namespace":"test","workload":"daemon","allocation_id":"tee","lease_id":"one",
+            "generation":1,"node_id":"node-one"},"driver":"tee"}});
+    assert!(call(&socket, tee_resume).await.get("error").is_some());
     assert!(
         trusted_shim::daemon::serve(&state, "node-one".into(), CancellationToken::new())
             .await
@@ -144,6 +154,37 @@ async fn disconnected_client_and_daemon_restart_do_not_restart_the_container() {
     }
     assert_eq!(call(&socket, launch).await, status);
     assert_eq!(snapshot(), before);
+    // Only the supervisor's explicit resume brings a crashed runtime back.
+    let resume = envelope(json!({"operation":"resume","execution":execution}));
+    assert_eq!(
+        call(&socket, resume.clone()).await["result"]["state"],
+        "ready"
+    );
+    assert_eq!(snapshot(), before);
+    assert!(std::process::Command::new("docker")
+        .args(["kill", &name])
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        call(&socket, inspect.clone()).await["result"]["state"],
+        "stopped"
+    );
+    assert_eq!(
+        call(&socket, resume.clone()).await["result"]["state"],
+        "ready"
+    );
+    assert_eq!(snapshot()["Running"], true);
+    assert_eq!(
+        call(
+            &socket,
+            envelope(json!({"operation":"stop","execution":execution}))
+        )
+        .await["result"]["stopped"],
+        true
+    );
+    assert!(call(&socket, resume).await.get("error").is_some());
+    assert_eq!(snapshot()["Running"], false);
     assert_eq!(
         call(
             &socket,

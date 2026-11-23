@@ -91,6 +91,12 @@ pub enum Command {
         #[serde(default)]
         driver: DriverKind,
     },
+    /// Starts an exited Docker runtime again in place; see `DockerDriver::resume`.
+    Resume {
+        execution: ExecutionIdentity,
+        #[serde(default)]
+        driver: DriverKind,
+    },
     Delete {
         execution: ExecutionIdentity,
         #[serde(default)]
@@ -106,7 +112,7 @@ pub enum Command {
 
 pub fn capabilities() -> Value {
     json!({"protocol": PROTOCOL, "drivers": ["docker"], "access_policy": {"provider":"openshell", "default":"driver_bounds"}, "features": [
-        "data-plane-v1", "chisel-network-v1", "runtime-management-v1", "single-use-ingress-v1", "runtime-daemon-v1", "openshell-access-v1"
+        "data-plane-v1", "chisel-network-v1", "runtime-management-v1", "single-use-ingress-v1", "runtime-daemon-v1", "openshell-access-v1", "runtime-resume-v1"
     ]})
 }
 
@@ -449,6 +455,18 @@ impl Daemon {
                     }
                 }
                 .map_err(|_| Error::InvalidContract)
+            }
+            Command::Resume { execution, driver } => {
+                // Docker only: a TEE runtime would need fresh attestation, and
+                // native OpenShell lifecycle stays a Fleet allocation operation.
+                if !matches!(
+                    self.lifecycle_driver(&execution, driver)?,
+                    DriverKind::Docker
+                ) {
+                    return Err(Error::Unsupported);
+                }
+                serde_json::to_value(self.docker()?.resume(&execution).await?)
+                    .map_err(|_| Error::InvalidContract)
             }
             Command::Stop { execution, driver } => {
                 match self.lifecycle_driver(&execution, driver)? {

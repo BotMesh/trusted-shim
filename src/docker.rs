@@ -440,6 +440,35 @@ impl DockerDriver {
         Ok(())
     }
 
+    /// Starts this allocation's own exited container again, in place. Fleet,
+    /// as the supervisor, decides when; the shim never does it on its own and a
+    /// lost connection still never restarts anything. The container keeps its
+    /// committed configuration, limits and writable layer, so this is not a
+    /// replay of the launch: nothing is created or resubmitted. Only a
+    /// `Running` allocation qualifies -- stop/delete fences stay final -- a
+    /// running container is left as it is, and a missing one is never
+    /// substituted.
+    pub async fn resume(&self, execution: &ExecutionIdentity) -> Result<RuntimeStatus> {
+        let slot = self.slot(execution)?;
+        let _lock = self.lock(&slot).await?;
+        let record = self.owned(&slot, execution)?;
+        if record.phase != Phase::Running {
+            return Err(Error::Ownership);
+        }
+        let container = Self::container(&slot, &record)
+            .await?
+            .ok_or(Error::Ownership)?;
+        // Re-checks the committed limits before anything is started again.
+        if Self::status(&slot, &record, Some(&container))?.state == RuntimeState::Stopped {
+            Self::docker(&["start".into(), Self::name(&slot)]).await?;
+        }
+        Self::status(
+            &slot,
+            &record,
+            Self::container(&slot, &record).await?.as_ref(),
+        )
+    }
+
     fn network_paths(&self, execution: &ExecutionIdentity) -> Result<(PathBuf, PathBuf)> {
         self.slot(execution)?;
         let id = hash(execution)?;
