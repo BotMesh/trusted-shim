@@ -76,6 +76,13 @@ async fn private_protocol_survives_clients_and_rejects_incompatible_takeover() {
         .as_array()
         .unwrap()
         .contains(&json!("runtime-network-v1")));
+    // Fleet runs a batch job on the shim only where both are advertised.
+    for feature in ["runtime-exit-status-v1", "runtime-run-to-completion-v1"] {
+        assert!(before["result"]["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(feature)));
+    }
     // TEE resume is advertised separately, and only by a node with a TEE driver;
     // this one has none, so it refuses a TEE resume.
     assert!(!before["result"]["features"]

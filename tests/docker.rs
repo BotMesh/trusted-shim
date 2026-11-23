@@ -72,6 +72,12 @@ async fn unsupported_trust_and_driver_requirements_never_create_state() {
         ));
     }
     r.limits.cpu_shares = None;
+    // Nothing reaches a run to completion.
+    r.driver_options = json!({"run_to_completion":true,"port":8080});
+    assert!(matches!(
+        driver.launch(&r).await,
+        Err(Error::InvalidContract)
+    ));
     // Nothing can reach a container without a network, and only two are named.
     for options in [
         json!({"network":"none","port":8080}),
@@ -556,4 +562,77 @@ async fn real_docker_runs_a_container_without_a_network_or_on_the_hosts() {
     }
     assert_eq!(answer.trim(), "ok");
     driver.delete(&host.execution).await.unwrap();
+}
+
+async fn exited(driver: &DockerDriver, r: &LaunchRequest) -> trusted_shim::runtime::RuntimeStatus {
+    for _ in 0..100 {
+        let status = driver.inspect(&r.execution).await.unwrap();
+        if status.state == RuntimeState::Stopped {
+            return status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the run did not end");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_runs_to_completion_and_reports_how_it_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let id = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+
+    let mut job = request(&format!("job-{id}"));
+    job.command = ["sh", "-c", "echo done; exit 3"].map(String::from).into();
+    job.driver_options = json!({"stop_timeout_s":1,"run_to_completion":true});
+    let name = driver.launch(&job).await.unwrap().runtime_id;
+    let status = exited(&driver, &job).await;
+    let exit = status.exit.unwrap();
+    assert_eq!((exit.code, exit.oom_killed), (3, false));
+    for at in [&exit.started_at, &exit.finished_at] {
+        assert!(at.starts_with("20"), "{at}");
+    }
+    // It is never started again, and its container stays until delete.
+    assert!(matches!(
+        driver.resume(&job.execution).await,
+        Err(Error::Ownership)
+    ));
+    let replayed = driver.launch(&job).await.unwrap();
+    assert_eq!(replayed.state, RuntimeState::Stopped);
+    assert_eq!(replayed.exit.unwrap().finished_at, exit.finished_at);
+    assert_eq!(
+        String::from_utf8_lossy(&docker(&["logs", &name]).stdout).trim(),
+        "done"
+    );
+    driver.delete(&job.execution).await.unwrap();
+    assert!(!docker(&["inspect", &name]).status.success());
+
+    // A run past its memory limit reports that the OOM killer ended it.
+    let mut oom = request(&format!("job-oom-{id}"));
+    oom.command = [
+        "sh",
+        "-c",
+        "a=$(head -c 134217728 /dev/zero | tr '\\0' x); echo ${#a}",
+    ]
+    .map(String::from)
+    .into();
+    oom.driver_options = json!({"stop_timeout_s":1,"run_to_completion":true});
+    driver.launch(&oom).await.unwrap();
+    let exit = exited(&driver, &oom).await.exit.unwrap();
+    assert!(exit.oom_killed);
+    assert_eq!(exit.code, 137);
+    driver.delete(&oom.execution).await.unwrap();
+
+    // A crashed app reports its exit too, and stays resumable.
+    let app = request(&format!("app-exit-{id}"));
+    let name = driver.launch(&app).await.unwrap().runtime_id;
+    assert_eq!(driver.inspect(&app.execution).await.unwrap().exit, None);
+    assert!(docker(&["kill", &name]).status.success());
+    let exit = exited(&driver, &app).await.exit.unwrap();
+    assert_eq!((exit.code, exit.oom_killed), (137, false));
+    let resumed = driver.resume(&app.execution).await.unwrap();
+    assert_eq!(resumed.state, RuntimeState::Ready);
+    assert_eq!(resumed.exit, None);
+    driver.delete(&app.execution).await.unwrap();
 }

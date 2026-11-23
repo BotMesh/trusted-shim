@@ -89,6 +89,23 @@ pub struct RuntimeStatus {
     pub state: RuntimeState,
     pub effective_limits: ResourceLimits,
     pub port: Option<u16>,
+    /// How the container's process ended, once it has: set while `state` is
+    /// `stopped` and the container exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<ExitStatus>,
+}
+
+/// How a runtime's process ended, as its container reports it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExitStatus {
+    /// The process's exit code; 128 + n after signal n, as for a shell.
+    pub code: i64,
+    /// The kernel's OOM killer ended a process in the container.
+    pub oom_killed: bool,
+    /// When the process last started and when it ended, in RFC 3339.
+    pub started_at: String,
+    pub finished_at: String,
 }
 
 /// One machine, with no node selection or cluster resource allocator.
