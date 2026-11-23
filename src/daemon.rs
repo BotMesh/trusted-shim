@@ -113,7 +113,8 @@ pub enum Command {
 
 pub fn capabilities() -> Value {
     json!({"protocol": PROTOCOL, "drivers": ["docker"], "access_policy": {"provider":"openshell", "default":"driver_bounds"}, "features": [
-        "data-plane-v1", "chisel-network-v1", "runtime-management-v1", "single-use-ingress-v1", "runtime-daemon-v1", "openshell-access-v1", "runtime-resume-v1"
+        "data-plane-v1", "chisel-network-v1", "runtime-management-v1", "single-use-ingress-v1", "runtime-daemon-v1", "openshell-access-v1", "runtime-resume-v1",
+        "runtime-network-v1"
     ]})
 }
 

@@ -171,6 +171,22 @@ async fn bad_quote_and_bad_proof_cannot_create_runtime() {
 }
 
 #[tokio::test]
+async fn a_tee_runtime_refuses_the_hosts_network_before_any_admission() {
+    let lab = Lab::start(false, None).await;
+    let root = tempfile::tempdir().unwrap();
+    let proof = Arc::new(ProofDouble::default());
+    let driver = lab.driver(root.path(), proof.clone(), true).await;
+    let mut host = request("host-network");
+    host.driver_options = json!({"stop_timeout_s":1,"network":"host","port":8080});
+    assert!(matches!(
+        driver.launch(&host).await,
+        Err(trusted_shim::Error::Unsupported)
+    ));
+    assert_eq!(proof.submitted.load(Ordering::SeqCst), 0);
+    no_container_intent(root.path());
+}
+
+#[tokio::test]
 async fn ambiguous_submission_is_not_repeated_or_rebound_after_restart() {
     let lab = Lab::start(false, None).await;
     let root = tempfile::tempdir().unwrap();

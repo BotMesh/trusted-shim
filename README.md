@@ -93,6 +93,7 @@ uses only what a node advertises.
 | `runtime-management-v1` | The administrator `control` service: metadata, logs, exec, restart |
 | `single-use-ingress-v1` | Ingress rules with `single_use: true` |
 | `runtime-resume-v1` | `resume` for Docker runtimes |
+| `runtime-network-v1` | `driver_options.network`: `none` (loopback only) or `host` (refused on TEE) instead of Docker's default network |
 | `openshell-access-v1` | The OpenShell access layer |
 | `tee-startup-v1` | This node has a TEE driver |
 | `runtime-resume-tee-v1` | `resume` for TEE runtimes, behind a fresh admission |

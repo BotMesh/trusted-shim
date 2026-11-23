@@ -38,6 +38,33 @@ pub struct DockerOptions {
     pub stop_timeout_s: Option<u32>,
     /// HTTP surfaces approved in the existing application manifest.
     pub ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
+    /// The container's network. Unset, it is Docker's default bridge network,
+    /// with `port` published on host loopback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkMode>,
+}
+
+/// A network other than Docker's default bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// Loopback only: no egress, no published port and no services.
+    None,
+    /// The host's own network namespace. The container listens on `port`
+    /// itself and reaches everything the host does, including its loopback
+    /// services, so only an administrator should choose it. A TEE runtime
+    /// refuses it: in a confidential VM that includes the attestation agent.
+    Host,
+}
+
+impl NetworkMode {
+    /// Docker's `HostConfig.NetworkMode` for this network.
+    fn docker(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Host => "host",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -66,6 +93,9 @@ struct Record {
     services: Vec<trusted_data_router::ServiceSpec>,
     #[serde(default)]
     ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
+    /// Omitted for Docker's default network, so existing journals keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<NetworkMode>,
 }
 
 /// Private state must survive upgrades, deletion and restart. A tombstone fences
@@ -137,10 +167,9 @@ impl DockerDriver {
             r.phase != Phase::Deleted || r.execution.generation >= execution.generation
         }))
     }
-    pub(crate) fn validate_launch(&self, request: &LaunchRequest) -> Result<()> {
+    pub(crate) fn validate_launch(&self, request: &LaunchRequest) -> Result<DockerOptions> {
         self.slot(&request.execution)?;
-        Self::options(request)?;
-        Ok(())
+        Self::options(request)
     }
 
     pub(crate) fn has_allocations(state: &Path) -> Result<bool> {
@@ -745,6 +774,12 @@ impl DockerDriver {
         } else {
             r.limits.clone()
         };
+        // A chosen network is part of the committed launch, like its limits.
+        if let (Some(v), Some(network)) = (container, r.network) {
+            if v["HostConfig"]["NetworkMode"] != network.docker() {
+                return Err(Error::Untrusted);
+            }
+        }
         if container.is_some() && effective_limits != r.limits {
             return Err(Error::Untrusted);
         }
@@ -829,6 +864,25 @@ impl DockerDriver {
         {
             return Err(Error::InvalidContract);
         }
+        match options.network {
+            // Nothing can reach a container without a network.
+            Some(NetworkMode::None)
+                if options.port.is_some()
+                    || options.container_port.is_some()
+                    || !options.ingress.is_empty()
+                    || !request.services.is_empty() =>
+            {
+                return Err(Error::InvalidContract)
+            }
+            // There is no mapping: the container listens on `port` itself, so
+            // the port can't be chosen for it.
+            Some(NetworkMode::Host)
+                if options.container_port.is_some() || options.port == Some(0) =>
+            {
+                return Err(Error::InvalidContract)
+            }
+            _ => {}
+        }
         let mut names = std::collections::HashSet::new();
         for service in &request.services {
             if service.id.namespace != request.execution.namespace
@@ -902,7 +956,10 @@ impl DockerDriver {
         if let Some(bytes) = options.shm_bytes {
             args.extend(["--shm-size".into(), bytes.to_string()]);
         }
-        if let Some(port) = r.port {
+        if let Some(network) = options.network {
+            args.push(format!("--network={}", network.docker()));
+        }
+        if let Some(port) = r.port.filter(|_| options.network.is_none()) {
             args.extend([
                 "--publish".into(),
                 format!(
@@ -974,6 +1031,7 @@ impl RuntimeDriver for DockerDriver {
                     allocated_port: options.port == Some(0),
                     services: request.services.clone(),
                     ingress: options.ingress.clone(),
+                    network: options.network,
                 };
                 self.save(&slot, &r)?;
                 r
@@ -1099,6 +1157,7 @@ impl RuntimeDriver for DockerDriver {
                 allocated_port: false,
                 services: Vec::new(),
                 ingress: Default::default(),
+                network: None,
             },
         };
         let _network = self.drain_network(execution).await?;
@@ -1122,5 +1181,142 @@ impl RuntimeDriver for DockerDriver {
         }
         self.release_port(&r)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    fn request(driver_options: Value, services: Value) -> LaunchRequest {
+        serde_json::from_value(json!({
+            "execution": {"namespace":"test", "workload":"docker", "allocation_id":"unit",
+                "lease_id":"one", "generation":1, "node_id":"test-node"},
+            "driver":"docker", "image":"alpine:3.21", "command":["sleep","300"],
+            "environment":{}, "limits":{"cpu_millicores":250,"memory_bytes":33554432},
+            "policy":{"issuer":"test","policy_id":"no-policy-claim","version":0,"sha256":""},
+            "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required",
+                "attestation_proof":"not_required"},
+            "services":services, "driver_options":driver_options
+        }))
+        .unwrap()
+    }
+
+    fn app() -> Value {
+        json!([{"id":{"namespace":"test","workload":"docker","service":"app"},
+            "endpoint_ref":"app","protocol":"http1"}])
+    }
+
+    fn record(request: &LaunchRequest, options: &DockerOptions) -> Record {
+        Record {
+            execution: request.execution.clone(),
+            request_sha256: hash(request).unwrap(),
+            limits: request.limits.clone(),
+            phase: Phase::Running,
+            stop_timeout_s: 1,
+            port: options.port,
+            allocated_port: false,
+            services: request.services.clone(),
+            ingress: options.ingress.clone(),
+            network: options.network,
+        }
+    }
+
+    fn args(request: &LaunchRequest) -> Vec<String> {
+        let options = DockerDriver::options(request).unwrap();
+        DockerDriver::create_args("slot", &record(request, &options), request, &options)
+    }
+
+    #[test]
+    fn a_network_without_a_surface_is_none_and_one_listening_itself_is_host() {
+        for valid in [
+            // Null is unset, as for the other options: Docker's default network.
+            request(json!({"network":null}), json!([])),
+            request(json!({"network":"none"}), json!([])),
+            request(json!({"network":"host"}), json!([])),
+            request(json!({"network":"host","port":8080}), app()),
+        ] {
+            DockerDriver::options(&valid).unwrap();
+        }
+        for (case, invalid) in [
+            // Nothing can reach a container without a network.
+            request(json!({"network":"none","port":8080}), json!([])),
+            request(
+                json!({"network":"none","port":0,"container_port":8080}),
+                json!([]),
+            ),
+            request(json!({"network":"none"}), app()),
+            // On the host's network the container listens on the port itself.
+            request(
+                json!({"network":"host","port":8080,"container_port":80}),
+                app(),
+            ),
+            request(
+                json!({"network":"host","port":0,"container_port":8080}),
+                app(),
+            ),
+            // Only the two named networks.
+            request(json!({"network":"bridge"}), json!([])),
+            request(json!({"network":"container:other"}), json!([])),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                matches!(DockerDriver::options(invalid), Err(Error::InvalidContract)),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_network_reaches_docker_and_only_the_default_one_publishes_a_port() {
+        let none = args(&request(json!({"network":"none"}), json!([])));
+        assert!(none.contains(&"--network=none".into()));
+        assert!(!none.iter().any(|a| a == "--publish"));
+
+        let host = args(&request(json!({"network":"host","port":8080}), app()));
+        assert!(host.contains(&"--network=host".into()));
+        assert!(!host.iter().any(|a| a == "--publish"));
+        let end = host.iter().position(|a| a == "--").unwrap();
+        assert!(host.iter().position(|a| a == "--network=host").unwrap() < end);
+
+        let default = args(&request(json!({"port":8080}), app()));
+        assert!(!default.iter().any(|a| a.starts_with("--network")));
+        let publish = default.iter().position(|a| a == "--publish").unwrap();
+        assert_eq!(default[publish + 1], "127.0.0.1:8080:8080");
+    }
+
+    #[test]
+    fn a_chosen_network_is_verified_and_the_default_one_keeps_its_journal() {
+        let container = |mode: Value| {
+            json!({"State":{"Status":"running"},"HostConfig":{"NanoCpus":250_000_000u64,
+                "Memory":33_554_432u64,"MemorySwap":33_554_432u64,"NetworkMode":mode}})
+        };
+        let none = request(json!({"network":"none"}), json!([]));
+        let none = record(&none, &DockerDriver::options(&none).unwrap());
+        DockerDriver::status("slot", &none, Some(&container(json!("none")))).unwrap();
+        for changed in [
+            json!("bridge"),
+            json!("host"),
+            json!("default"),
+            Value::Null,
+        ] {
+            assert!(matches!(
+                DockerDriver::status("slot", &none, Some(&container(changed))),
+                Err(Error::Untrusted)
+            ));
+        }
+
+        // Docker reports the default network as `bridge` or `default`; an
+        // existing allocation is not checked against either.
+        let default = request(json!({}), json!([]));
+        let default = record(&default, &DockerDriver::options(&default).unwrap());
+        for mode in [json!("bridge"), json!("default")] {
+            DockerDriver::status("slot", &default, Some(&container(mode))).unwrap();
+        }
+        let journal = serde_json::to_value(&default).unwrap();
+        assert!(journal.get("network").is_none());
+        assert_eq!(serde_json::to_value(&none).unwrap()["network"], "none");
     }
 }

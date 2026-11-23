@@ -756,7 +756,13 @@ impl TeeDriver {
         {
             return Err(Error::Unsupported);
         }
-        self.backend.validate_launch(&Self::delegated(request))?;
+        let options = self.backend.validate_launch(&Self::delegated(request))?;
+        // In the confidential VM, the host's network is the VM's own. A
+        // workload on it could reach the attestation agent, which serves on
+        // loopback, and ask it for evidence over report data of its choosing.
+        if options.network == Some(crate::docker::NetworkMode::Host) {
+            return Err(Error::Unsupported);
+        }
         self.gate.validate_request(request)?;
         let admission = self.gate.authorize(&request.execution, request).await?;
         if admission.ensure_fresh().is_err() {

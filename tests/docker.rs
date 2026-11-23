@@ -56,6 +56,17 @@ async fn unsupported_trust_and_driver_requirements_never_create_state() {
         driver.launch(&r).await,
         Err(Error::InvalidContract)
     ));
+    // Nothing can reach a container without a network, and only two are named.
+    for options in [
+        json!({"network":"none","port":8080}),
+        json!({"network":"bridge"}),
+    ] {
+        r.driver_options = options;
+        assert!(matches!(
+            driver.launch(&r).await,
+            Err(Error::InvalidContract)
+        ));
+    }
     assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
 }
 
@@ -309,4 +320,70 @@ async fn real_docker_resume_restarts_only_a_crashed_runtime_in_place() {
         Err(Error::Ownership)
     ));
     recovered.delete(&gone.execution).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_runs_a_container_without_a_network_or_on_the_hosts() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let id = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+    let interfaces = |name: &str| {
+        let out = docker(&["exec", name, "ls", "/sys/class/net"]);
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let mut none = request(&format!("network-none-{id}"));
+    none.driver_options = json!({"stop_timeout_s":1,"network":"none"});
+    let status = driver.launch(&none).await.unwrap();
+    assert_eq!(status.state, RuntimeState::Ready);
+    assert_eq!(status.port, None);
+    assert_eq!(
+        inspect(&status.runtime_id)["HostConfig"]["NetworkMode"],
+        "none"
+    );
+    assert_eq!(interfaces(&status.runtime_id), ["lo"]);
+    driver.delete(&none.execution).await.unwrap();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut host = request(&format!("network-host-{id}"));
+    host.command = [
+        "sh",
+        "-c",
+        &format!("while :; do echo ok | nc -l -p {port}; done"),
+    ]
+    .map(String::from)
+    .into();
+    host.driver_options = json!({"stop_timeout_s":1,"network":"host","port":port});
+    let status = driver.launch(&host).await.unwrap();
+    assert_eq!(status.state, RuntimeState::Ready);
+    assert_eq!(status.port, Some(port));
+    let container = inspect(&status.runtime_id);
+    assert_eq!(container["HostConfig"]["NetworkMode"], "host");
+    assert!(container["HostConfig"]["PortBindings"]
+        .as_object()
+        .is_none_or(|bindings| bindings.is_empty()));
+    // It listens on the host's loopback itself.
+    let mut answer = String::new();
+    for _ in 0..50 {
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            use std::io::Read;
+            let _ = stream.read_to_string(&mut answer);
+            if !answer.is_empty() {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(answer.trim(), "ok");
+    driver.delete(&host.execution).await.unwrap();
 }
