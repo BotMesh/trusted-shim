@@ -148,6 +148,11 @@ impl NativeCreate {
             .memory_bytes
             .filter(|v| *v >= 6 * 1024 * 1024)
             .ok_or(Error::InvalidContract)?;
+        // The native driver enforces CPU and memory limits but has no CPU
+        // weight. Refuse one rather than create the sandbox without it.
+        if request.limits.cpu_shares.is_some() {
+            return Err(Error::Unsupported);
+        }
         if sandbox.id.is_empty()
             || sandbox.name.is_empty()
             // The stock gateway leaves the platform namespace empty; the

@@ -13,6 +13,12 @@ use trusted_rail::{EvaluationRequest, ExecutionGrant};
 pub struct ResourceLimits {
     pub cpu_millicores: Option<u64>,
     pub memory_bytes: Option<u64>,
+    /// Relative CPU weight under contention, Docker's `--cpu-shares` (cgroup v2
+    /// `cpu.weight`), within 2..=262144. None keeps the runtime's default
+    /// weight of 1024. Omission preserves existing launch commitments and
+    /// recovery journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_shares: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

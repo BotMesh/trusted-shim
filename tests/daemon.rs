@@ -18,6 +18,20 @@ async fn call(path: &Path, request: Value) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+#[test]
+fn one_shot_runtime_advertises_the_cpu_weight() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_trusted-shim-runtime"))
+        .arg("--capabilities")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(value["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runtime-cpu-shares-v1")));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_protocol_survives_clients_and_rejects_incompatible_takeover() {
     let root = tempfile::tempdir().unwrap();
@@ -47,6 +61,11 @@ async fn private_protocol_survives_clients_and_rejects_incompatible_takeover() {
         .as_array()
         .unwrap()
         .contains(&json!("runtime-resume-v1")));
+    // Fleet sends limits.cpu_shares only where the daemon advertises it.
+    assert!(before["result"]["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runtime-cpu-shares-v1")));
     // TEE resume is advertised separately, and only by a node with a TEE driver;
     // this one has none, so it refuses a TEE resume.
     assert!(!before["result"]["features"]

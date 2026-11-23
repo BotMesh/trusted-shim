@@ -189,6 +189,78 @@ async fn ambiguous_submission_is_not_repeated_or_rebound_after_restart() {
     no_container_intent(root.path());
 }
 
+/// The launch digest the gate binds into the attestation report data, read
+/// from its pending admission. Submission fails and receipts are rejected, so
+/// nothing is authorized and no runtime is created.
+async fn bound_request_sha256(lab: &Lab, request: &LaunchRequest) -> String {
+    let root = tempfile::tempdir().unwrap();
+    let proof = Arc::new(ProofDouble::default());
+    proof.fail_submit.store(true, Ordering::SeqCst);
+    let driver = lab.driver(root.path(), proof.clone(), true).await;
+    assert!(driver.launch(request).await.is_err());
+    assert_eq!(proof.submitted.load(Ordering::SeqCst), 1);
+    no_container_intent(root.path());
+    let path = std::fs::read_dir(root.path().join("tee"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|s| s == "json"))
+        .unwrap();
+    let pending: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let bound = pending["binding"]["request_sha256"].as_str().unwrap();
+    assert_eq!(
+        bound,
+        hex::encode(Sha256::digest(canonical(request).unwrap()))
+    );
+    bound.into()
+}
+
+#[tokio::test]
+async fn attested_digest_of_an_unchanged_request_is_stable() {
+    let lab = Lab::start(false, None).await;
+    assert_eq!(
+        bound_request_sha256(&lab, &request("pinned")).await,
+        "b69471db0c81f96e6e95ace05d7383eccbea14c61869d611950b3de8366f82a2"
+    );
+}
+
+/// The CPU weight is in `LaunchRequest.limits`, so the gate binds it into the
+/// attestation report data with the other limits. An admission for one weight
+/// cannot launch another.
+#[tokio::test]
+async fn cpu_shares_are_part_of_the_attested_launch() {
+    use trusted_shim::Error;
+    let lab = Lab::start(false, None).await;
+    let unweighted = request("weighted");
+    let mut weighted = unweighted.clone();
+    weighted.limits.cpu_shares = Some(64);
+    assert_ne!(
+        bound_request_sha256(&lab, &unweighted).await,
+        bound_request_sha256(&lab, &weighted).await
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let proof = Arc::new(ProofDouble::default());
+    proof.fail_submit.store(true, Ordering::SeqCst);
+    let driver = lab.driver(root.path(), proof.clone(), true).await;
+    // An out-of-range weight is refused before any attestation starts.
+    let mut invalid = weighted.clone();
+    invalid.limits.cpu_shares = Some(1);
+    assert!(matches!(
+        driver.launch(&invalid).await,
+        Err(Error::InvalidContract)
+    ));
+    assert_eq!(proof.submitted.load(Ordering::SeqCst), 0);
+    assert!(driver.launch(&weighted).await.is_err());
+    assert_eq!(proof.submitted.load(Ordering::SeqCst), 1);
+    // The same execution with another weight does not match its admission.
+    assert!(matches!(
+        driver.launch(&unweighted).await,
+        Err(Error::Untrusted)
+    ));
+    assert_eq!(proof.submitted.load(Ordering::SeqCst), 1);
+    no_container_intent(root.path());
+}
+
 #[tokio::test]
 #[ignore = "requires local Docker and preloaded alpine:3.21; receipts are orchestration doubles"]
 async fn simulated_startup_preserves_runtime_on_restart_and_fences_cleanup() {

@@ -97,6 +97,11 @@ impl GatewayLaunch {
         {
             return Err(Error::InvalidContract);
         }
+        // The public create request carries CPU and memory limits only. A CPU
+        // weight would be dropped, so it is refused.
+        if launch.limits.cpu_shares.is_some() {
+            return Err(Error::Unsupported);
+        }
         // This is the same initial native profile admitted at the node. No
         // unsupported request may silently turn into a weaker public API call.
         crate::access::native_policy(&launch, &deterministic_policy_hash(&policy))?;
