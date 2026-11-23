@@ -511,7 +511,7 @@ and foreign devices are rejected.
 
 Attachments require the node's driver to run with `allow_driver_config=true` in
 its admission policy; the acknowledged policy is checked before any volume is
-touched. Before dispatch the shim idempotently creates each missing volume as a
+touched. Only then does the daemon advertise `openshell-attachments-v1`. Before dispatch the shim idempotently creates each missing volume as a
 plain `local` volume carrying the policy's `required_labels` (with
 `${workspace}` substituted) and `trusted-shim.openshell/volume=v1`. An existing
 volume is used only if it is a plain local volume with that label that upstream

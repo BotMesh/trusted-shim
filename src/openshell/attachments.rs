@@ -194,6 +194,20 @@ async fn inspect(name: &str) -> Result<Option<Volume>> {
         .map_err(|_| Error::Unavailable)
 }
 
+fn admission(policy: &str) -> Result<DriverAdmissionConfig> {
+    let admission: DriverAdmissionConfig =
+        serde_json::from_str(policy.strip_prefix("v1:").ok_or(Error::Untrusted)?)
+            .map_err(|_| Error::Untrusted)?;
+    admission.validate().map_err(|_| Error::Untrusted)?;
+    Ok(admission)
+}
+
+/// Whether the node's acknowledged driver policy accepts attachments at all.
+/// Advertised so Fleet never places GPU or durable-storage workloads elsewhere.
+pub(crate) fn supported(admission_policy: &str) -> bool {
+    admission(admission_policy).is_ok_and(|a| a.allow_driver_config)
+}
+
 /// Idempotently provision each durable volume with the labels the node's
 /// upstream admission policy requires for this workspace. Existing volumes are
 /// never relabeled or adopted unless upstream admission already accepts them,
@@ -203,13 +217,7 @@ pub(crate) async fn ensure_volumes(request: &LaunchRequest, admission_policy: &s
     if request.mounts.is_empty() {
         return Ok(());
     }
-    let admission: DriverAdmissionConfig = serde_json::from_str(
-        admission_policy
-            .strip_prefix("v1:")
-            .ok_or(Error::Untrusted)?,
-    )
-    .map_err(|_| Error::Untrusted)?;
-    admission.validate().map_err(|_| Error::Untrusted)?;
+    let admission = admission(admission_policy)?;
     if !admission.allow_driver_config {
         return Err(Error::Unsupported);
     }
@@ -258,4 +266,22 @@ pub(crate) async fn ensure_volumes(request: &LaunchRequest, admission_policy: &s
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn attachments_are_supported_only_by_an_acknowledged_permissive_policy() {
+        let allowed = r#"v1:{"allow_driver_config":true}"#;
+        assert!(super::supported(allowed));
+        for policy in [
+            r#"v1:{"allow_driver_config":false}"#,
+            r#"v1:{}"#,
+            r#"{"allow_driver_config":true}"#,
+            "approved",
+            "",
+        ] {
+            assert!(!super::supported(policy), "{policy}");
+        }
+    }
 }

@@ -1195,6 +1195,11 @@ async fn native_dispatch_at_remote(via_daemon: bool) {
                 .as_array()
                 .unwrap()
                 .contains(&json!("openshell-provisioning-v1")));
+            // Attachments are advertised only by an allow_driver_config policy.
+            assert!(!caps["result"]["features"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("openshell-attachments-v1")));
             for changed in ["execution", "native", "token", "endpoint"] {
                 let mut bad = command.clone();
                 match changed {

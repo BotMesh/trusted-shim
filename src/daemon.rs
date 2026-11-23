@@ -334,6 +334,12 @@ impl Daemon {
                         .as_array_mut()
                         .unwrap()
                         .push(json!("openshell-allocation-v1"));
+                    if native.attachments {
+                        value["features"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!("openshell-attachments-v1"));
+                    }
                     if native.supervisor_image.is_some() {
                         value["features"]
                             .as_array_mut()

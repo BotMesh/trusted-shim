@@ -36,6 +36,7 @@ pub(crate) struct OpenShellRuntime {
     pub configuration_sha256: String,
     endpoint: Endpoint,
     pub supervisor_image: Option<String>,
+    pub attachments: bool,
 }
 
 impl OpenShellRuntime {
@@ -84,12 +85,14 @@ impl OpenShellRuntime {
                 .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)))
                 .map_err(|_| Error::InvalidContract)?;
         }
+        let attachments = crate::openshell::attachments::supported(&config.admission_policy);
         let native = NativeDriver::new(config.socket, config.admission_policy)?;
         Ok(Self {
             driver: ManagedNativeDriver::open(state.to_owned(), node_id, native)?,
             endpoint,
             configuration_sha256,
             supervisor_image: config.supervisor_image,
+            attachments,
         })
     }
 
