@@ -20,6 +20,16 @@ use trusted_shim::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local Docker and preloaded python:3.12-slim"]
 async fn real_runtime_drains_network_before_releasing_its_port() {
+    runtime_network(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Docker, python:3.12-slim and TRUSTED_ROUTER_TUNNEL_BINARY"]
+async fn real_runtime_chisel_drains_network_before_releasing_its_port() {
+    runtime_network(true).await;
+}
+
+async fn runtime_network(chisel: bool) {
     let temp = tempfile::tempdir().unwrap();
     let private = temp.path().join("key.pem");
     let public = temp.path().join("pub.pem");
@@ -45,6 +55,20 @@ async fn real_runtime_drains_network_before_releasing_its_port() {
         &temp.path().join("routes.db"),
     )
     .unwrap();
+    let tunnel_binary = chisel.then(|| {
+        std::path::PathBuf::from(
+            std::env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY").expect("build pinned helper"),
+        )
+    });
+    if let Some(binary) = &tunnel_binary {
+        relay
+            .enable_chisel(
+                trusted_router_transport::chisel::Broker::start(binary)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = listener.local_addr().unwrap();
     let relay_task = tokio::spawn(relay.serve(listener));
@@ -118,6 +142,7 @@ async fn real_runtime_drains_network_before_releasing_its_port() {
         token_file: node_key,
         public_key_file: public,
         issuer: issuer.into(),
+        tunnel_binary,
     };
     let driver =
         Arc::new(DockerDriver::new(temp.path().join("state"), "local-edge".into()).unwrap());

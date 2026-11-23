@@ -7328,12 +7328,13 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-data-router?rev=a57030dfb2787afb76e3f4ee46e03a334eed60e9#a57030dfb2787afb76e3f4ee46e03a334eed60e9"
+source = "git+https://github.com/attestx/trusted-data-router?rev=ee5f97cf8eb4eeb4e0051f83d7d1a8ca207178b0#ee5f97cf8eb4eeb4e0051f83d7d1a8ca207178b0"
 dependencies = [
  "async-trait",
  "axum",
  "bytes",
  "futures",
+ "getrandom 0.2.17",
  "hex",
  "hyper",
  "hyper-util",

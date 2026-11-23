@@ -30,9 +30,23 @@ pub struct NetworkConfig {
     pub token_file: PathBuf,
     pub public_key_file: PathBuf,
     pub issuer: String,
+    /// Operator-owned upstream helper, inside the existing node configuration.
+    /// Omission preserves the transport of an already deployed node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_binary: Option<PathBuf>,
 }
 
 pub(crate) fn validate_config(config: &NetworkConfig) -> Result<()> {
+    if let Some(binary) = &config.tunnel_binary {
+        let meta = std::fs::metadata(binary).map_err(|_| Error::InvalidContract)?;
+        if !binary.is_absolute()
+            || !meta.is_file()
+            || meta.permissions().mode() & 0o022 != 0
+            || meta.permissions().mode() & 0o111 == 0
+        {
+            return Err(Error::InvalidContract);
+        }
+    }
     endpoint(&config.gateway_url, "https", "http")?;
     endpoint(&config.relay_url, "wss", "ws")?;
     Verifier::from_file(config.public_key_file.clone(), config.issuer.clone())
@@ -299,7 +313,13 @@ pub(crate) async fn connect_service(
         if let Ok((url, token, exp)) = registration {
             let started = tokio::time::Instant::now();
             let active_stop = CancellationToken::new();
-            let active = edge::connect(&url, &token, target, active_stop.clone());
+            let active = async {
+                if let Some(binary) = &config.tunnel_binary {
+                    edge::connect_chisel(binary, &url, &token, target, active_stop.clone()).await
+                } else {
+                    edge::connect(&url, &token, target, active_stop.clone()).await
+                }
+            };
             tokio::pin!(active);
             tokio::select! {
                 _ = &mut active => {},
