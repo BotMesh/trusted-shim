@@ -56,6 +56,15 @@ async fn unsupported_trust_and_driver_requirements_never_create_state() {
         driver.launch(&r).await,
         Err(Error::InvalidContract)
     ));
+    r.driver_options = json!({"stop_timeout_s":1});
+    // Docker would clamp a CPU weight outside its range; it is refused instead.
+    for invalid in [0, 1, 262_145] {
+        r.limits.cpu_shares = Some(invalid);
+        assert!(matches!(
+            driver.launch(&r).await,
+            Err(Error::InvalidContract)
+        ));
+    }
     assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
 }
 
@@ -74,6 +83,11 @@ fn launch_request_without_optional_fields_keeps_its_serialized_form() {
         hex::encode(sha2::Sha256::digest(&bytes)),
         "a22f1177d8efd59ac9e4a4493e2fa6b88317dcfb77f621d4e00227313e3f2675"
     );
+    // An explicit null CPU weight is the same request as an absent one.
+    let mut null = serde_json::to_value(&r).unwrap();
+    null["limits"]["cpu_shares"] = serde_json::Value::Null;
+    let null: LaunchRequest = serde_json::from_value(null).unwrap();
+    assert_eq!(serde_json::to_vec(&null).unwrap(), bytes);
     r.limits.cpu_millicores = None;
     r.limits.memory_bytes = None;
     assert_eq!(
@@ -260,6 +274,56 @@ fn docker(args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+/// The container's own CPU weight: cgroup v2 `cpu.weight`, or v1 `cpu.shares`.
+fn cpu_weight(name: &str) -> u64 {
+    let out = docker(&[
+        "exec",
+        name,
+        "sh",
+        "-c",
+        "cat /sys/fs/cgroup/cpu.weight 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.shares",
+    ]);
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_cpu_shares_set_the_cgroup_weight() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let suffix = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+    // Unset, Docker reports 0 and the container keeps the default weight.
+    let unweighted = request(&format!("unweighted-{suffix}"));
+    let status = driver.launch(&unweighted).await.unwrap();
+    assert_eq!(status.effective_limits.cpu_shares, None);
+    assert_eq!(inspect(&status.runtime_id)["HostConfig"]["CpuShares"], 0u64);
+    let default = cpu_weight(&status.runtime_id);
+    driver.delete(&unweighted.execution).await.unwrap();
+
+    let mut weighted = request(&format!("weighted-{suffix}"));
+    weighted.limits.cpu_shares = Some(64);
+    let status = driver.launch(&weighted).await.unwrap();
+    assert_eq!(status.effective_limits.cpu_shares, Some(64));
+    assert_eq!(
+        inspect(&status.runtime_id)["HostConfig"]["CpuShares"],
+        64u64
+    );
+    assert!(cpu_weight(&status.runtime_id) < default);
+    // A weight changed outside the shim is not the committed launch.
+    assert!(
+        docker(&["update", "--cpu-shares", "1024", &status.runtime_id])
+            .status
+            .success()
+    );
+    assert!(matches!(
+        driver.inspect(&weighted.execution).await,
+        Err(Error::Untrusted)
+    ));
+    driver.delete(&weighted.execution).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

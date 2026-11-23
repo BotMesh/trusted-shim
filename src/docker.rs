@@ -76,6 +76,9 @@ pub struct DockerDriver {
     node_id: String,
 }
 
+/// Docker's accepted `--cpu-shares` range on Linux.
+const CPU_SHARES: std::ops::RangeInclusive<u64> = 2..=262_144;
+
 fn hash(value: &impl Serialize) -> Result<String> {
     // Convert through Value to sort all maps, including driver-specific options.
     let mut value = serde_json::to_value(value).map_err(|_| Error::InvalidContract)?;
@@ -732,6 +735,9 @@ impl DockerDriver {
                 || r.limits
                     .memory_bytes
                     .is_some_and(|bytes| v["HostConfig"]["MemorySwap"].as_u64() != Some(bytes))
+                // Docker reports 0 when no weight was requested, and the
+                // daemon's default of 1024 applies.
+                || v["HostConfig"]["CpuShares"].as_u64() != Some(r.limits.cpu_shares.unwrap_or(0))
             {
                 return Err(Error::Untrusted);
             }
@@ -741,6 +747,7 @@ impl DockerDriver {
                     .filter(|v| *v > 0)
                     .map(|v| v / 1_000_000),
                 memory_bytes: v["HostConfig"]["Memory"].as_u64().filter(|v| *v > 0),
+                cpu_shares: v["HostConfig"]["CpuShares"].as_u64().filter(|v| *v > 0),
             }
         } else {
             r.limits.clone()
@@ -787,6 +794,11 @@ impl DockerDriver {
                 .limits
                 .memory_bytes
                 .is_some_and(|v| v < 6 * 1024 * 1024 || v > i64::MAX as u64)
+            // Docker would clamp an out-of-range weight instead of refusing it.
+            || request
+                .limits
+                .cpu_shares
+                .is_some_and(|v| !CPU_SHARES.contains(&v))
             || request.command.iter().any(|s| s.contains('\0'))
             || request.environment.iter().any(|(k, v)| {
                 k.is_empty() || k.contains(['=', '\0']) || v.contains(['\0', '\n', '\r'])
@@ -899,6 +911,9 @@ impl DockerDriver {
                 bytes.to_string(),
             ]);
         }
+        if let Some(shares) = request.limits.cpu_shares {
+            args.extend(["--cpu-shares".into(), shares.to_string()]);
+        }
         if let Some(bytes) = options.shm_bytes {
             args.extend(["--shm-size".into(), bytes.to_string()]);
         }
@@ -991,6 +1006,7 @@ impl RuntimeDriver for DockerDriver {
                     && (info["CpuCfsQuota"] != true || info["CpuCfsPeriod"] != true)
                 || request.limits.memory_bytes.is_some()
                     && (info["MemoryLimit"] != true || info["SwapLimit"] != true)
+                || request.limits.cpu_shares.is_some() && info["CPUShares"] != true
             {
                 return Err(Error::Unsupported);
             }
@@ -1092,6 +1108,7 @@ impl RuntimeDriver for DockerDriver {
                 limits: ResourceLimits {
                     cpu_millicores: None,
                     memory_bytes: None,
+                    cpu_shares: None,
                 },
                 phase: Phase::Deleted,
                 stop_timeout_s: 30,
@@ -1174,5 +1191,71 @@ mod tests {
         );
         let loaded: Record = serde_json::from_slice(&journal).unwrap();
         assert_eq!(serde_json::to_vec(&loaded).unwrap(), journal);
+    }
+
+    /// Inspect output for a container created with the committed CPU and
+    /// memory limits and the given `HostConfig.CpuShares`.
+    fn container(cpu_shares: Value) -> Value {
+        json!({"State":{"Status":"running"},"HostConfig":{"NanoCpus":250_000_000u64,
+            "Memory":33_554_432u64,"MemorySwap":33_554_432u64,"CpuShares":cpu_shares}})
+    }
+
+    #[test]
+    fn cpu_shares_are_bounded_passed_to_docker_and_verified() {
+        fn limits(shares: Value) -> Value {
+            json!({"cpu_millicores":250, "memory_bytes":33554432, "cpu_shares":shares})
+        }
+        let absent = request(json!({"cpu_millicores":250,"memory_bytes":33554432}));
+        let null = request(limits(Value::Null));
+        assert_eq!(hash(&null).unwrap(), hash(&absent).unwrap());
+        let weighted = request(limits(json!(64)));
+        assert_ne!(hash(&weighted).unwrap(), hash(&absent).unwrap());
+        assert_eq!(
+            serde_json::to_value(&weighted).unwrap()["limits"],
+            limits(json!(64))
+        );
+
+        for invalid in [0, 1, 262_145, u64::MAX] {
+            assert!(matches!(
+                DockerDriver::options(&request(limits(json!(invalid)))),
+                Err(Error::InvalidContract)
+            ));
+        }
+        for valid in [2, 64, 1024, 262_144] {
+            DockerDriver::options(&request(limits(json!(valid)))).unwrap();
+        }
+
+        let args = |r: &LaunchRequest| {
+            DockerDriver::create_args("slot", &record(r), r, &DockerDriver::options(r).unwrap())
+        };
+        let weighted_args = args(&weighted);
+        let flag = weighted_args
+            .iter()
+            .position(|a| a == "--cpu-shares")
+            .unwrap();
+        assert_eq!(weighted_args[flag + 1], "64");
+        assert!(flag < weighted_args.iter().position(|a| a == "--").unwrap());
+        assert!(!args(&absent).iter().any(|a| a.starts_with("--cpu-shares")));
+
+        // Unset, Docker reports 0 and applies its default weight.
+        let status = DockerDriver::status("slot", &record(&absent), Some(&container(json!(0))));
+        assert_eq!(status.unwrap().effective_limits, absent.limits);
+        let status = DockerDriver::status("slot", &record(&weighted), Some(&container(json!(64))));
+        assert_eq!(status.unwrap().effective_limits.cpu_shares, Some(64));
+        // Any other reported weight, the explicit default included, is not the
+        // committed launch and is refused like a changed CPU or memory limit.
+        for (r, reported) in [
+            (&absent, json!(1024)),
+            (&absent, json!(64)),
+            (&absent, Value::Null),
+            (&weighted, json!(0)),
+            (&weighted, json!(1024)),
+            (&weighted, Value::Null),
+        ] {
+            assert!(matches!(
+                DockerDriver::status("slot", &record(r), Some(&container(reported))),
+                Err(Error::Untrusted)
+            ));
+        }
     }
 }
