@@ -103,6 +103,15 @@ pub enum Command {
         #[serde(default)]
         driver: DriverKind,
     },
+    /// A bounded window of a runtime's output; see `DockerDriver::read_logs`.
+    Logs {
+        execution: ExecutionIdentity,
+        #[serde(default)]
+        driver: DriverKind,
+        /// Unix seconds with optional nanoseconds; absent, from the start.
+        #[serde(default)]
+        since: Option<String>,
+    },
     Network {
         execution: ExecutionIdentity,
         config: NetworkConfig,
@@ -113,7 +122,8 @@ pub enum Command {
 
 pub fn capabilities() -> Value {
     json!({"protocol": PROTOCOL, "drivers": ["docker"], "access_policy": {"provider":"openshell", "default":"driver_bounds"}, "features": [
-        "data-plane-v1", "chisel-network-v1", "runtime-management-v1", "single-use-ingress-v1", "runtime-daemon-v1", "openshell-access-v1", "runtime-resume-v1"
+        "data-plane-v1", "chisel-network-v1", "runtime-management-v1", "single-use-ingress-v1", "runtime-daemon-v1", "openshell-access-v1", "runtime-resume-v1",
+        "runtime-logs-v1"
     ]})
 }
 
@@ -510,6 +520,22 @@ impl Daemon {
                 }
                 Ok(json!({"cleaned": true}))
             }
+            Command::Logs {
+                execution,
+                driver,
+                since,
+            } => match self.lifecycle_driver(&execution, driver)? {
+                DriverKind::Docker | DriverKind::Tee | DriverKind::TeeSimulation => {
+                    serde_json::to_value(
+                        self.local(driver)?
+                            .read_logs(&execution, since.as_deref())
+                            .await?,
+                    )
+                    .map_err(|_| Error::InvalidContract)
+                }
+                // A native sandbox's output stays with its gateway.
+                DriverKind::LegacyOpenShell => Err(Error::Unsupported),
+            },
             Command::Network {
                 execution,
                 config,

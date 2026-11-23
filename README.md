@@ -53,7 +53,7 @@ connection sends one bounded JSON request and closes its write half:
 ```
 
 The reply has `protocol` and either `result` or `error`. Operations are
-`capabilities`, `launch`, `inspect`, `stop`, `resume`, `delete`, `network`,
+`capabilities`, `launch`, `inspect`, `stop`, `resume`, `delete`, `logs`, `network`,
 `allocate` and `provision`. A request runs to completion even if the caller
 disconnects.
 
@@ -93,6 +93,7 @@ uses only what a node advertises.
 | `runtime-management-v1` | The administrator `control` service: metadata, logs, exec, restart |
 | `single-use-ingress-v1` | Ingress rules with `single_use: true` |
 | `runtime-resume-v1` | `resume` for Docker runtimes |
+| `runtime-logs-v1` | `logs`: a runtime's output from a point in time, in windows of up to 1 MiB |
 | `openshell-access-v1` | The OpenShell access layer |
 | `tee-startup-v1` | This node has a TEE driver |
 | `runtime-resume-tee-v1` | `resume` for TEE runtimes, behind a fresh admission |

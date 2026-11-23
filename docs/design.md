@@ -39,6 +39,16 @@ file rather than the command line, and ports bind host loopback only. Plain
 Docker is not a policy boundary for an agent's shell, so requests that need a
 policy proof or attestation are refused on this path rather than downgraded.
 
+### Logs
+
+Fleet follows a runtime's output through the daemon's `logs` operation, so it
+needs no access to Docker and works the same for a TEE runtime inside its
+confidential VM. Each read returns up to 1 MiB from a point in time, stdout and
+stderr together in Docker's order with each line's timestamp, plus where the next
+read starts. Reads in a row see every line once: a read cut at the limit stops
+before the time of its last whole line, and the next one starts at that time.
+The container's output stays readable until `delete`, after it exits too.
+
 ### Resume after a crash
 
 A crashed container keeps its writable layer. Fleet can therefore ask shim to
