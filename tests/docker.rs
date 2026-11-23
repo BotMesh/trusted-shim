@@ -636,3 +636,94 @@ async fn real_docker_runs_to_completion_and_reports_how_it_ended() {
     assert_eq!(resumed.exit, None);
     driver.delete(&app.execution).await.unwrap();
 }
+
+async fn read_logs(
+    driver: &DockerDriver,
+    r: &LaunchRequest,
+    since: Option<&str>,
+) -> (Vec<String>, Option<String>, bool) {
+    use base64::Engine as _;
+    let logs = driver.read_logs(&r.execution, since).await.unwrap();
+    let output = base64::engine::general_purpose::STANDARD
+        .decode(logs.output)
+        .unwrap();
+    let lines = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (time, text) = line.split_once(' ').unwrap();
+            assert!(time.ends_with('Z'), "{line}");
+            text.to_owned()
+        })
+        .collect();
+    (lines, logs.next_since, logs.more)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_logs_are_read_in_bounded_windows_without_loss_or_repeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let id = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+
+    // Both streams, in order, then only what came after.
+    let mut r = request(&format!("logs-{id}"));
+    r.command = [
+        "sh",
+        "-c",
+        "echo out; echo err >&2; sleep 1; echo later; sleep 300",
+    ]
+    .map(String::from)
+    .into();
+    driver.launch(&r).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (lines, next, more) = read_logs(&driver, &r, None).await;
+    assert_eq!(lines, ["out", "err"]);
+    assert!(!more);
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let (lines, next, _) = read_logs(&driver, &r, next.as_deref()).await;
+    assert_eq!(lines, ["later"]);
+    let (lines, after, more) = read_logs(&driver, &r, next.as_deref()).await;
+    assert!(lines.is_empty() && !more);
+    assert_eq!(after, next);
+    driver.delete(&r.execution).await.unwrap();
+    assert!(matches!(
+        driver.read_logs(&r.execution, None).await,
+        Err(Error::Ownership)
+    ));
+
+    // More than one window: each line exactly once, in order.
+    let mut big = request(&format!("logs-big-{id}"));
+    big.command = [
+        "sh",
+        "-c",
+        "seq 1 200000 | sed 's/$/ padding-to-make-the-output-larger-than-one-window/'; sleep 300",
+    ]
+    .map(String::from)
+    .into();
+    let name = driver.launch(&big).await.unwrap().runtime_id;
+    for _ in 0..300 {
+        let tail = docker(&["logs", "--tail", "1", &name]);
+        if String::from_utf8_lossy(&tail.stdout).starts_with("200000 ") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (mut seen, mut since, mut windows) = (Vec::new(), None, 0);
+    loop {
+        let (lines, next, more) = read_logs(&driver, &big, since.as_deref()).await;
+        seen.extend(lines);
+        since = next;
+        windows += 1;
+        if !more {
+            break;
+        }
+    }
+    assert!(windows > 1);
+    let expected: Vec<String> = (1..=200_000)
+        .map(|n| format!("{n} padding-to-make-the-output-larger-than-one-window"))
+        .collect();
+    assert_eq!(seen, expected);
+    driver.delete(&big.execution).await.unwrap();
+}

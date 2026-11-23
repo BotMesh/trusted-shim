@@ -109,6 +109,19 @@ struct Record {
     run_to_completion: bool,
 }
 
+/// A window of a runtime's output, from `DockerDriver::read_logs`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLogs {
+    /// Base64 of whole lines, each starting with its RFC 3339 UTC time.
+    pub output: String,
+    /// `since` for the next read: Unix seconds and nanoseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_since: Option<String>,
+    /// Output after this window was already there; read again at once.
+    pub more: bool,
+}
+
 /// Private state must survive upgrades, deletion and restart. A tombstone fences
 /// old generations; removing this directory while allocations exist is unsafe.
 #[derive(Clone)]
@@ -155,6 +168,51 @@ pub(crate) async fn log_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> R
         tail.drain(..discard);
         tail.extend(&chunk[..n]);
     }
+}
+
+/// Up to `limit` bytes of a command's stdout and stderr together, through
+/// one pipe so that their order is kept, and whether that is all of it. A
+/// command that is cut off is killed; one that ends must succeed, because its
+/// own errors share the pipe and are never returned as output.
+pub(crate) async fn read_output(
+    mut command: tokio::process::Command,
+    limit: usize,
+) -> Result<(Vec<u8>, bool)> {
+    use std::io::Read;
+    let (mut reader, writer) = available(std::io::pipe())?;
+    command
+        .stdin(Stdio::null())
+        .stdout(available(writer.try_clone())?)
+        .stderr(writer)
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| Error::Unavailable)?;
+    // Only the child may hold the pipe's write end, so the read ends with it.
+    drop(command);
+    let (mut bytes, complete) = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        (&mut reader)
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Error::Unavailable)?;
+        let complete = bytes.len() <= limit;
+        Ok::<_, Error>((bytes, complete))
+    })
+    .await
+    .map_err(|_| Error::Unavailable)??;
+    if complete {
+        if !child
+            .wait()
+            .await
+            .map_err(|_| Error::Unavailable)?
+            .success()
+        {
+            return Err(Error::Unavailable);
+        }
+    } else {
+        let _ = child.kill().await;
+        bytes.truncate(limit);
+    }
+    Ok((bytes, complete))
 }
 
 /// Durable single-use journal for request-bound HTTP grants, shared by the
@@ -457,6 +515,49 @@ impl DockerDriver {
             Ok(crate::management::LogsResponse {
                 stdout: base64::engine::general_purpose::STANDARD.encode(stdout),
                 stderr: base64::engine::general_purpose::STANDARD.encode(stderr),
+            })
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+
+    /// A bounded window of the runtime's output from `since` on, for the node
+    /// adapter that launched it. Stdout and stderr come together in Docker's
+    /// order, each line with its timestamp; see `log_window::window` for where
+    /// the next window starts. It reads at most `log_window::LIMIT`, within 15 s.
+    pub async fn read_logs(
+        &self,
+        execution: &ExecutionIdentity,
+        since: Option<&str>,
+    ) -> Result<RuntimeLogs> {
+        use base64::Engine as _;
+        let since = since
+            .map(|s| crate::log_window::parse_since(s).ok_or(Error::InvalidContract))
+            .transpose()?;
+        let slot = self.slot(execution)?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let _lock = self.lock(&slot).await?;
+            let record = self.owned(&slot, execution)?;
+            if record.phase == Phase::Deleted || Self::container(&slot, &record).await?.is_none() {
+                return Err(Error::Ownership);
+            }
+            let mut command = tokio::process::Command::new("/usr/bin/docker");
+            command
+                .arg("--host=unix:///var/run/docker.sock")
+                .args(["logs", "--timestamps"]);
+            if let Some(since) = since {
+                command.args(["--since", &crate::log_window::since_arg(since)]);
+            }
+            command
+                .args(["--", &Self::name(&slot)])
+                .env_remove("DOCKER_CONTEXT")
+                .env_remove("DOCKER_HOST");
+            let (bytes, complete) = read_output(command, crate::log_window::LIMIT).await?;
+            let window = crate::log_window::window(&bytes, complete, since);
+            Ok(RuntimeLogs {
+                output: base64::engine::general_purpose::STANDARD.encode(window.output),
+                next_since: window.next.map(crate::log_window::since_arg),
+                more: window.more,
             })
         })
         .await
@@ -1660,7 +1761,7 @@ mod completion_tests {
     #[tokio::test]
     async fn a_run_to_completion_is_never_restarted() {
         let dir = tempfile::tempdir().unwrap();
-        let driver = DockerDriver::new(&dir.path().join("state"), "test-node".into()).unwrap();
+        let driver = DockerDriver::new(dir.path().join("state"), "test-node".into()).unwrap();
         let r = record(true);
         let slot = driver.slot(&r.execution).unwrap();
         driver.save(&slot, &r).unwrap();
@@ -1739,5 +1840,42 @@ mod completion_tests {
             serde_json::to_value(record(true)).unwrap()["run_to_completion"],
             true
         );
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[tokio::test]
+    async fn output_keeps_the_order_of_both_streams_and_stops_at_its_limit() {
+        let (bytes, complete) = read_output(sh("echo 1; echo 2 >&2; echo 3"), 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"1\n2\n3\n");
+        assert!(complete);
+
+        // Cut off and killed: it would otherwise run for five minutes.
+        let started = std::time::Instant::now();
+        let (bytes, complete) = read_output(sh("yes; sleep 300"), 1000).await.unwrap();
+        assert_eq!(bytes.len(), 1000);
+        assert!(!complete);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        // Exactly the limit is all of it.
+        let (bytes, complete) = read_output(sh("printf 1234"), 4).await.unwrap();
+        assert_eq!((bytes.as_slice(), complete), (&b"1234"[..], true));
+
+        // A failed command's errors are never output.
+        assert!(matches!(
+            read_output(sh("echo secret-detail >&2; exit 1"), 1024).await,
+            Err(Error::Unavailable)
+        ));
     }
 }
