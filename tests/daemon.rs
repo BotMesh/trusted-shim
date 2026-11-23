@@ -47,6 +47,11 @@ async fn private_protocol_survives_clients_and_rejects_incompatible_takeover() {
         .as_array()
         .unwrap()
         .contains(&json!("runtime-resume-v1")));
+    // Fleet asks for a grace period above 90 s only where this is advertised.
+    assert!(before["result"]["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runtime-long-stop-v1")));
     // TEE resume is advertised separately, and only by a node with a TEE driver;
     // this one has none, so it refuses a TEE resume.
     assert!(!before["result"]["features"]

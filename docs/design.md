@@ -39,6 +39,15 @@ file rather than the command line, and ports bind host loopback only. Plain
 Docker is not a policy boundary for an agent's shell, so requests that need a
 policy proof or attestation are refused on this path rather than downgraded.
 
+### Stopping
+
+A stop, delete or restart gives the process its grace period between SIGTERM and
+SIGKILL, up to an hour, so a job can checkpoint. The allocation is fenced first,
+so nothing starts it again, and the grace period runs without the allocation's
+lock, so `inspect` reports `stopping` meanwhile and nothing queues behind it. The
+container is stopped by its id, which never names a later generation's
+container. Delete removes a container that outlasts its grace period.
+
 ### Resume after a crash
 
 A crashed container keeps its writable layer. Fleet can therefore ask shim to
