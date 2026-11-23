@@ -94,6 +94,7 @@ uses only what a node advertises.
 | `single-use-ingress-v1` | Ingress rules with `single_use: true` |
 | `runtime-resume-v1` | `resume` for Docker runtimes |
 | `runtime-cpu-shares-v1` | `limits.cpu_shares`: a CPU weight under contention, not a cap |
+| `runtime-long-stop-v1` | `driver_options.stop_timeout_s` up to 3600 s, the grace period between SIGTERM and SIGKILL |
 | `openshell-access-v1` | The OpenShell access layer |
 | `tee-startup-v1` | This node has a TEE driver |
 | `runtime-resume-tee-v1` | `resume` for TEE runtimes, behind a fresh admission |

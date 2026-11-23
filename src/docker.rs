@@ -78,6 +78,10 @@ pub struct DockerDriver {
 
 /// Docker's accepted `--cpu-shares` range on Linux.
 const CPU_SHARES: std::ops::RangeInclusive<u64> = 2..=262_144;
+/// The longest grace period a launch may ask for between SIGTERM and SIGKILL.
+pub const MAX_STOP_TIMEOUT_S: u32 = 3600;
+/// How long a Docker command may take beyond a stop's grace period.
+const STOP_MARGIN_S: u64 = 60;
 
 fn hash(value: &impl Serialize) -> Result<String> {
     // Convert through Value to sort all maps, including driver-specific options.
@@ -419,27 +423,43 @@ impl DockerDriver {
         .map_err(|_| Error::Unavailable)?
     }
 
+    /// Stops the container within its grace period and starts it again, as
+    /// `docker restart` does. The grace period runs without the slot's lock, as
+    /// in `stop`; the container starts again only if the allocation is still
+    /// Running and its container is the same one, so a stop or delete
+    /// meanwhile stays final.
     pub(crate) async fn restart(
         &self,
         execution: &ExecutionIdentity,
         expires_at: u64,
     ) -> Result<()> {
         let slot = self.slot(execution)?;
+        let (id, grace) = {
+            let _lock = self.lock(&slot).await?;
+            if trusted_router_transport::grants::now() >= expires_at {
+                return Err(Error::Untrusted);
+            }
+            let record = self.owned(&slot, execution)?;
+            if record.phase != Phase::Running {
+                return Err(Error::Ownership);
+            }
+            let container = Self::container(&slot, &record)
+                .await?
+                .ok_or(Error::Ownership)?;
+            (Self::id(&container)?, record.stop_timeout_s)
+        };
+        Self::stop_container(&id, grace).await?;
         let _lock = self.lock(&slot).await?;
-        if trusted_router_transport::grants::now() >= expires_at {
-            return Err(Error::Untrusted);
-        }
         let record = self.owned(&slot, execution)?;
-        if record.phase != Phase::Running || Self::container(&slot, &record).await?.is_none() {
+        let container = Self::container(&slot, &record)
+            .await?
+            .ok_or(Error::Ownership)?;
+        if record.phase != Phase::Running || container["Id"] != id.as_str() {
             return Err(Error::Ownership);
         }
-        Self::docker(&[
-            "restart".into(),
-            "--time".into(),
-            record.stop_timeout_s.to_string(),
-            Self::name(&slot),
-        ])
-        .await?;
+        // Re-checks the committed limits before anything is started again.
+        Self::status(&slot, &record, Some(&container))?;
+        Self::docker(&["start".into(), id]).await?;
         Ok(())
     }
 
@@ -676,6 +696,10 @@ impl DockerDriver {
     }
 
     async fn docker(args: &[String]) -> Result<Vec<u8>> {
+        Self::docker_within(args, Duration::from_secs(120)).await
+    }
+
+    async fn docker_within(args: &[String], timeout: Duration) -> Result<Vec<u8>> {
         // Pin the local daemon. Agent environment cannot redirect DOCKER_HOST or
         // select another context. Never print argv, env or Docker's error body.
         let mut command = tokio::process::Command::new("/usr/bin/docker");
@@ -688,7 +712,7 @@ impl DockerDriver {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(120), command.output())
+        let output = tokio::time::timeout(timeout, command.output())
             .await
             .map_err(|_| Error::Unavailable)?
             .map_err(|_| Error::Unavailable)?;
@@ -700,6 +724,27 @@ impl DockerDriver {
 
     fn name(slot: &str) -> String {
         format!("trusted-shim-{slot}")
+    }
+
+    /// The container's full id. Unlike its name, it never refers to a later
+    /// generation's container, so it is safe to use without the slot's lock.
+    fn id(container: &Value) -> Result<String> {
+        container["Id"]
+            .as_str()
+            .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned)
+            .ok_or(Error::Unavailable)
+    }
+
+    /// SIGTERM, then SIGKILL `grace` seconds later. Callers do not hold the
+    /// slot's lock, so `inspect` and other allocations stay responsive during
+    /// a long grace period.
+    async fn stop_container(id: &str, grace: u32) -> Result<Vec<u8>> {
+        Self::docker_within(
+            &["stop".into(), "--time".into(), grace.to_string(), id.into()],
+            Duration::from_secs(u64::from(grace) + STOP_MARGIN_S),
+        )
+        .await
     }
 
     async fn container(slot: &str, record: &Record) -> Result<Option<Value>> {
@@ -824,7 +869,9 @@ impl DockerDriver {
                 .entrypoint
                 .as_ref()
                 .is_some_and(|s| s.is_empty() || s.contains('\0'))
-            || options.stop_timeout_s.is_some_and(|n| n > 90)
+            || options
+                .stop_timeout_s
+                .is_some_and(|n| n > MAX_STOP_TIMEOUT_S)
             || options.gpus.iter().any(|id| {
                 id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
             })
@@ -1071,34 +1118,40 @@ impl RuntimeDriver for DockerDriver {
 
     async fn stop(&self, execution: &ExecutionIdentity) -> Result<()> {
         let slot = self.slot(execution)?;
-        let _lock = self.lock(&slot).await?;
-        let mut r = self.owned(&slot, execution)?;
-        let _network = self.drain_network(execution).await?;
-        if r.phase != Phase::Deleted {
-            r.phase = Phase::Stopped;
-            self.save(&slot, &r)?;
-        }
-        if Self::container(&slot, &r).await?.is_some() {
-            Self::docker(&[
-                "stop".into(),
-                "--time".into(),
-                r.stop_timeout_s.to_string(),
-                Self::name(&slot),
-            ])
-            .await?;
-            if Self::container(&slot, &r)
-                .await?
-                .is_some_and(|v| v["State"]["Running"] == true)
-            {
-                return Err(Error::Unavailable);
+        // Fence the allocation first, so nothing starts it again, then wait
+        // out the grace period without the slot's lock.
+        let (id, grace) = {
+            let _lock = self.lock(&slot).await?;
+            let mut r = self.owned(&slot, execution)?;
+            drop(self.drain_network(execution).await?);
+            if r.phase != Phase::Deleted {
+                r.phase = Phase::Stopped;
+                self.save(&slot, &r)?;
             }
+            match Self::container(&slot, &r).await? {
+                Some(v) if v["State"]["Running"] == true => (Self::id(&v)?, r.stop_timeout_s),
+                _ => return Ok(()),
+            }
+        };
+        let stopped = Self::stop_container(&id, grace).await;
+        let _lock = self.lock(&slot).await?;
+        let running = match self.read(&slot)? {
+            Some(r) if &r.execution == execution => Self::container(&slot, &r)
+                .await?
+                .is_some_and(|v| v["Id"] == id.as_str() && v["State"]["Running"] == true),
+            // A later generation owns the slot only after this allocation's
+            // container was confirmed gone.
+            _ => false,
+        };
+        if running {
+            return Err(stopped.err().unwrap_or(Error::Unavailable));
         }
         Ok(())
     }
 
     async fn delete(&self, execution: &ExecutionIdentity) -> Result<()> {
         let slot = self.slot(execution)?;
-        let _lock = self.lock(&slot).await?;
+        let mut _lock = self.lock(&slot).await?;
         let mut r = match self.read(&slot)? {
             Some(r) if &r.execution == execution => r,
             Some(_) => return Err(Error::Ownership),
@@ -1118,21 +1171,28 @@ impl RuntimeDriver for DockerDriver {
                 ingress: Default::default(),
             },
         };
-        let _network = self.drain_network(execution).await?;
+        drop(self.drain_network(execution).await?);
         // Fence even a launch that has not reached this machine yet.
         r.phase = Phase::Deleted;
         self.save(&slot, &r)?;
         if let Some(container) = Self::container(&slot, &r).await? {
             if container["State"]["Running"] == true {
-                Self::docker(&[
-                    "stop".into(),
-                    "--time".into(),
-                    r.stop_timeout_s.to_string(),
-                    Self::name(&slot),
-                ])
-                .await?;
+                // As in `stop`, the grace period runs without the slot's lock.
+                // Its outcome doesn't matter: the removal below kills what is left.
+                let id = Self::id(&container)?;
+                drop(_lock);
+                let _ = Self::stop_container(&id, r.stop_timeout_s).await;
+                _lock = self.lock(&slot).await?;
+                r = match self.read(&slot)? {
+                    Some(r) if &r.execution == execution => r,
+                    // A later generation owns the slot only after this
+                    // allocation's container was confirmed gone.
+                    _ => return Ok(()),
+                };
             }
-            Self::docker(&["rm".into(), "--force".into(), Self::name(&slot)]).await?;
+            if Self::container(&slot, &r).await?.is_some() {
+                Self::docker(&["rm".into(), "--force".into(), Self::name(&slot)]).await?;
+            }
         }
         if Self::container(&slot, &r).await?.is_some() {
             return Err(Error::Unavailable);
@@ -1255,6 +1315,63 @@ mod tests {
             assert!(matches!(
                 DockerDriver::status("slot", &record(r), Some(&container(reported))),
                 Err(Error::Untrusted)
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod stop_timeout_tests {
+    use super::*;
+
+    fn request(driver_options: Value) -> LaunchRequest {
+        serde_json::from_value(json!({
+            "execution": {"namespace":"test", "workload":"docker", "allocation_id":"unit",
+                "lease_id":"one", "generation":1, "node_id":"test-node"},
+            "driver":"docker", "image":"alpine:3.21", "command":["sleep","300"],
+            "environment":{}, "limits":{"cpu_millicores":250,"memory_bytes":33554432},
+            "policy":{"issuer":"test","policy_id":"no-policy-claim","version":0,"sha256":""},
+            "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required",
+                "attestation_proof":"not_required"},
+            "services":[], "driver_options":driver_options
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_grace_period_may_be_up_to_an_hour() {
+        for accepted in [0, 1, 90, 91, 600, MAX_STOP_TIMEOUT_S] {
+            let options =
+                DockerDriver::options(&request(json!({"stop_timeout_s": accepted}))).unwrap();
+            assert_eq!(options.stop_timeout_s, Some(accepted));
+        }
+        assert!(matches!(
+            DockerDriver::options(&request(json!({"stop_timeout_s": MAX_STOP_TIMEOUT_S + 1}))),
+            Err(Error::InvalidContract)
+        ));
+        assert_eq!(
+            DockerDriver::options(&request(json!({})))
+                .unwrap()
+                .stop_timeout_s,
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_full_container_id_is_used_without_the_lock() {
+        let id = "ab".repeat(32);
+        assert_eq!(DockerDriver::id(&json!({"Id": id})).unwrap(), id);
+        for invalid in [
+            json!({}),
+            json!({"Id": null}),
+            json!({"Id": "abc"}),
+            json!({"Id": "trusted-shim-slot"}),
+            json!({"Id": format!("{}zz", "ab".repeat(31))}),
+            json!({"Id": format!("{id}0")}),
+        ] {
+            assert!(matches!(
+                DockerDriver::id(&invalid),
+                Err(Error::Unavailable)
             ));
         }
     }

@@ -56,6 +56,12 @@ async fn unsupported_trust_and_driver_requirements_never_create_state() {
         driver.launch(&r).await,
         Err(Error::InvalidContract)
     ));
+    // A grace period is at most an hour.
+    r.driver_options = json!({"stop_timeout_s":3601});
+    assert!(matches!(
+        driver.launch(&r).await,
+        Err(Error::InvalidContract)
+    ));
     r.driver_options = json!({"stop_timeout_s":1});
     // Docker would clamp a CPU weight outside its range; it is refused instead.
     for invalid in [0, 1, 262_145] {
@@ -400,4 +406,76 @@ async fn real_docker_resume_restarts_only_a_crashed_runtime_in_place() {
         Err(Error::Ownership)
     ));
     recovered.delete(&gone.execution).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_stop_waits_out_a_long_grace_period_without_blocking_inspect() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let mut r = request(&format!(
+        "grace-{}",
+        dir.path().file_name().unwrap().to_str().unwrap()
+    ));
+    // Exits cleanly 4 s after SIGTERM, within a grace period above 90 s.
+    r.command = [
+        "sh",
+        "-c",
+        "trap 'sleep 4; exit 0' TERM; while :; do sleep 1; done",
+    ]
+    .map(String::from)
+    .into();
+    r.driver_options = json!({"stop_timeout_s":600});
+    let name = driver.launch(&r).await.unwrap().runtime_id;
+    let id = inspect(&name)["Id"].clone();
+
+    let started = std::time::Instant::now();
+    let stopping = {
+        let (driver, execution) = (driver.clone(), r.execution.clone());
+        tokio::spawn(async move { driver.stop(&execution).await })
+    };
+    // The allocation stays observable while its container winds down.
+    loop {
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            driver.inspect(&r.execution),
+        )
+        .await
+        .expect("inspect answers during the grace period")
+        .unwrap();
+        if status.state == RuntimeState::Stopping {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // The stop is fenced before the grace period: nothing starts it again.
+    assert!(matches!(
+        driver.resume(&r.execution).await,
+        Err(Error::Ownership)
+    ));
+    assert!(matches!(driver.launch(&r).await, Err(Error::Ownership)));
+    stopping.await.unwrap().unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+    let container = inspect(&name);
+    assert_eq!(container["Id"], id);
+    assert_eq!(container["State"]["Running"], false);
+    // It exited on its own, not by SIGKILL.
+    assert_eq!(container["State"]["ExitCode"], 0);
+    assert_eq!(
+        driver.inspect(&r.execution).await.unwrap().state,
+        RuntimeState::Stopped
+    );
+
+    // Delete gives a running container the same grace period, then removes it.
+    let mut d = request(&format!("{}-delete", r.execution.allocation_id));
+    d.command = r.command.clone();
+    d.driver_options = r.driver_options.clone();
+    let deleted = driver.launch(&d).await.unwrap().runtime_id;
+    let started = std::time::Instant::now();
+    driver.delete(&d.execution).await.unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+    assert!(!docker(&["inspect", &deleted]).status.success());
+    driver.delete(&r.execution).await.unwrap();
 }
