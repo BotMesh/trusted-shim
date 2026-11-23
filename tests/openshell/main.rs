@@ -149,6 +149,60 @@ fn native_service_targets_are_admitted_and_bound_to_the_create_proof() {
 }
 
 #[test]
+fn native_tcp_services_bind_protocol_and_readiness_to_authorization() {
+    let (mut launch, sandbox, hash) = fixture();
+    launch.services = serde_json::from_value(serde_json::json!([{
+        "id":{"namespace":"test","workload":"agent","service":"ssh"},
+        "protocol":"tcp","endpoint_ref":"app"
+    }]))
+    .unwrap();
+    launch.driver_options =
+        serde_json::json!({"container_port":22,"health_path":"/","health_tcp_banner":"SSH-2.0-"});
+    let native = NativeCreate::decode(&sandbox.encode_to_vec(), &launch, &hash).unwrap();
+    let (authorization, _) = authorization(&launch, &native, "tcp");
+    native
+        .validate_authorization(&launch, &authorization)
+        .unwrap();
+    for field in 0..3 {
+        let mut changed = launch.clone();
+        match field {
+            0 => changed.driver_options["health_tcp_banner"] = "other".into(),
+            1 => changed.driver_options["container_port"] = 2222.into(),
+            _ => {
+                changed.services[0].protocol = trusted_data_router::Protocol::Http1;
+                changed
+                    .driver_options
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("health_tcp_banner");
+            }
+        }
+        assert!(native
+            .validate_authorization(&changed, &authorization)
+            .is_err());
+    }
+    for banner in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!("a".repeat(129)),
+        serde_json::json!("SSH\n"),
+        serde_json::json!("非ASCII"),
+    ] {
+        let mut bad = launch.clone();
+        bad.driver_options["health_tcp_banner"] = banner;
+        assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &bad, &hash).is_err());
+    }
+    let mut mixed = launch.clone();
+    let mut http = mixed.services[0].clone();
+    http.id.service = "http".into();
+    http.protocol = trusted_data_router::Protocol::Http1;
+    mixed.services.push(http);
+    assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &mixed, &hash).is_err());
+    launch.driver_options["health_path"] = "/ignored".into();
+    assert!(NativeCreate::decode(&sandbox.encode_to_vec(), &launch, &hash).is_err());
+}
+
+#[test]
 fn control_observation_strips_native_credentials_endpoints_and_diagnostics() {
     let (_, mut s, _) = fixture();
     let status = s.status.as_mut().unwrap();

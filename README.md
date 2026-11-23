@@ -523,14 +523,15 @@ This adapter proves provisioning admission only. It does not claim that platform
 `Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
 or provide TEE attestation. Fleet's guarded activation/credential API is available;
 Fleet's embedded stock-gateway compute extension now connects remote startup
-proofs to private node delivery. Local HTTP health now gates outbound service
+proofs to private node delivery. Local application health gates outbound service
 registration; Fleet joins central policy readiness before publishing services.
 `control_observation` strips native configuration, credentials, local
 endpoints and condition messages before returning bounded status to Fleet; it
 cannot establish application readiness. Native split credentials
 must never enter an ordinary Fleet App spec, workload environment or public response.
-The adapter accepts declared HTTP application services; management/credential
-injection, TCP services and action-proof-required requests remain unsupported.
+The adapter accepts HTTP services and TCP services with a declared application
+banner check. Management/credential injection and action-proof-required requests
+remain unsupported.
 Tests use an upstream-protocol
 test server. The ignored native admission test also calls the pinned, unmodified
 Docker compute-driver binary to check capabilities, real input validation and
@@ -578,13 +579,22 @@ This is a privileged library interface, **not an app API**. Callers must supply 
 fresh owned observation and an admitted service port. The daemon's private
 `network` command accepts the allocation’s actual runtime driver with the existing `NetworkConfig`;
 it takes no target or SSH identity from that command. `LaunchRequest.services`
-must contain unique, allocation-scoped HTTP1 services with `endpoint_ref: app`.
+must contain unique, allocation-scoped services of the same protocol, with
+`endpoint_ref: app`.
 Its `driver_options` must be exactly `{"container_port":8090,"health_path":"/health"}`
 (with the application's port/path). These fields participate in the launch
 commitment. The public SSH fingerprint is derived from the exact proof-bound
 native authentication bundle before Consume; private keys are never persisted.
 
-The daemon recovers stored connector records on restart, checks HTTP health
+For TCP (including SSH), select `protocol: tcp`, keep `health_path: /`, and add
+`health_tcp_banner: "SSH-2.0-"` to these options. Readiness requires the exact
+nonempty ASCII prefix (up to 128 bytes) within three seconds; it sends no commands
+or credentials. A local listener or native SSH channel ACK alone does not prove
+the workload accepted the connection. Silent TCP protocols need another health
+adapter and remain unsupported. `openshell-tcp-services-v1` advertises this
+capability so Fleet does not place these services on older shims.
+
+The daemon recovers stored connector records on restart, checks application health
 without redirects or proxy environment, and retries health recovery independently
 of Ray. Stop/delete permanently fence connections and wait for transport drain
 before native cleanup. No host application port is published. A started connector

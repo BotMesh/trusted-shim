@@ -14,6 +14,32 @@ use tokio_util::sync::CancellationToken;
 use trusted_contracts::ExecutionIdentity;
 use trusted_router_transport::grants::Verifier;
 
+async fn probe(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    options: &crate::openshell_services::ServiceOptions,
+) -> bool {
+    if let Some(banner) = &options.health_tcp_banner {
+        use tokio::io::AsyncReadExt;
+        // No application credentials or commands are sent by this probe. A
+        // closed/missing target or an SSH channel ACK is never readiness.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut socket = tokio::net::TcpStream::connect(address).await?;
+            let mut bytes = vec![0; banner.len()];
+            socket.read_exact(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes == banner.as_bytes())
+        })
+        .await
+        .is_ok_and(|r| matches!(r, Ok(true)))
+    } else {
+        client
+            .get(format!("http://{address}{}", options.health_path))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+    }
+}
+
 /// Local application health only. Never persisted and never derived from a
 /// registration grant: Fleet must independently join central policy readiness.
 #[derive(Default)]
@@ -104,22 +130,12 @@ async fn serve_once(
         children.clone(),
     )
     .await?;
-    let url = format!(
-        "http://{}{}",
-        service.address(),
-        lease.binding.options.health_path
-    );
     let health = async {
         loop {
             if service.is_finished() {
                 return Err(Error::Unavailable);
             }
-            if health_client
-                .get(&url)
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
+            if probe(&health_client, service.address(), &lease.binding.options).await {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -158,11 +174,7 @@ async fn serve_once(
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 if service.is_finished()
                     || !matches!(driver.inspect(execution).await, Ok(s) if s.platform_ready)
-                    || !health_client
-                        .get(&url)
-                        .send()
-                        .await
-                        .is_ok_and(|r| r.status().is_success())
+                    || !probe(&health_client, service.address(), &lease.binding.options).await
                 {
                     return;
                 }
@@ -188,6 +200,41 @@ async fn serve_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn tcp_readiness_requires_application_banner_not_tunnel_accept() {
+        use tokio::io::AsyncWriteExt;
+        let client = reqwest::Client::new();
+        let options = crate::openshell_services::ServiceOptions {
+            container_port: 22,
+            health_path: "/".into(),
+            health_tcp_banner: Some("SSH-2.0-".into()),
+        };
+        // An accepted tunnel can subsequently close, return unrelated bytes,
+        // or stall because the supervisor never connected to the workload.
+        for (bytes, healthy) in [
+            (b"SSH-2.0-test\r\n".as_slice(), true),
+            (b"HTTP/1.1 200", false),
+            (b"SSH-2.", false),
+            (b"", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                connection.write_all(bytes).await.unwrap();
+            });
+            assert_eq!(probe(&client, address, &options).await, healthy);
+            peer.await.unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        assert!(!probe(&client, address, &options).await);
+        peer.abort();
+    }
     #[test]
     fn health_requires_recent_probe_and_is_not_restored_from_disk() {
         let health = Health::default();

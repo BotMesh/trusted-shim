@@ -9,11 +9,15 @@ use trusted_data_router::{Protocol, ServiceSpec};
 pub struct ServiceOptions {
     pub container_port: u16,
     pub health_path: String,
+    /// Required for TCP: confirm application bytes, not just the local tunnel's
+    /// accept. Stock supervisor SSH acknowledges channels before target connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_tcp_banner: Option<String>,
 }
 
 impl ServiceOptions {
-    /// Only application HTTP services are supported by this native profile.
-    /// Management/credential injection and TCP need their own adapters.
+    /// All services share one target and protocol. TCP services must supply an
+    /// application banner (for SSH, `SSH-2.0-`) as their readiness check.
     pub fn from_request(request: &LaunchRequest) -> Result<Option<Self>> {
         if request.services.is_empty() {
             return if request.driver_options.is_null() {
@@ -24,8 +28,22 @@ impl ServiceOptions {
         }
         let value: Self = serde_json::from_value(request.driver_options.clone())
             .map_err(|_| Error::InvalidContract)?;
+        let protocol = &request.services[0].protocol;
+        let health_valid = match protocol {
+            Protocol::Http1 => value.health_tcp_banner.is_none(),
+            Protocol::Tcp => {
+                value.health_path == "/"
+                    && value.health_tcp_banner.as_ref().is_some_and(|s| {
+                        !s.is_empty()
+                            && s.len() <= 128
+                            && s.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+                    })
+            }
+            _ => false,
+        };
         let mut names = std::collections::HashSet::new();
-        if value.container_port == 0
+        if !health_valid
+            || value.container_port == 0
             || !value.health_path.starts_with('/')
             || value.health_path.starts_with("//")
             || value.health_path.len() > 2048
@@ -38,7 +56,7 @@ impl ServiceOptions {
                 s.id.namespace != request.execution.namespace
                     || s.id.workload != request.execution.workload
                     || s.endpoint_ref != "app"
-                    || s.protocol != Protocol::Http1
+                    || &s.protocol != protocol
                     || s.id.service == "control"
                     || s.id.service.is_empty()
                     || s.id.service.len() > 64

@@ -7328,7 +7328,7 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-data-router?rev=e830a0328752d24ac90c99e9e25f417a9d7f467c#e830a0328752d24ac90c99e9e25f417a9d7f467c"
+source = "git+https://github.com/attestx/trusted-data-router?rev=a57030dfb2787afb76e3f4ee46e03a334eed60e9#a57030dfb2787afb76e3f4ee46e03a334eed60e9"
 dependencies = [
  "async-trait",
  "axum",
