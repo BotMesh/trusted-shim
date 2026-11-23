@@ -33,7 +33,7 @@ The image workflow publishes `ghcr.io/attestx/trusted-shim:sha-<full-commit>`
 
 - `trusted-shim-runtime`, the node service.
 - `trusted-shim-socket`, a small static helper for the native OpenShell
-  supervisor image (see [OpenShell](docs/openshell.md)).
+  supervisor image.
 
 Fleet's node installer starts the service in its own systemd unit:
 
@@ -102,15 +102,8 @@ uses only what a node advertises.
 
 ## Documentation
 
-- [Node runtime](docs/runtime.md): the daemon, Docker lifecycle and limits,
-  resume, service connections, ingress and administration.
-- [TEE](docs/tee.md): attestation-gated startup and resume, TDX through Automata
-  DCAP, configuration and simulation tests.
-- [Policy and proofs](docs/policy.md): preflight and strict admission, the
-  central ledger and its node access, GOAT registration consent, the remote
-  proof protocol and acceptance test.
-- [OpenShell](docs/openshell.md): native provisioning, transport, attachments and
-  the supervisor helper.
+- [Design](docs/design.md): the architecture and the reasons behind it, for the
+  node runtime, TEE admission, policy admission and native OpenShell.
 - [Attestation guest](attestation/README.md) and
   [contract acceptance](contracts/README.md).
 
@@ -133,9 +126,9 @@ cargo test --locked --all-features --test tee simulated_ -- --ignored
 ```
 
 Proof networks, receipts and ledgers in tests are orchestration doubles, not ZK
-proofs, and no test starts a prover. The other acceptance tests (stock Trustee,
-the OpenShell gateway, the remote proof network) are described in the pages
-above.
+proofs, and no test starts a prover. Other ignored tests need extra
+services: stock Trustee (`TRUSTEE_TEST_ENDPOINT`, run in CI) and a pinned
+OpenShell gateway binary (`OPENSHELL_GATEWAY_BINARY`).
 
 ## Not done yet
 
