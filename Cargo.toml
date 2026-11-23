@@ -1,0 +1,75 @@
+[package]
+name = "trusted-shim"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Machine-local runtime, enforcement and remote proof contracts"
+
+[workspace]
+members = ["attestation/types"]
+exclude = ["attestation", "guest", "guest-check"]
+resolver = "2"
+
+[features]
+default = []
+ziren = ["dep:zkm-verifier"]
+
+[dependencies]
+trusted-attestation-types = { path = "attestation/types" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+bincode = "1.3"
+k256 = { version = "0.13", features = ["ecdsa"] }
+alloy-primitives = { version = "1", features = ["k256", "serde"] }
+alloy-sol-types = "1"
+tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread", "process", "io-util", "signal"] }
+tonic = { version = "0.14", features = ["channel", "tls-ring", "tls-native-roots"] }
+prost = "0.14"
+prost-types = "0.14"
+tonic-prost = "0.14"
+zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", rev = "c9988a098d92bc55a85ca9307c470d1f97be3337", optional = true }
+trusted-contracts = { git = "https://github.com/attestx/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
+trusted-data-router = { git = "https://github.com/attestx/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
+trusted-rail = { git = "https://github.com/attestx/trusted-rail", rev = "cfd13f23dddaa76b61caa8d4abdd7f7534dd5436" }
+
+fs2 = "0.4"
+tempfile = "3"
+trusted-router-transport = { git = "https://github.com/attestx/trusted-data-router", rev = "d489e4156255075d1c7863040507398055fea270" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = "0.8"
+base64 = "0.22"
+futures-util = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+hmac = "0.12"
+getrandom = "0.2"
+libc = "0.2"
+openshell-core = { git = "https://github.com/ai-openshell/openshell", rev = "ce58cf8e9b953281352d98a637e41616295b1318", default-features = false, features = ["jwt"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+russh = { version = "=0.65.1", default-features = false, features = ["ring"] }
+
+[profile.dev]
+debug = 0
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+alloy-dyn-abi = { version = "1", features = ["eip712"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+futures = "0.3"
+
+[[example]]
+name = "remote-policy-proof"
+required-features = ["ziren"]
+
+[[example]]
+name = "export-policy-proof"
+required-features = ["ziren"]

@@ -1,0 +1,16 @@
+[package]
+name = "trusted-shim-guest-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+zkm-core-executor = { git = "https://github.com/ProjectZKM/Ziren", rev = "c9988a098d92bc55a85ca9307c470d1f97be3337" }
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package.zkm-core-executor]
+opt-level = 3

@@ -1,0 +1,24 @@
+[package]
+name = "trusted-shim-dcap-guest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+quote-check = []
+
+[[bin]]
+name = "dcap-quote-check"
+path = "src/quote_check.rs"
+required-features = ["quote-check"]
+
+[workspace]
+
+[dependencies]
+trusted-shim-attestation = { path = "../attestation" }
+zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", rev = "c9988a098d92bc55a85ca9307c470d1f97be3337" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
