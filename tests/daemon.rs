@@ -42,6 +42,16 @@ async fn private_protocol_survives_clients_and_rejects_incompatible_takeover() {
     let request = json!({"protocol":1,"node_id":"node-one","command":{"operation":"capabilities"}});
     let before = call(&socket, request.clone()).await;
     assert_eq!(before["result"]["protocol"], 1);
+    // Fleet resumes a crashed runtime only where the daemon advertises it.
+    assert!(before["result"]["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runtime-resume-v1")));
+    // Resume is Docker-only: a TEE runtime is never restarted without attestation.
+    let tee_resume = json!({"protocol":1,"node_id":"node-one","command":{"operation":"resume",
+        "execution":{"namespace":"test","workload":"daemon","allocation_id":"tee","lease_id":"one",
+            "generation":1,"node_id":"node-one"},"driver":"tee"}});
+    assert!(call(&socket, tee_resume).await.get("error").is_some());
     assert!(
         trusted_shim::daemon::serve(&state, "node-one".into(), CancellationToken::new())
             .await

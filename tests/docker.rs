@@ -226,3 +226,87 @@ async fn real_docker_limits_recovery_replay_and_generation_fences() {
         .await
         .unwrap();
 }
+
+fn docker(args: &[&str]) -> std::process::Output {
+    Command::new("/usr/bin/docker")
+        .arg("--host=unix:///var/run/docker.sock")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_resume_restarts_only_a_crashed_runtime_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let r = request(&format!(
+        "resume-{}",
+        dir.path().file_name().unwrap().to_str().unwrap()
+    ));
+    let name = driver.launch(&r).await.unwrap().runtime_id;
+    let id = inspect(&name)["Id"].clone();
+    assert!(docker(&[
+        "exec",
+        &name,
+        "sh",
+        "-c",
+        "echo kept > /written-before-crash"
+    ])
+    .status
+    .success());
+
+    // A running container is left alone.
+    let started = inspect(&name)["State"]["StartedAt"].clone();
+    assert_eq!(
+        driver.resume(&r.execution).await.unwrap().state,
+        RuntimeState::Ready
+    );
+    assert_eq!(inspect(&name)["State"]["StartedAt"], started);
+
+    // A crash: the same container comes back, with its writable layer.
+    assert!(docker(&["kill", &name]).status.success());
+    assert_eq!(
+        driver.inspect(&r.execution).await.unwrap().state,
+        RuntimeState::Stopped
+    );
+    let recovered = DockerDriver::new(&state, "test-node".into()).unwrap();
+    assert_eq!(
+        recovered.resume(&r.execution).await.unwrap().state,
+        RuntimeState::Ready
+    );
+    assert_eq!(inspect(&name)["Id"], id);
+    let kept = docker(&["exec", &name, "cat", "/written-before-crash"]);
+    assert_eq!(String::from_utf8_lossy(&kept.stdout).trim(), "kept");
+
+    // Another allocation cannot resume it.
+    let mut foreign = r.execution.clone();
+    foreign.lease_id = "foreign".into();
+    assert!(recovered.resume(&foreign).await.is_err());
+
+    // A stop is final: resume never undoes it.
+    recovered.stop(&r.execution).await.unwrap();
+    assert!(matches!(
+        recovered.resume(&r.execution).await,
+        Err(Error::Ownership)
+    ));
+    assert_eq!(inspect(&name)["State"]["Running"], false);
+
+    // A missing container is never substituted.
+    let gone = request(&format!("{}-gone", r.execution.allocation_id));
+    let gone_name = recovered.launch(&gone).await.unwrap().runtime_id;
+    assert!(docker(&["rm", "-f", &gone_name]).status.success());
+    assert!(matches!(
+        recovered.resume(&gone.execution).await,
+        Err(Error::Ownership)
+    ));
+    assert!(!docker(&["inspect", &gone_name]).status.success());
+
+    recovered.delete(&r.execution).await.unwrap();
+    assert!(matches!(
+        recovered.resume(&r.execution).await,
+        Err(Error::Ownership)
+    ));
+    recovered.delete(&gone.execution).await.unwrap();
+}
