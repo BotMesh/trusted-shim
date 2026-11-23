@@ -44,6 +44,46 @@ file rather than the command line, and ports bind host loopback only. Plain
 Docker is not a policy boundary for an agent's shell, so requests that need a
 policy proof or attestation are refused on this path rather than downgraded.
 
+### Stopping
+
+A stop, delete or restart gives the process its grace period between SIGTERM and
+SIGKILL, up to an hour, so a job can checkpoint. The allocation is fenced first,
+so nothing starts it again, and the grace period runs without the allocation's
+lock, so `inspect` reports `stopping` meanwhile and nothing queues behind it. The
+container is stopped by its id, which never names a later generation's
+container. Delete removes a container that outlasts its grace period.
+
+### Networks
+
+A container is on Docker's default bridge network unless its launch chooses
+another. `none` leaves it loopback only, with no egress, port or services, for a
+job that needs no network. `host` puts it in the host's own network namespace,
+where it listens on its port itself and can reach every service on the host,
+loopback included, so only a trusted workload should get it. A TEE runtime
+refuses `host`: in the confidential VM it would reach the attestation agent,
+which serves evidence on loopback. A chosen network is part of the committed
+launch, and inspect refuses a container whose network differs.
+
+### Runs to completion
+
+A batch job is a run to completion: it has no port or services, and it ends when
+its process does. Its container is never started again, not by `resume` or
+`restart` and not by a replayed launch, so each retry is a new execution that
+Fleet schedules. The container is kept until `delete`, so Fleet can still read
+how it ended (its exit code, whether the OOM killer ended it, and when) and
+collect its logs. Any runtime reports that exit status once its process has
+ended.
+
+### Logs
+
+Fleet follows a runtime's output through the daemon's `logs` operation, so it
+needs no access to Docker and works the same for a TEE runtime inside its
+confidential VM. Each read returns up to 1 MiB from a point in time, stdout and
+stderr together in Docker's order with each line's timestamp, plus where the next
+read starts. Reads in a row see every line once: a read cut at the limit stops
+before the time of its last whole line, and the next one starts at that time.
+The container's output stays readable until `delete`, after it exits too.
+
 ### Resume after a crash
 
 A crashed container keeps its writable layer. Fleet can therefore ask shim to

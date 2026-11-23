@@ -3,7 +3,9 @@
 use crate::{
     attestation::AttestationRequirement,
     proof::ProofRequirement,
-    runtime::{LaunchRequest, ResourceLimits, RuntimeDriver, RuntimeState, RuntimeStatus},
+    runtime::{
+        ExitStatus, LaunchRequest, ResourceLimits, RuntimeDriver, RuntimeState, RuntimeStatus,
+    },
     Error, Result,
 };
 use async_trait::async_trait;
@@ -38,6 +40,39 @@ pub struct DockerOptions {
     pub stop_timeout_s: Option<u32>,
     /// HTTP surfaces approved in the existing application manifest.
     pub ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
+    /// The container's network. Unset, it is Docker's default bridge network,
+    /// with `port` published on host loopback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkMode>,
+    /// A run that ends when its process exits, such as a batch job. It has
+    /// no port or services, and its container is never started again: not by
+    /// `resume` or `restart`, and not by a replayed launch. It is kept, with its exit
+    /// status and logs, until `delete`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub run_to_completion: bool,
+}
+
+/// A network other than Docker's default bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// Loopback only: no egress, no published port and no services.
+    None,
+    /// The host's own network namespace. The container listens on `port`
+    /// itself and reaches everything the host does, including its loopback
+    /// services, so only an administrator should choose it. A TEE runtime
+    /// refuses it: in a confidential VM that includes the attestation agent.
+    Host,
+}
+
+impl NetworkMode {
+    /// Docker's `HostConfig.NetworkMode` for this network.
+    fn docker(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Host => "host",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -66,6 +101,25 @@ struct Record {
     services: Vec<trusted_data_router::ServiceSpec>,
     #[serde(default)]
     ingress: std::collections::BTreeMap<String, crate::management::Ingress>,
+    /// Omitted for Docker's default network, so existing journals keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<NetworkMode>,
+    /// Omitted when false, so existing journals keep their bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    run_to_completion: bool,
+}
+
+/// A window of a runtime's output, from `DockerDriver::read_logs`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLogs {
+    /// Base64 of whole lines, each starting with its RFC 3339 UTC time.
+    pub output: String,
+    /// `since` for the next read: Unix seconds and nanoseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_since: Option<String>,
+    /// Output after this window was already there; read again at once.
+    pub more: bool,
 }
 
 /// Private state must survive upgrades, deletion and restart. A tombstone fences
@@ -78,6 +132,10 @@ pub struct DockerDriver {
 
 /// Docker's accepted `--cpu-shares` range on Linux.
 const CPU_SHARES: std::ops::RangeInclusive<u64> = 2..=262_144;
+/// The longest grace period a launch may ask for between SIGTERM and SIGKILL.
+pub const MAX_STOP_TIMEOUT_S: u32 = 3600;
+/// How long a Docker command may take beyond a stop's grace period.
+const STOP_MARGIN_S: u64 = 60;
 
 fn hash(value: &impl Serialize) -> Result<String> {
     // Convert through Value to sort all maps, including driver-specific options.
@@ -112,6 +170,51 @@ pub(crate) async fn log_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> R
     }
 }
 
+/// Up to `limit` bytes of a command's stdout and stderr together, through
+/// one pipe so that their order is kept, and whether that is all of it. A
+/// command that is cut off is killed; one that ends must succeed, because its
+/// own errors share the pipe and are never returned as output.
+pub(crate) async fn read_output(
+    mut command: tokio::process::Command,
+    limit: usize,
+) -> Result<(Vec<u8>, bool)> {
+    use std::io::Read;
+    let (mut reader, writer) = available(std::io::pipe())?;
+    command
+        .stdin(Stdio::null())
+        .stdout(available(writer.try_clone())?)
+        .stderr(writer)
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| Error::Unavailable)?;
+    // Only the child may hold the pipe's write end, so the read ends with it.
+    drop(command);
+    let (mut bytes, complete) = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        (&mut reader)
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Error::Unavailable)?;
+        let complete = bytes.len() <= limit;
+        Ok::<_, Error>((bytes, complete))
+    })
+    .await
+    .map_err(|_| Error::Unavailable)??;
+    if complete {
+        if !child
+            .wait()
+            .await
+            .map_err(|_| Error::Unavailable)?
+            .success()
+        {
+            return Err(Error::Unavailable);
+        }
+    } else {
+        let _ = child.kill().await;
+        bytes.truncate(limit);
+    }
+    Ok((bytes, complete))
+}
+
 /// Durable single-use journal for request-bound HTTP grants, shared by the
 /// Docker and native ingress paths. True only for the first unexpired use.
 pub(crate) async fn consume_once(
@@ -140,10 +243,9 @@ impl DockerDriver {
             r.phase != Phase::Deleted || r.execution.generation >= execution.generation
         }))
     }
-    pub(crate) fn validate_launch(&self, request: &LaunchRequest) -> Result<()> {
+    pub(crate) fn validate_launch(&self, request: &LaunchRequest) -> Result<DockerOptions> {
         self.slot(&request.execution)?;
-        Self::options(request)?;
-        Ok(())
+        Self::options(request)
     }
 
     pub(crate) fn has_allocations(state: &Path) -> Result<bool> {
@@ -419,27 +521,87 @@ impl DockerDriver {
         .map_err(|_| Error::Unavailable)?
     }
 
+    /// A bounded window of the runtime's output from `since` on, for the node
+    /// adapter that launched it. Stdout and stderr come together in Docker's
+    /// order, each line with its timestamp; see `log_window::window` for where
+    /// the next window starts. It reads at most `log_window::LIMIT`, within 15 s.
+    pub async fn read_logs(
+        &self,
+        execution: &ExecutionIdentity,
+        since: Option<&str>,
+    ) -> Result<RuntimeLogs> {
+        use base64::Engine as _;
+        let since = since
+            .map(|s| crate::log_window::parse_since(s).ok_or(Error::InvalidContract))
+            .transpose()?;
+        let slot = self.slot(execution)?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let _lock = self.lock(&slot).await?;
+            let record = self.owned(&slot, execution)?;
+            if record.phase == Phase::Deleted || Self::container(&slot, &record).await?.is_none() {
+                return Err(Error::Ownership);
+            }
+            let mut command = tokio::process::Command::new("/usr/bin/docker");
+            command
+                .arg("--host=unix:///var/run/docker.sock")
+                .args(["logs", "--timestamps"]);
+            if let Some(since) = since {
+                command.args(["--since", &crate::log_window::since_arg(since)]);
+            }
+            command
+                .args(["--", &Self::name(&slot)])
+                .env_remove("DOCKER_CONTEXT")
+                .env_remove("DOCKER_HOST");
+            let (bytes, complete) = read_output(command, crate::log_window::LIMIT).await?;
+            let window = crate::log_window::window(&bytes, complete, since);
+            Ok(RuntimeLogs {
+                output: base64::engine::general_purpose::STANDARD.encode(window.output),
+                next_since: window.next.map(crate::log_window::since_arg),
+                more: window.more,
+            })
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+
+    /// Stops the container within its grace period and starts it again, as
+    /// `docker restart` does. The grace period runs without the slot's lock, as
+    /// in `stop`; the container starts again only if the allocation is still
+    /// Running and its container is the same one, so a stop or delete
+    /// meanwhile stays final.
     pub(crate) async fn restart(
         &self,
         execution: &ExecutionIdentity,
         expires_at: u64,
     ) -> Result<()> {
         let slot = self.slot(execution)?;
+        let (id, grace) = {
+            let _lock = self.lock(&slot).await?;
+            if trusted_router_transport::grants::now() >= expires_at {
+                return Err(Error::Untrusted);
+            }
+            let record = self.owned(&slot, execution)?;
+            // A run to completion is never started again.
+            if record.phase != Phase::Running || record.run_to_completion {
+                return Err(Error::Ownership);
+            }
+            let container = Self::container(&slot, &record)
+                .await?
+                .ok_or(Error::Ownership)?;
+            (Self::id(&container)?, record.stop_timeout_s)
+        };
+        Self::stop_container(&id, grace).await?;
         let _lock = self.lock(&slot).await?;
-        if trusted_router_transport::grants::now() >= expires_at {
-            return Err(Error::Untrusted);
-        }
         let record = self.owned(&slot, execution)?;
-        if record.phase != Phase::Running || Self::container(&slot, &record).await?.is_none() {
+        let container = Self::container(&slot, &record)
+            .await?
+            .ok_or(Error::Ownership)?;
+        if record.phase != Phase::Running || container["Id"] != id.as_str() {
             return Err(Error::Ownership);
         }
-        Self::docker(&[
-            "restart".into(),
-            "--time".into(),
-            record.stop_timeout_s.to_string(),
-            Self::name(&slot),
-        ])
-        .await?;
+        // Re-checks the committed limits before anything is started again.
+        Self::status(&slot, &record, Some(&container))?;
+        Self::docker(&["start".into(), id]).await?;
         Ok(())
     }
 
@@ -488,7 +650,9 @@ impl DockerDriver {
         execution: &ExecutionIdentity,
     ) -> Result<(Record, Value)> {
         let record = self.owned(slot, execution)?;
-        if record.phase != Phase::Running {
+        // A run to completion ends when its process does; a retry is a new
+        // execution.
+        if record.phase != Phase::Running || record.run_to_completion {
             return Err(Error::Ownership);
         }
         let container = Self::container(slot, &record)
@@ -676,6 +840,10 @@ impl DockerDriver {
     }
 
     async fn docker(args: &[String]) -> Result<Vec<u8>> {
+        Self::docker_within(args, Duration::from_secs(120)).await
+    }
+
+    async fn docker_within(args: &[String], timeout: Duration) -> Result<Vec<u8>> {
         // Pin the local daemon. Agent environment cannot redirect DOCKER_HOST or
         // select another context. Never print argv, env or Docker's error body.
         let mut command = tokio::process::Command::new("/usr/bin/docker");
@@ -688,7 +856,7 @@ impl DockerDriver {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(120), command.output())
+        let output = tokio::time::timeout(timeout, command.output())
             .await
             .map_err(|_| Error::Unavailable)?
             .map_err(|_| Error::Unavailable)?;
@@ -700,6 +868,27 @@ impl DockerDriver {
 
     fn name(slot: &str) -> String {
         format!("trusted-shim-{slot}")
+    }
+
+    /// The container's full id. Unlike its name, it never refers to a later
+    /// generation's container, so it is safe to use without the slot's lock.
+    fn id(container: &Value) -> Result<String> {
+        container["Id"]
+            .as_str()
+            .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned)
+            .ok_or(Error::Unavailable)
+    }
+
+    /// SIGTERM, then SIGKILL `grace` seconds later. Callers do not hold the
+    /// slot's lock, so `inspect` and other allocations stay responsive during
+    /// a long grace period.
+    async fn stop_container(id: &str, grace: u32) -> Result<Vec<u8>> {
+        Self::docker_within(
+            &["stop".into(), "--time".into(), grace.to_string(), id.into()],
+            Duration::from_secs(u64::from(grace) + STOP_MARGIN_S),
+        )
+        .await
     }
 
     async fn container(slot: &str, record: &Record) -> Result<Option<Value>> {
@@ -752,6 +941,12 @@ impl DockerDriver {
         } else {
             r.limits.clone()
         };
+        // A chosen network is part of the committed launch, like its limits.
+        if let (Some(v), Some(network)) = (container, r.network) {
+            if v["HostConfig"]["NetworkMode"] != network.docker() {
+                return Err(Error::Untrusted);
+            }
+        }
         if container.is_some() && effective_limits != r.limits {
             return Err(Error::Untrusted);
         }
@@ -765,12 +960,27 @@ impl DockerDriver {
         if matches!(r.phase, Phase::Stopped | Phase::Deleted) && state == RuntimeState::Ready {
             state = RuntimeState::Stopping;
         }
+        let exit = container
+            .filter(|_| state == RuntimeState::Stopped)
+            .and_then(Self::exit);
         Ok(RuntimeStatus {
             execution: r.execution.clone(),
             runtime_id: Self::name(slot),
             state,
             effective_limits,
             port: r.port,
+            exit,
+        })
+    }
+
+    /// An exited container's exit status, from `docker inspect`.
+    fn exit(container: &Value) -> Option<ExitStatus> {
+        let state = &container["State"];
+        Some(ExitStatus {
+            code: state["ExitCode"].as_i64()?,
+            oom_killed: state["OOMKilled"].as_bool()?,
+            started_at: state["StartedAt"].as_str()?.to_owned(),
+            finished_at: state["FinishedAt"].as_str()?.to_owned(),
         })
     }
 
@@ -824,7 +1034,9 @@ impl DockerDriver {
                 .entrypoint
                 .as_ref()
                 .is_some_and(|s| s.is_empty() || s.contains('\0'))
-            || options.stop_timeout_s.is_some_and(|n| n > 90)
+            || options
+                .stop_timeout_s
+                .is_some_and(|n| n > MAX_STOP_TIMEOUT_S)
             || options.gpus.iter().any(|id| {
                 id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
             })
@@ -838,6 +1050,34 @@ impl DockerDriver {
                 .volumes
                 .iter()
                 .any(|s| !s.starts_with('/') || !s.contains(":"))
+        {
+            return Err(Error::InvalidContract);
+        }
+        match options.network {
+            // Nothing can reach a container without a network.
+            Some(NetworkMode::None)
+                if options.port.is_some()
+                    || options.container_port.is_some()
+                    || !options.ingress.is_empty()
+                    || !request.services.is_empty() =>
+            {
+                return Err(Error::InvalidContract)
+            }
+            // There is no mapping: the container listens on `port` itself, so
+            // the port can't be chosen for it.
+            Some(NetworkMode::Host)
+                if options.container_port.is_some() || options.port == Some(0) =>
+            {
+                return Err(Error::InvalidContract)
+            }
+            _ => {}
+        }
+        // A run to completion is reached by nothing: it ends on its own.
+        if options.run_to_completion
+            && (options.port.is_some()
+                || options.container_port.is_some()
+                || !options.ingress.is_empty()
+                || !request.services.is_empty())
         {
             return Err(Error::InvalidContract);
         }
@@ -917,7 +1157,10 @@ impl DockerDriver {
         if let Some(bytes) = options.shm_bytes {
             args.extend(["--shm-size".into(), bytes.to_string()]);
         }
-        if let Some(port) = r.port {
+        if let Some(network) = options.network {
+            args.push(format!("--network={}", network.docker()));
+        }
+        if let Some(port) = r.port.filter(|_| options.network.is_none()) {
             args.extend([
                 "--publish".into(),
                 format!(
@@ -989,6 +1232,8 @@ impl RuntimeDriver for DockerDriver {
                     allocated_port: options.port == Some(0),
                     services: request.services.clone(),
                     ingress: options.ingress.clone(),
+                    network: options.network,
+                    run_to_completion: options.run_to_completion,
                 };
                 self.save(&slot, &r)?;
                 r
@@ -1071,34 +1316,40 @@ impl RuntimeDriver for DockerDriver {
 
     async fn stop(&self, execution: &ExecutionIdentity) -> Result<()> {
         let slot = self.slot(execution)?;
-        let _lock = self.lock(&slot).await?;
-        let mut r = self.owned(&slot, execution)?;
-        let _network = self.drain_network(execution).await?;
-        if r.phase != Phase::Deleted {
-            r.phase = Phase::Stopped;
-            self.save(&slot, &r)?;
-        }
-        if Self::container(&slot, &r).await?.is_some() {
-            Self::docker(&[
-                "stop".into(),
-                "--time".into(),
-                r.stop_timeout_s.to_string(),
-                Self::name(&slot),
-            ])
-            .await?;
-            if Self::container(&slot, &r)
-                .await?
-                .is_some_and(|v| v["State"]["Running"] == true)
-            {
-                return Err(Error::Unavailable);
+        // Fence the allocation first, so nothing starts it again, then wait
+        // out the grace period without the slot's lock.
+        let (id, grace) = {
+            let _lock = self.lock(&slot).await?;
+            let mut r = self.owned(&slot, execution)?;
+            drop(self.drain_network(execution).await?);
+            if r.phase != Phase::Deleted {
+                r.phase = Phase::Stopped;
+                self.save(&slot, &r)?;
             }
+            match Self::container(&slot, &r).await? {
+                Some(v) if v["State"]["Running"] == true => (Self::id(&v)?, r.stop_timeout_s),
+                _ => return Ok(()),
+            }
+        };
+        let stopped = Self::stop_container(&id, grace).await;
+        let _lock = self.lock(&slot).await?;
+        let running = match self.read(&slot)? {
+            Some(r) if &r.execution == execution => Self::container(&slot, &r)
+                .await?
+                .is_some_and(|v| v["Id"] == id.as_str() && v["State"]["Running"] == true),
+            // A later generation owns the slot only after this allocation's
+            // container was confirmed gone.
+            _ => false,
+        };
+        if running {
+            return Err(stopped.err().unwrap_or(Error::Unavailable));
         }
         Ok(())
     }
 
     async fn delete(&self, execution: &ExecutionIdentity) -> Result<()> {
         let slot = self.slot(execution)?;
-        let _lock = self.lock(&slot).await?;
+        let mut _lock = self.lock(&slot).await?;
         let mut r = match self.read(&slot)? {
             Some(r) if &r.execution == execution => r,
             Some(_) => return Err(Error::Ownership),
@@ -1116,23 +1367,32 @@ impl RuntimeDriver for DockerDriver {
                 allocated_port: false,
                 services: Vec::new(),
                 ingress: Default::default(),
+                network: None,
+                run_to_completion: false,
             },
         };
-        let _network = self.drain_network(execution).await?;
+        drop(self.drain_network(execution).await?);
         // Fence even a launch that has not reached this machine yet.
         r.phase = Phase::Deleted;
         self.save(&slot, &r)?;
         if let Some(container) = Self::container(&slot, &r).await? {
             if container["State"]["Running"] == true {
-                Self::docker(&[
-                    "stop".into(),
-                    "--time".into(),
-                    r.stop_timeout_s.to_string(),
-                    Self::name(&slot),
-                ])
-                .await?;
+                // As in `stop`, the grace period runs without the slot's lock.
+                // Its outcome doesn't matter: the removal below kills what is left.
+                let id = Self::id(&container)?;
+                drop(_lock);
+                let _ = Self::stop_container(&id, r.stop_timeout_s).await;
+                _lock = self.lock(&slot).await?;
+                r = match self.read(&slot)? {
+                    Some(r) if &r.execution == execution => r,
+                    // A later generation owns the slot only after this
+                    // allocation's container was confirmed gone.
+                    _ => return Ok(()),
+                };
             }
-            Self::docker(&["rm".into(), "--force".into(), Self::name(&slot)]).await?;
+            if Self::container(&slot, &r).await?.is_some() {
+                Self::docker(&["rm".into(), "--force".into(), Self::name(&slot)]).await?;
+            }
         }
         if Self::container(&slot, &r).await?.is_some() {
             return Err(Error::Unavailable);
@@ -1171,6 +1431,8 @@ mod tests {
             allocated_port: false,
             services: Vec::new(),
             ingress: Default::default(),
+            network: None,
+            run_to_completion: false,
         }
     }
 
@@ -1257,5 +1519,363 @@ mod tests {
                 Err(Error::Untrusted)
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_timeout_tests {
+    use super::*;
+
+    fn request(driver_options: Value) -> LaunchRequest {
+        serde_json::from_value(json!({
+            "execution": {"namespace":"test", "workload":"docker", "allocation_id":"unit",
+                "lease_id":"one", "generation":1, "node_id":"test-node"},
+            "driver":"docker", "image":"alpine:3.21", "command":["sleep","300"],
+            "environment":{}, "limits":{"cpu_millicores":250,"memory_bytes":33554432},
+            "policy":{"issuer":"test","policy_id":"no-policy-claim","version":0,"sha256":""},
+            "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required",
+                "attestation_proof":"not_required"},
+            "services":[], "driver_options":driver_options
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_grace_period_may_be_up_to_an_hour() {
+        for accepted in [0, 1, 90, 91, 600, MAX_STOP_TIMEOUT_S] {
+            let options =
+                DockerDriver::options(&request(json!({"stop_timeout_s": accepted}))).unwrap();
+            assert_eq!(options.stop_timeout_s, Some(accepted));
+        }
+        assert!(matches!(
+            DockerDriver::options(&request(json!({"stop_timeout_s": MAX_STOP_TIMEOUT_S + 1}))),
+            Err(Error::InvalidContract)
+        ));
+        assert_eq!(
+            DockerDriver::options(&request(json!({})))
+                .unwrap()
+                .stop_timeout_s,
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_full_container_id_is_used_without_the_lock() {
+        let id = "ab".repeat(32);
+        assert_eq!(DockerDriver::id(&json!({"Id": id})).unwrap(), id);
+        for invalid in [
+            json!({}),
+            json!({"Id": null}),
+            json!({"Id": "abc"}),
+            json!({"Id": "trusted-shim-slot"}),
+            json!({"Id": format!("{}zz", "ab".repeat(31))}),
+            json!({"Id": format!("{id}0")}),
+        ] {
+            assert!(matches!(
+                DockerDriver::id(&invalid),
+                Err(Error::Unavailable)
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    fn request(driver_options: Value, services: Value) -> LaunchRequest {
+        serde_json::from_value(json!({
+            "execution": {"namespace":"test", "workload":"docker", "allocation_id":"unit",
+                "lease_id":"one", "generation":1, "node_id":"test-node"},
+            "driver":"docker", "image":"alpine:3.21", "command":["sleep","300"],
+            "environment":{}, "limits":{"cpu_millicores":250,"memory_bytes":33554432},
+            "policy":{"issuer":"test","policy_id":"no-policy-claim","version":0,"sha256":""},
+            "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required",
+                "attestation_proof":"not_required"},
+            "services":services, "driver_options":driver_options
+        }))
+        .unwrap()
+    }
+
+    fn app() -> Value {
+        json!([{"id":{"namespace":"test","workload":"docker","service":"app"},
+            "endpoint_ref":"app","protocol":"http1"}])
+    }
+
+    fn record(request: &LaunchRequest, options: &DockerOptions) -> Record {
+        Record {
+            execution: request.execution.clone(),
+            request_sha256: hash(request).unwrap(),
+            limits: request.limits.clone(),
+            phase: Phase::Running,
+            stop_timeout_s: 1,
+            port: options.port,
+            allocated_port: false,
+            services: request.services.clone(),
+            ingress: options.ingress.clone(),
+            network: options.network,
+            run_to_completion: options.run_to_completion,
+        }
+    }
+
+    fn args(request: &LaunchRequest) -> Vec<String> {
+        let options = DockerDriver::options(request).unwrap();
+        DockerDriver::create_args("slot", &record(request, &options), request, &options)
+    }
+
+    #[test]
+    fn a_network_without_a_surface_is_none_and_one_listening_itself_is_host() {
+        for valid in [
+            // Null is unset, as for the other options: Docker's default network.
+            request(json!({"network":null}), json!([])),
+            request(json!({"network":"none"}), json!([])),
+            request(json!({"network":"host"}), json!([])),
+            request(json!({"network":"host","port":8080}), app()),
+        ] {
+            DockerDriver::options(&valid).unwrap();
+        }
+        for (case, invalid) in [
+            // Nothing can reach a container without a network.
+            request(json!({"network":"none","port":8080}), json!([])),
+            request(
+                json!({"network":"none","port":0,"container_port":8080}),
+                json!([]),
+            ),
+            request(json!({"network":"none"}), app()),
+            // On the host's network the container listens on the port itself.
+            request(
+                json!({"network":"host","port":8080,"container_port":80}),
+                app(),
+            ),
+            request(
+                json!({"network":"host","port":0,"container_port":8080}),
+                app(),
+            ),
+            // Only the two named networks.
+            request(json!({"network":"bridge"}), json!([])),
+            request(json!({"network":"container:other"}), json!([])),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                matches!(DockerDriver::options(invalid), Err(Error::InvalidContract)),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_network_reaches_docker_and_only_the_default_one_publishes_a_port() {
+        let none = args(&request(json!({"network":"none"}), json!([])));
+        assert!(none.contains(&"--network=none".into()));
+        assert!(!none.iter().any(|a| a == "--publish"));
+
+        let host = args(&request(json!({"network":"host","port":8080}), app()));
+        assert!(host.contains(&"--network=host".into()));
+        assert!(!host.iter().any(|a| a == "--publish"));
+        let end = host.iter().position(|a| a == "--").unwrap();
+        assert!(host.iter().position(|a| a == "--network=host").unwrap() < end);
+
+        let default = args(&request(json!({"port":8080}), app()));
+        assert!(!default.iter().any(|a| a.starts_with("--network")));
+        let publish = default.iter().position(|a| a == "--publish").unwrap();
+        assert_eq!(default[publish + 1], "127.0.0.1:8080:8080");
+    }
+
+    #[test]
+    fn a_chosen_network_is_verified_and_the_default_one_keeps_its_journal() {
+        let container = |mode: Value| {
+            json!({"State":{"Status":"running"},"HostConfig":{"NanoCpus":250_000_000u64,
+                "Memory":33_554_432u64,"MemorySwap":33_554_432u64,"CpuShares":0,"NetworkMode":mode}})
+        };
+        let none = request(json!({"network":"none"}), json!([]));
+        let none = record(&none, &DockerDriver::options(&none).unwrap());
+        DockerDriver::status("slot", &none, Some(&container(json!("none")))).unwrap();
+        for changed in [
+            json!("bridge"),
+            json!("host"),
+            json!("default"),
+            Value::Null,
+        ] {
+            assert!(matches!(
+                DockerDriver::status("slot", &none, Some(&container(changed))),
+                Err(Error::Untrusted)
+            ));
+        }
+
+        // Docker reports the default network as `bridge` or `default`; an
+        // existing allocation is not checked against either.
+        let default = request(json!({}), json!([]));
+        let default = record(&default, &DockerDriver::options(&default).unwrap());
+        for mode in [json!("bridge"), json!("default")] {
+            DockerDriver::status("slot", &default, Some(&container(mode))).unwrap();
+        }
+        let journal = serde_json::to_value(&default).unwrap();
+        assert!(journal.get("network").is_none());
+        assert_eq!(serde_json::to_value(&none).unwrap()["network"], "none");
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn request(driver_options: Value, services: Value) -> LaunchRequest {
+        serde_json::from_value(json!({
+            "execution": {"namespace":"test", "workload":"docker", "allocation_id":"unit",
+                "lease_id":"one", "generation":1, "node_id":"test-node"},
+            "driver":"docker", "image":"alpine:3.21", "command":["true"],
+            "environment":{}, "limits":{"cpu_millicores":250,"memory_bytes":33554432},
+            "policy":{"issuer":"test","policy_id":"no-policy-claim","version":0,"sha256":""},
+            "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required",
+                "attestation_proof":"not_required"},
+            "services":services, "driver_options":driver_options
+        }))
+        .unwrap()
+    }
+
+    fn record(run_to_completion: bool) -> Record {
+        let r = request(json!({}), json!([]));
+        Record {
+            execution: r.execution.clone(),
+            request_sha256: hash(&r).unwrap(),
+            limits: r.limits.clone(),
+            phase: Phase::Running,
+            stop_timeout_s: 1,
+            port: None,
+            allocated_port: false,
+            services: Vec::new(),
+            ingress: Default::default(),
+            network: None,
+            run_to_completion,
+        }
+    }
+
+    fn container(state: Value) -> Value {
+        json!({"State":state,"HostConfig":{"NanoCpus":250_000_000u64,
+            "Memory":33_554_432u64,"MemorySwap":33_554_432u64,"CpuShares":0}})
+    }
+
+    /// `restart` refuses it from the journal, before Docker is asked anything.
+    #[tokio::test]
+    async fn a_run_to_completion_is_never_restarted() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = DockerDriver::new(dir.path().join("state"), "test-node".into()).unwrap();
+        let r = record(true);
+        let slot = driver.slot(&r.execution).unwrap();
+        driver.save(&slot, &r).unwrap();
+        assert!(matches!(
+            driver.restart(&r.execution, u64::MAX).await,
+            Err(Error::Ownership)
+        ));
+    }
+
+    #[test]
+    fn an_exited_container_reports_how_it_ended() {
+        let exited = container(json!({"Status":"exited","ExitCode":137,"OOMKilled":true,
+            "StartedAt":"2026-11-23T10:00:00.1Z","FinishedAt":"2026-11-23T10:05:00.2Z"}));
+        let status = DockerDriver::status("slot", &record(false), Some(&exited)).unwrap();
+        assert_eq!(status.state, RuntimeState::Stopped);
+        assert_eq!(
+            status.exit,
+            Some(ExitStatus {
+                code: 137,
+                oom_killed: true,
+                started_at: "2026-11-23T10:00:00.1Z".into(),
+                finished_at: "2026-11-23T10:05:00.2Z".into(),
+            })
+        );
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire["exit"],
+            json!({"code":137,"oom_killed":true,"started_at":"2026-11-23T10:00:00.1Z",
+                "finished_at":"2026-11-23T10:05:00.2Z"})
+        );
+
+        // A process that hasn't ended has no exit status, and the field is
+        // left out, so a status reads as it did.
+        for state in [
+            json!({"Status":"running","ExitCode":0,"OOMKilled":false,
+                "StartedAt":"2026-11-23T10:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}),
+            json!({"Status":"created","ExitCode":0,"OOMKilled":false,
+                "StartedAt":"0001-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}),
+        ] {
+            let status =
+                DockerDriver::status("slot", &record(false), Some(&container(state))).unwrap();
+            assert_eq!(status.exit, None);
+            assert!(serde_json::to_value(&status).unwrap().get("exit").is_none());
+        }
+        let missing = DockerDriver::status("slot", &record(false), None).unwrap();
+        assert_eq!(missing.exit, None);
+        let incomplete = container(json!({"Status":"exited","ExitCode":1}));
+        let status = DockerDriver::status("slot", &record(false), Some(&incomplete)).unwrap();
+        assert_eq!(status.exit, None);
+    }
+
+    #[test]
+    fn a_run_to_completion_has_no_surface_and_keeps_other_journals_unchanged() {
+        DockerDriver::options(&request(json!({"run_to_completion":true}), json!([]))).unwrap();
+        let app = json!([{"id":{"namespace":"test","workload":"docker","service":"app"},
+            "endpoint_ref":"app","protocol":"http1"}]);
+        for (options, services) in [
+            (json!({"run_to_completion":true,"port":8080}), app.clone()),
+            (json!({"run_to_completion":true,"port":8080}), json!([])),
+            (
+                json!({"run_to_completion":true,"port":0,"container_port":8080}),
+                json!([]),
+            ),
+            (json!({"run_to_completion":true}), app),
+        ] {
+            assert!(matches!(
+                DockerDriver::options(&request(options, services)),
+                Err(Error::InvalidContract)
+            ));
+        }
+        assert!(serde_json::to_value(record(false))
+            .unwrap()
+            .get("run_to_completion")
+            .is_none());
+        assert_eq!(
+            serde_json::to_value(record(true)).unwrap()["run_to_completion"],
+            true
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[tokio::test]
+    async fn output_keeps_the_order_of_both_streams_and_stops_at_its_limit() {
+        let (bytes, complete) = read_output(sh("echo 1; echo 2 >&2; echo 3"), 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"1\n2\n3\n");
+        assert!(complete);
+
+        // Cut off and killed: it would otherwise run for five minutes.
+        let started = std::time::Instant::now();
+        let (bytes, complete) = read_output(sh("yes; sleep 300"), 1000).await.unwrap();
+        assert_eq!(bytes.len(), 1000);
+        assert!(!complete);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        // Exactly the limit is all of it.
+        let (bytes, complete) = read_output(sh("printf 1234"), 4).await.unwrap();
+        assert_eq!((bytes.as_slice(), complete), (&b"1234"[..], true));
+
+        // A failed command's errors are never output.
+        assert!(matches!(
+            read_output(sh("echo secret-detail >&2; exit 1"), 1024).await,
+            Err(Error::Unavailable)
+        ));
     }
 }

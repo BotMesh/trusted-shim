@@ -393,10 +393,9 @@ async fn exact_allocation_administration_and_native_credential_ingress() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    assert_eq!(
-        driver.inspect(&request.execution).await.unwrap().port,
-        before
-    );
+    let restarted = driver.inspect(&request.execution).await.unwrap();
+    assert_eq!(restarted.port, before);
+    assert_eq!(restarted.state, trusted_shim::runtime::RuntimeState::Ready);
     // The running shim listeners must reload the existing trust file too;
     // accepting a new relay signer only at the relay would break node ingress.
     let next_key = tmp.path().join("next-key");

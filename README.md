@@ -53,7 +53,7 @@ connection sends one bounded JSON request and closes its write half:
 ```
 
 The reply has `protocol` and either `result` or `error`. Operations are
-`capabilities`, `launch`, `inspect`, `stop`, `resume`, `delete`, `network`,
+`capabilities`, `launch`, `inspect`, `stop`, `resume`, `delete`, `logs`, `network`,
 `allocate` and `provision`. A request runs to completion even if the caller
 disconnects.
 
@@ -94,6 +94,11 @@ uses only what a node advertises.
 | `single-use-ingress-v1` | Ingress rules with `single_use: true` |
 | `runtime-resume-v1` | `resume` for Docker runtimes |
 | `runtime-cpu-shares-v1` | `limits.cpu_shares`: a CPU weight under contention, not a cap |
+| `runtime-long-stop-v1` | `driver_options.stop_timeout_s` up to 3600 s, the grace period between SIGTERM and SIGKILL |
+| `runtime-network-v1` | `driver_options.network`: `none` (loopback only) or `host` (refused on TEE) instead of Docker's default network |
+| `runtime-exit-status-v1` | `exit`: how an exited container's process ended, including an OOM kill |
+| `runtime-run-to-completion-v1` | `driver_options.run_to_completion`: a run that ends with its process, such as a batch job |
+| `runtime-logs-v1` | `logs`: a runtime's output from a point in time, in windows of up to 1 MiB |
 | `openshell-access-v1` | The OpenShell access layer |
 | `tee-startup-v1` | This node has a TEE driver |
 | `runtime-resume-tee-v1` | `resume` for TEE runtimes, behind a fresh admission |

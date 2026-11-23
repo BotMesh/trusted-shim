@@ -66,6 +66,23 @@ async fn private_protocol_survives_clients_and_rejects_incompatible_takeover() {
         .as_array()
         .unwrap()
         .contains(&json!("runtime-cpu-shares-v1")));
+    // Fleet asks for a grace period above 90 s only where this is advertised.
+    assert!(before["result"]["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runtime-long-stop-v1")));
+    // Fleet sends driver_options.network only where this is advertised.
+    assert!(before["result"]["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runtime-network-v1")));
+    // Fleet runs a batch job on the shim only where both are advertised.
+    for feature in ["runtime-exit-status-v1", "runtime-run-to-completion-v1"] {
+        assert!(before["result"]["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(feature)));
+    }
     // TEE resume is advertised separately, and only by a node with a TEE driver;
     // this one has none, so it refuses a TEE resume.
     assert!(!before["result"]["features"]
@@ -76,6 +93,29 @@ async fn private_protocol_survives_clients_and_rejects_incompatible_takeover() {
         "execution":{"namespace":"test","workload":"daemon","allocation_id":"tee","lease_id":"one",
             "generation":1,"node_id":"node-one"},"driver":"tee"}});
     assert!(call(&socket, tee_resume).await.get("error").is_some());
+    // Fleet reads a runtime's output through the daemon where it advertises
+    // this. A read checks its start and the allocation before reaching Docker.
+    assert!(before["result"]["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runtime-logs-v1")));
+    let logs = |since: Value| {
+        json!({"protocol":1,"node_id":"node-one","command":{"operation":"logs",
+            "execution":{"namespace":"test","workload":"daemon","allocation_id":"logs",
+                "lease_id":"one","generation":1,"node_id":"node-one"},"since":since}})
+    };
+    for since in ["10m", "-1", "2026-11-23T10:00:00Z", "1.1234567890"] {
+        assert_eq!(
+            call(&socket, logs(json!(since))).await["error"],
+            "invalid runtime or trust contract"
+        );
+    }
+    for since in [Value::Null, json!("1795428000.000000001")] {
+        assert_eq!(
+            call(&socket, logs(since)).await["error"],
+            "execution is not owned by this allocation"
+        );
+    }
     assert!(
         trusted_shim::daemon::serve(&state, "node-one".into(), CancellationToken::new())
             .await

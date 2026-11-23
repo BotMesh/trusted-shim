@@ -56,10 +56,34 @@ async fn unsupported_trust_and_driver_requirements_never_create_state() {
         driver.launch(&r).await,
         Err(Error::InvalidContract)
     ));
+    // A grace period is at most an hour.
+    r.driver_options = json!({"stop_timeout_s":3601});
+    assert!(matches!(
+        driver.launch(&r).await,
+        Err(Error::InvalidContract)
+    ));
     r.driver_options = json!({"stop_timeout_s":1});
     // Docker would clamp a CPU weight outside its range; it is refused instead.
     for invalid in [0, 1, 262_145] {
         r.limits.cpu_shares = Some(invalid);
+        assert!(matches!(
+            driver.launch(&r).await,
+            Err(Error::InvalidContract)
+        ));
+    }
+    r.limits.cpu_shares = None;
+    // Nothing reaches a run to completion.
+    r.driver_options = json!({"run_to_completion":true,"port":8080});
+    assert!(matches!(
+        driver.launch(&r).await,
+        Err(Error::InvalidContract)
+    ));
+    // Nothing can reach a container without a network, and only two are named.
+    for options in [
+        json!({"network":"none","port":8080}),
+        json!({"network":"bridge"}),
+    ] {
+        r.driver_options = options;
         assert!(matches!(
             driver.launch(&r).await,
             Err(Error::InvalidContract)
@@ -400,4 +424,306 @@ async fn real_docker_resume_restarts_only_a_crashed_runtime_in_place() {
         Err(Error::Ownership)
     ));
     recovered.delete(&gone.execution).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_stop_waits_out_a_long_grace_period_without_blocking_inspect() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let mut r = request(&format!(
+        "grace-{}",
+        dir.path().file_name().unwrap().to_str().unwrap()
+    ));
+    // Exits cleanly 4 s after SIGTERM, within a grace period above 90 s.
+    r.command = [
+        "sh",
+        "-c",
+        "trap 'sleep 4; exit 0' TERM; while :; do sleep 1; done",
+    ]
+    .map(String::from)
+    .into();
+    r.driver_options = json!({"stop_timeout_s":600});
+    let name = driver.launch(&r).await.unwrap().runtime_id;
+    let id = inspect(&name)["Id"].clone();
+
+    let started = std::time::Instant::now();
+    let stopping = {
+        let (driver, execution) = (driver.clone(), r.execution.clone());
+        tokio::spawn(async move { driver.stop(&execution).await })
+    };
+    // The allocation stays observable while its container winds down.
+    loop {
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            driver.inspect(&r.execution),
+        )
+        .await
+        .expect("inspect answers during the grace period")
+        .unwrap();
+        if status.state == RuntimeState::Stopping {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // The stop is fenced before the grace period: nothing starts it again.
+    assert!(matches!(
+        driver.resume(&r.execution).await,
+        Err(Error::Ownership)
+    ));
+    assert!(matches!(driver.launch(&r).await, Err(Error::Ownership)));
+    stopping.await.unwrap().unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+    let container = inspect(&name);
+    assert_eq!(container["Id"], id);
+    assert_eq!(container["State"]["Running"], false);
+    // It exited on its own, not by SIGKILL.
+    assert_eq!(container["State"]["ExitCode"], 0);
+    assert_eq!(
+        driver.inspect(&r.execution).await.unwrap().state,
+        RuntimeState::Stopped
+    );
+
+    // Delete gives a running container the same grace period, then removes it.
+    let mut d = request(&format!("{}-delete", r.execution.allocation_id));
+    d.command = r.command.clone();
+    d.driver_options = r.driver_options.clone();
+    let deleted = driver.launch(&d).await.unwrap().runtime_id;
+    let started = std::time::Instant::now();
+    driver.delete(&d.execution).await.unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+    assert!(!docker(&["inspect", &deleted]).status.success());
+    driver.delete(&r.execution).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_runs_a_container_without_a_network_or_on_the_hosts() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let id = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+    let interfaces = |name: &str| {
+        let out = docker(&["exec", name, "ls", "/sys/class/net"]);
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let mut none = request(&format!("network-none-{id}"));
+    none.driver_options = json!({"stop_timeout_s":1,"network":"none"});
+    let status = driver.launch(&none).await.unwrap();
+    assert_eq!(status.state, RuntimeState::Ready);
+    assert_eq!(status.port, None);
+    assert_eq!(
+        inspect(&status.runtime_id)["HostConfig"]["NetworkMode"],
+        "none"
+    );
+    assert_eq!(interfaces(&status.runtime_id), ["lo"]);
+    driver.delete(&none.execution).await.unwrap();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut host = request(&format!("network-host-{id}"));
+    host.command = [
+        "sh",
+        "-c",
+        &format!("while :; do echo ok | nc -l -p {port}; done"),
+    ]
+    .map(String::from)
+    .into();
+    host.driver_options = json!({"stop_timeout_s":1,"network":"host","port":port});
+    let status = driver.launch(&host).await.unwrap();
+    assert_eq!(status.state, RuntimeState::Ready);
+    assert_eq!(status.port, Some(port));
+    let container = inspect(&status.runtime_id);
+    assert_eq!(container["HostConfig"]["NetworkMode"], "host");
+    assert!(container["HostConfig"]["PortBindings"]
+        .as_object()
+        .is_none_or(|bindings| bindings.is_empty()));
+    // It listens on the host's loopback itself.
+    let mut answer = String::new();
+    for _ in 0..50 {
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            use std::io::Read;
+            let _ = stream.read_to_string(&mut answer);
+            if !answer.is_empty() {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(answer.trim(), "ok");
+    driver.delete(&host.execution).await.unwrap();
+}
+
+async fn exited(driver: &DockerDriver, r: &LaunchRequest) -> trusted_shim::runtime::RuntimeStatus {
+    for _ in 0..100 {
+        let status = driver.inspect(&r.execution).await.unwrap();
+        if status.state == RuntimeState::Stopped {
+            return status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the run did not end");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_runs_to_completion_and_reports_how_it_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let id = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+
+    let mut job = request(&format!("job-{id}"));
+    job.command = ["sh", "-c", "echo done; exit 3"].map(String::from).into();
+    job.driver_options = json!({"stop_timeout_s":1,"run_to_completion":true});
+    let name = driver.launch(&job).await.unwrap().runtime_id;
+    let status = exited(&driver, &job).await;
+    let exit = status.exit.unwrap();
+    assert_eq!((exit.code, exit.oom_killed), (3, false));
+    for at in [&exit.started_at, &exit.finished_at] {
+        assert!(at.starts_with("20"), "{at}");
+    }
+    // It is never started again, and its container stays until delete.
+    assert!(matches!(
+        driver.resume(&job.execution).await,
+        Err(Error::Ownership)
+    ));
+    let replayed = driver.launch(&job).await.unwrap();
+    assert_eq!(replayed.state, RuntimeState::Stopped);
+    assert_eq!(replayed.exit.unwrap().finished_at, exit.finished_at);
+    assert_eq!(
+        String::from_utf8_lossy(&docker(&["logs", &name]).stdout).trim(),
+        "done"
+    );
+    driver.delete(&job.execution).await.unwrap();
+    assert!(!docker(&["inspect", &name]).status.success());
+
+    // A run past its memory limit reports that the OOM killer ended it.
+    let mut oom = request(&format!("job-oom-{id}"));
+    oom.command = [
+        "sh",
+        "-c",
+        "a=$(head -c 134217728 /dev/zero | tr '\\0' x); echo ${#a}",
+    ]
+    .map(String::from)
+    .into();
+    oom.driver_options = json!({"stop_timeout_s":1,"run_to_completion":true});
+    driver.launch(&oom).await.unwrap();
+    let exit = exited(&driver, &oom).await.exit.unwrap();
+    assert!(exit.oom_killed);
+    assert_eq!(exit.code, 137);
+    driver.delete(&oom.execution).await.unwrap();
+
+    // A crashed app reports its exit too, and stays resumable.
+    let app = request(&format!("app-exit-{id}"));
+    let name = driver.launch(&app).await.unwrap().runtime_id;
+    assert_eq!(driver.inspect(&app.execution).await.unwrap().exit, None);
+    assert!(docker(&["kill", &name]).status.success());
+    let exit = exited(&driver, &app).await.exit.unwrap();
+    assert_eq!((exit.code, exit.oom_killed), (137, false));
+    let resumed = driver.resume(&app.execution).await.unwrap();
+    assert_eq!(resumed.state, RuntimeState::Ready);
+    assert_eq!(resumed.exit, None);
+    driver.delete(&app.execution).await.unwrap();
+}
+
+async fn read_logs(
+    driver: &DockerDriver,
+    r: &LaunchRequest,
+    since: Option<&str>,
+) -> (Vec<String>, Option<String>, bool) {
+    use base64::Engine as _;
+    let logs = driver.read_logs(&r.execution, since).await.unwrap();
+    let output = base64::engine::general_purpose::STANDARD
+        .decode(logs.output)
+        .unwrap();
+    let lines = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (time, text) = line.split_once(' ').unwrap();
+            assert!(time.ends_with('Z'), "{line}");
+            text.to_owned()
+        })
+        .collect();
+    (lines, logs.next_since, logs.more)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_logs_are_read_in_bounded_windows_without_loss_or_repeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let id = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+
+    // Both streams, in order, then only what came after.
+    let mut r = request(&format!("logs-{id}"));
+    r.command = [
+        "sh",
+        "-c",
+        "echo out; echo err >&2; sleep 1; echo later; sleep 300",
+    ]
+    .map(String::from)
+    .into();
+    driver.launch(&r).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (lines, next, more) = read_logs(&driver, &r, None).await;
+    assert_eq!(lines, ["out", "err"]);
+    assert!(!more);
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let (lines, next, _) = read_logs(&driver, &r, next.as_deref()).await;
+    assert_eq!(lines, ["later"]);
+    let (lines, after, more) = read_logs(&driver, &r, next.as_deref()).await;
+    assert!(lines.is_empty() && !more);
+    assert_eq!(after, next);
+    driver.delete(&r.execution).await.unwrap();
+    assert!(matches!(
+        driver.read_logs(&r.execution, None).await,
+        Err(Error::Ownership)
+    ));
+
+    // More than one window: each line exactly once, in order.
+    let mut big = request(&format!("logs-big-{id}"));
+    big.command = [
+        "sh",
+        "-c",
+        "seq 1 200000 | sed 's/$/ padding-to-make-the-output-larger-than-one-window/'; sleep 300",
+    ]
+    .map(String::from)
+    .into();
+    let name = driver.launch(&big).await.unwrap().runtime_id;
+    for _ in 0..300 {
+        let tail = docker(&["logs", "--tail", "1", &name]);
+        if String::from_utf8_lossy(&tail.stdout).starts_with("200000 ") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (mut seen, mut since, mut windows) = (Vec::new(), None, 0);
+    loop {
+        let (lines, next, more) = read_logs(&driver, &big, since.as_deref()).await;
+        seen.extend(lines);
+        since = next;
+        windows += 1;
+        if !more {
+            break;
+        }
+    }
+    assert!(windows > 1);
+    let expected: Vec<String> = (1..=200_000)
+        .map(|n| format!("{n} padding-to-make-the-output-larger-than-one-window"))
+        .collect();
+    assert_eq!(seen, expected);
+    driver.delete(&big.execution).await.unwrap();
 }
