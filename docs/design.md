@@ -34,7 +34,12 @@ execution, so shim's state directory must survive restarts and upgrades.
 ### Docker driver
 
 Requested CPU and memory become hard limits, checked at start and on every
-inspect. Images must already be present, environment goes through a private
+inspect. An optional CPU weight (`limits.cpu_shares`, Docker's `--cpu-shares`)
+divides CPU under contention in proportion to weight, so a low-weight workload
+gets a small share next to others and otherwise uses what they leave idle. It is
+checked the same way. For a TEE runtime the limits and the weight are in the
+admitted request digest. The native OpenShell path refuses a weight, since
+OpenShell's create request has no field for it. Images must already be present, environment goes through a private
 file rather than the command line, and ports bind host loopback only. Plain
 Docker is not a policy boundary for an agent's shell, so requests that need a
 policy proof or attestation are refused on this path rather than downgraded.
