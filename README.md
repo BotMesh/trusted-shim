@@ -129,15 +129,3 @@ Proof networks, receipts and ledgers in tests are orchestration doubles, not ZK
 proofs, and no test starts a prover. Other ignored tests need extra
 services: stock Trustee (`TRUSTEE_TEST_ENDPOINT`, run in CI) and a pinned
 OpenShell gateway binary (`OPENSHELL_GATEWAY_BINARY`).
-
-## Not done yet
-
-- Real TDX acceptance: a fresh, launch-bound quote on a measured confidential VM,
-  including OpenShell enforcement and runtime creation.
-- A published DCAP guest, and a launch-bound receipt from the remote proof
-  network before a runtime is created.
-- AMD SNP: raw-evidence verification in an approved guest. A Trustee result alone
-  never authorizes a launch.
-- Collateral refresh, and SGX/Nitro isolation backends.
-- Application action hooks, so preflight enforcement can't be bypassed.
-- GOAT agent registration. Only the owner-consent interface exists.
