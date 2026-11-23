@@ -1,902 +1,143 @@
 # trusted-shim
 
-Fleet’s persistent machine-local runtime with a shared OpenShell access layer. Fleet
-owns scheduling and central policy administration; shim owns local execution,
-enforcement and outbound connectors. Rail supplies deterministic policy evaluation.
+The machine-local runtime under [zkm-fleet](https://github.com/ProjectZKM/zkm-fleet).
+Fleet schedules workloads across machines. On each machine, shim runs them,
+connects their services out to the data relay, and enforces what may start:
+attestation and a verified remote proof for confidential workloads, and policy
+admission for actions.
 
-The image workflow publishes both executables in
-`ghcr.io/attestx/trusted-shim:sha-<full-commit>` (and version tags on `v*`).
-`trusted-shim-runtime` is the service; `trusted-shim-socket` is the static native
-supervisor helper. The image can distribute binaries to Fleet’s node installer;
-keep shim in its own service/cgroup so node upgrades do not stop workloads.
-OpenShell implementation lives in `src/openshell/`, its integration fixtures in
-`tests/openshell/`, and supervisor packaging in `docker/openshell/`.
+```text
+Fleet scheduling and allocation
+  -> fleet-node / per-machine Ray
+    -> shim: OpenShell access layer -> RuntimeDriver -> Docker / TEE runtime
+    -> shim: router connector -> independent data relay
 
-Existing remote policy receipts can now be verified in Solidity and recorded in
-a mined local-EVM transaction. See [contract acceptance](contracts/README.md) for
-the pinned upstream verifier, negative tests and reproduction commands.
+central policy gateway -> approved policy/program + authorization ledger
+startup: shim -> rail -> remote proof -> verification -> grant -> create
+action:  preflight evaluation -> durable receipt job + grant -> dispatch
+         receipt job -> remote proof -> verification (background)
+```
 
-## Independently supervised node runtime
+- **Fleet** owns placement, retries and confirmed release of resources.
+- **Shim** owns one machine's authorized executions, their state and their
+  outbound connections.
+- **[trusted-rail](https://github.com/attestx/trusted-rail)** evaluates policy
+  with a pinned Regorus engine; the same engine runs inside its Ziren guest.
+- **The remote proof network** generates proofs; shim checks them with Ziren's
+  upstream verifier. Shim never starts a local prover.
 
-Fleet can install this binary alongside its node agent and start it in a separate
-service/cgroup:
+## Running it
+
+The image workflow publishes `ghcr.io/attestx/trusted-shim:sha-<full-commit>`
+(and version tags for `v*`) with two executables:
+
+- `trusted-shim-runtime`, the node service.
+- `trusted-shim-socket`, a small static helper for the native OpenShell
+  supervisor image.
+
+Fleet's node installer starts the service in its own systemd unit:
 
 ```sh
 trusted-shim-runtime --serve --state-dir /var/lib/zkm-fleet/shim --node-id machine-name
 ```
 
-The service exposes only `STATE/control.sock` (0600), checks the connecting UID,
-and accepts a bounded JSON request followed by a write-half close:
+Keep it out of fleet-node's cgroup, with no `PartOf`/`BindsTo` on it, so upgrading
+the node never stops shim or its workloads. Keep the state directory across
+restarts and upgrades: it holds each allocation's journal and fences.
+
+The service listens only on `STATE/control.sock` (mode 0600, same UID). Each
+connection sends one bounded JSON request and closes its write half:
 
 ```json
 {"protocol":1,"node_id":"machine-name","command":{"operation":"capabilities"}}
 ```
 
-Responses contain `protocol` and either `result` or `error`. Launch, inspect,
-stop, delete and network commands use the same execution contracts as the stdio
-adapter. Disconnecting a client does not cancel an accepted operation. Network
-commands are idempotent and return after starting a daemon-owned connector;
-their configuration is persisted privately and recovered on daemon restart.
-Recovery never starts a stopped/missing business container. Explicit stop/delete
-still fence and drain networking before confirming cleanup.
+The reply has `protocol` and either `result` or `error`. Operations are
+`capabilities`, `launch`, `inspect`, `stop`, `resume`, `delete`, `network`,
+`allocate` and `provision`. A request runs to completion even if the caller
+disconnects.
 
-The shim service must not be a child in fleet-node's service cgroup or have a
-`PartOf`/`BindsTo` dependency on it. A node restart reconnects to this running
-service. A shim restart itself closes transports; upgrading the node must not
-restart shim, Ray, Docker or upstream runtime services. The node installer pins
-the shim executable by content hash and leaves old versions available for active
-allocations. Automatic shim replacement and live migration between shim versions
-are not implemented by this protocol.
+Other modes: `--probe-machine` reports the TEE devices it sees (not a successful
+attestation), and `--state-dir DIR --node-id ID` without `--serve` runs a single
+request from stdin.
 
-With a relay supporting `POST /v1/connect/{route}/renew`, the connector refreshes
-its registration grant without replacing the transport. User Access grants retain
-their original expiry, policy binding and revocation checks. An unavailable gateway
-can only be tolerated until the last accepted registration grant expires. Updated
-embedded gateways issue 30-second registration leases after a live Fleet readiness
-check, and this connector renews around halfway through the remaining lifetime.
-Fleet's five-second native readiness cache adds to that withdrawal window. Relay
-expiry independently drains streams even if this connector cannot contact control.
-Older issued leases retain their original expiry until they age out. This
-does not turn Docker admission into a policy/TEE proof.
+## Drivers
 
-Machine-local runtime and trust interfaces below zkm-fleet, with native preflight
-action admission and a separate proof-required startup path. Policy evaluation uses trusted-rail's
-pinned Regorus engine; the same engine runs inside its Ziren guest. Proofs are
-generated by the remote proof network and checked with Ziren's upstream verifier.
+A launch selects one driver:
 
-## Ownership
+| Driver | Runs | Before it starts |
+|---|---|---|
+| `docker` | A Docker container on the host, with hard CPU/memory limits when requested | Nothing beyond the request checks |
+| `tee` | Docker inside an already measured TDX/SNP confidential VM | Fresh evidence and a verified remote proof, at launch and at every restart |
+| `tee-simulation` | The same path, with sample evidence and no hardware | The same, for tests. Never satisfies a hardware allocation |
 
-```text
-Fleet scheduling and allocation
-  -> fleet-node / per-machine Ray
-    -> shim OpenShell access layer -> RuntimeDriver -> Docker / TEE runtime
-    -> router Connector   -> independent data relay
+The OpenShell access layer applies to every driver. With no user rules it adds
+nothing; with rules, shim requires native OpenShell enforcement before creating
+the runtime. `openshell` as a driver name is kept only for existing journals.
 
-central policy gateway -> approved policy/program + authorization ledger
-startup: shim -> rail -> remote proof -> verification -> grant -> Create
-action:  preflight evaluation -> durable receipt job + grant -> dispatch
-         receipt job -> remote proof -> verification (background)
-```
+A Running allocation whose container exits stays down until Fleet asks shim to
+`resume` it. Shim then starts the same container again with its state intact; a
+TEE runtime gets a fresh admission first. A stopped or deleted allocation is
+never resumed, and a missing container is never recreated.
 
-Fleet owns placement, retries and confirmed resource release. Shim owns one
-machine's authorized executions. The independent router carries service payloads;
-Fleet's control plane owns infrastructure policy and service grants. Application
-backends retain their own user/session and API-key authorization. OpenShell is
-called through upstream interfaces for native isolation, without forking it;
-Fleet wires its durable provisioning adapter to centralized native gateway
-preparation and application readiness. The gateway is included in Fleet’s default Compose stack.
+## Capabilities
 
-OpenShell access is enabled for every driver. With no user rules it adds no
-restrictions: the driver’s isolation, limits and permissions remain authoritative.
-When rules are configured, the control plane binds their canonical digest in
-`access_policy_sha256`; shim requires the matching native OpenShell enforcement
-before creation. A missing service, invalid policy or failed receipt never removes
-a configured restriction. Tenant identity and application authentication are separate.
-The field is a control-plane policy reference, not an enable switch or a new config file.
-New launches select `docker`, `tee` or `tee-simulation`; `openshell` is retained only
-for compatibility with existing envelopes/journals. Recovery chooses the persisted
-execution path. Changing or removing user rules requires a new admitted generation.
+`capabilities` reports the drivers this machine offers and these features. Fleet
+uses only what a node advertises.
 
-## Policy admission
+| Feature | Meaning |
+|---|---|
+| `runtime-daemon-v1` | The persistent `--serve` service |
+| `data-plane-v1` | Outbound service connections through the data relay |
+| `chisel-network-v1` | Connections can use an upstream Chisel client (`tunnel_binary`) |
+| `runtime-management-v1` | The administrator `control` service: metadata, logs, exec, restart |
+| `single-use-ingress-v1` | Ingress rules with `single_use: true` |
+| `runtime-resume-v1` | `resume` for Docker runtimes |
+| `openshell-access-v1` | The OpenShell access layer |
+| `tee-startup-v1` | This node has a TEE driver |
+| `runtime-resume-tee-v1` | `resume` for TEE runtimes, behind a fresh admission |
+| `openshell-provisioning-v1`, `openshell-allocation-v1` | A native OpenShell endpoint is configured |
+| `openshell-attachments-v1` | Native GPUs and durable volumes |
+| `openshell-local-services-v1`, `openshell-service-health-v1`, `openshell-tcp-services-v1`, `openshell-ingress-v1` | Native services, their health, TCP services and restricted ingress |
 
-Runtime actions use **preflight**: evaluate before execution, return the verdict,
-and generate the ZK receipt in the background. `SqliteLedger::preflight` reads the
-centrally activated policy and authenticated context, then commits the exact
-witness, decision and (for Allow) shared-budget reservation and single-use grant
-in one transaction. Deny and ApprovalRequired also queue receipts, without grants
-or budget charges. A failed transaction cannot return authorization. The existing
-`AuthorizedExecutor` and authenticated ledger Consume enforce the exact request;
-calling a tool for that action does not generate a second proof.
+## Documentation
 
-Fleet embeds `PreflightWorker` using the existing remote `ProofNetwork` adapter.
-Receipt states are `queued`, `proving`, `verified` and `failed`; native Allow is
-never labelled a verified receipt. The worker uses the persisted original policy
-and request, even if the policy changes, the grant expires or the instance is
-revoked while proving. Receipt verification never issues or renews authorization.
-Current policy, lease and revocation still gate consumption immediately before
-dispatch. The guest proves evaluation of the recorded snapshot, not the SQLite
-budget write or the external action's execution.
+- [Design](docs/design.md): the architecture and the reasons behind it, for the
+  node runtime, TEE admission, policy admission and native OpenShell.
+- [Attestation guest](attestation/README.md) and
+  [contract acceptance](contracts/README.md).
 
-Queued tasks survive restart. Submission is durably claimed before contacting
-the network; an ambiguous response is polled using the same job ID, without an
-automatic second submission. A crash before the RPC may therefore need operator
-reconciliation. Terminal proof failures block new preflight actions for that
-instance until reconciled with a valid original receipt. At 128 outstanding
-receipts (including failures), new admissions fail closed. An invalid receipt is
-never accepted; an already executed action cannot be undone by a later proof
-failure. Receipt retention and monitoring need operator deployment planning.
-These are bounded initial limits, not a latency or throughput claim.
-
-Preflight is a trusted central administration API, never a mode an untrusted
-agent selects. It rejects `runtime.*` operations and cannot convert an existing
-strict request into a native authorization. The gRPC `Reserve` method continues
-to require a valid proof; it does not accept missing evidence as preflight.
-
-TEE startup has a synchronous gate: collect CoCo Attestation Agent evidence,
-precheck it through stock Trustee, submit the original evidence to the remote
-RA program and verify its receipt before launching the container. The current
-hardware backend is intended for shim and local Docker **inside** an already
-measured SNP/TDX confidential VM; it does not create that VM or turn host Docker
-into an enclave. The measured init-data must confine shim, its endpoint key and
-local runtime. Trustee's token is not used as a proof or as launch authorization.
-GOAT registration execution is deliberately deferred. The owner-consent interface
-below does not register an agent or add a registration requirement to today's
-Docker path. Ordinary non-TEE registration will require owner authorization and
-agent-key possession, with an explicit `unattested` identity; it must never
-synthesize a successful RA result. Concrete multi-TEE RA guests and the GOAT agent
-registry integration remain TODO. Policy editing currently uses the application/control plane; the
-planned GOAT authority must authenticate owner, chain/contract, policy version,
-digest, finality and revocation before activating its local policy snapshot.
-No chain synchronization or hardware attestation is claimed by preflight.
-
-### Future GOAT registration: user consent interface
-
-`registration::PreparedRegistration` prepares a versioned EIP-712 wallet request
-and verifies an owner's EOA signature with Alloy/k256. The control plane supplies
-the approved chain, future authorization-adapter address and identity registry;
-these must not come from the signature submission. The authenticated product
-owner must independently match the recovered signer. This is a library interface,
-with no chain RPC, wallet custody, transaction submission or readiness mutation.
-
-Prepare the following immutable inputs before asking the user to sign:
-
-- Owner wallet, product agent ID, agent public-key address and exact execution
-  commitment. Preparing an agent key is distinct from enabling its actions; key
-  possession and any TEE binding still require verification by the future adapter.
-- Canonical runtime configuration and policy SHA-256 commitments, plus the agent
-  manifest URI and content hash. The caller must verify those hashes against the
-  approved content. Signatures alone do not authenticate caller-supplied hashes.
-- Trust requirement: `unattested`, or `tee_required` with the approved attestation
-  profile hash. This records the requested trust level, not a successful result.
-- A fresh random 32-byte nonce and a bounded validity window (at most 24 hours).
-  Changing any bound input, including allocation after a scheduling retry,
-  requires a new user signature.
-
-`signing_request()` is the `eth_signTypedData_v4` payload, with decimal-string
-integers to preserve precision in JavaScript wallets. `digest()` is its EIP-712
-digest. Submit `{intent_digest, signature}` through the authenticated private
-control path; signatures are authorization material and must not be logged or
-included in workload metadata. Verification requires canonical 65-byte low-S
-signatures with v=27/28, current validity and the current authenticated owner.
-Contract wallets (ERC-1271) remain unsupported.
-
-`VerifiedOwnerSignature` is deliberately not deserializable and is **only consent**.
-It is not a grant, proof of key possession, RA result or on-chain registration.
-Verification is pure and repeatable; it does not consume the nonce. No deployed
-authorizer address is supplied, and this interface must not be exposed as a live
-registration button until its consumer is implemented and approved.
-
-Registration execution remains TODO: an owner-preserving contract adapter,
-atomic durable nonce consumption/idempotency, signature revocation and current
-policy checks, agent-key possession, RA receipt binding for TEE profiles,
-transaction reconciliation and confirmation handling. Stock ERC-8004
-`register(string)` mints to the transaction sender; it does not accept this owner
-signature. A backend must not relay that call and claim the resulting identity
-belongs to the signing user. See the [ERC-8004 specification](https://eips.ethereum.org/EIPS/eip-8004)
-and [pinned upstream identity registry](https://github.com/erc-8004/erc-8004-contracts/blob/b9e466c250744a7e06b13dff9d3c2844ed64f825/contracts/IdentityRegistryUpgradeable.sol).
-
-Tests independently decode the exported wallet JSON through Alloy's dynamic
-EIP-712 encoder, compare it with the static Solidity-struct digest and verify a
-real test-key signature. They reject every bound-field substitution, cross-chain
-and cross-registry reuse, wrong owners, expired/early consent, high-S and malformed
-signatures. These tests make no network calls and create no on-chain identities.
-
-### Strict admission for startup
-
-`PolicyAdmission` uses the actual Regorus evaluator, computes the canonical
-witness and expected public decision, and only admits `allow`. The caller must
-persist the job ID and authoritative policy/request before submission. After an
-ambiguous RPC outcome, query that ID before retrying. Reconstruct a job from the
-same persisted inputs after restart; there is no automatic resubmission.
-
-Pending, failed, expired or invalid proofs never authorize execution. The receipt
-must verify against the approved guest key and exact expected public values before
-calling `AuthorizationLedger::reserve`. The central ledger must independently
-verify evidence, current policy/context/lease and budgets, then atomically issue
-and consume a single-use grant. `ledger::SqliteLedger` provides this durable
-implementation for the central policy gateway. It must not be hosted by an
-untrusted execution node.
-
-Open it in a private durable directory with the approved program and a real
-`ReceiptVerifier`. The operator sets a cumulative shared budget and activates an
-exact allocation with its approved policy, authoritative context and state root.
-Stage the request and cost before remote submission; after restart, `request`
-recovers the identical witness. The ledger re-verifies every receipt, atomically
-reserves budget across allocations, and consumes an HMAC-authenticated grant
-once before dispatch. Reservations are idempotent; execution failures do not
-refund them. Policy/context changes invalidate pending grants. Revocation is
-durable even when it arrives before activation. Preserve the database, including
-its signing secret, across restarts. This is a single-host SQLite authority;
-multi-host gateway replicas require a shared transactional ledger implementation.
-The library's operator APIs must be exposed only through authenticated control
-administration. Fleet embeds them in its existing gateway with administrator-only
-routes, an approved guest manifest, and a private ledger under its data directory.
-Ordinary namespace tokens cannot set policy, budgets or stage authoritative inputs.
-
-### Authenticated node-to-ledger access
-
-`ledger_transport::LedgerService` embeds a bounded gRPC service in the existing
-Fleet-controlled policy gateway. It exposes only `Reserve` and `Consume`, using
-the same authoritative `SqliteLedger`; it does not start a gateway process or
-export policy, context, budget, activation or request-staging APIs. The host must
-serve it behind TLS and select its Rustls crypto provider before constructing
-the listener when multiple provider features are linked. The transport does not
-override the host's crypto configuration. `RemoteLedger::connect` requires HTTPS, except numeric
-loopback HTTP; operator-supplied channels support private CA/mTLS. Clients enforce
-30-second call deadlines, bounded messages, exact execution binding and no
-application retries. They never discover credentials or select an agent's URL.
-
-The central operator calls `SqliteLedger::issue_access` for one exact execution
-(namespace, workload, allocation, lease, generation and node), choosing Admission,
-Execution or both. Admission credentials can reserve; Execution credentials can
-consume. Credentials contain 256 random bits, expire within one hour, and only
-their hashes enter the central database. An embedding scheduler must also cap
-validity at any fixed allocation lease deadline and deliver secrets through its authenticated private
-provisioning channel, never ordinary App JSON or node reports. Rotation issues
-a replacement credential and revokes the old one without resetting grants or
-budgets. `revoke_access` withdraws one credential; `revoke` fences the allocation.
-
-Credential validity and scope are checked before proof verification and again in
-the reservation transaction. Consumption checks authorization and marks the
-grant spent in the same transaction, so revocation cannot race between these
-steps. Gateway restarts preserve credentials, revoked state, budgets and consumed
-grants. Unknown credentials, wrong scopes, stale authority or transport failures
-never authorize dispatch. A lost response after consumption leaves the grant
-spent: the shim retains its local Authorizing state and does not create a native
-sandbox on retry. This favors reconciliation over duplicate external effects.
-
-Tests run the service over real loopback gRPC and TLS, including concurrent
-consumption, all six execution identity fields, credential rotation/expiry,
-revocation during proof verification, gateway reopen, and OpenShell dispatch
-after an ambiguous reply. These use proof/native-driver doubles for orchestration;
-they do not claim a new remote proof or a native sandbox isolation acceptance.
-`LedgerService::with_authority` lets Fleet retain its live scheduler state fence
-through reservation and consumption on the blocking ledger worker. Fleet checks
-the exact reported execution, current deployment, fresh node session, active
-namespace and held quota allocation. Suspension, release, stale heartbeats and
-replacement therefore reject old credentials even if their TTL has not elapsed.
-The service is mounted in Fleet's gateway; Fleet provisions private credentials and activates the exact execution before
-native Create. Credentials are delivered only through the private node channel.
-
-`AuthorizedExecutor` binds a grant to the full request and execution identity,
-consumes it through the ledger before invoking `ActionHandler`, and rejects
-substitution, expiry and replay. Execution failure does not refund the grant.
-The handler must be held behind the runtime's native enforcement boundary;
-wrapping a Rust function cannot constrain arbitrary shell access in plain Docker.
-An authorization proof establishes a policy decision, not an external side effect.
-
-## Remote proof protocol
-
-`ZirenNetwork` uses the upstream StageService protobuf and ZKM stdin framing.
-It uploads the approved ELF, preserves caller job IDs and requests Groth16 output.
-Credentials and channels are explicit; no SDK initialization or credential-file
-discovery occurs. HTTPS uses system roots. Numeric loopback HTTP is supported for
-Fleet's loopback-only proof-app endpoint; a deployment can inject a channel with
-its own private CA or mTLS configuration. Never accept an agent-selected channel.
-
-Older Fleet deployments require a token-bound EIP-191 signer as well as bearer
-authentication. `with_fleet_signer` supplies it explicitly using the same message
-encoding and crypto libraries as Fleet. Token-only networks need no signer.
-Worker-supplied download URLs and output streams are not used for verification.
-
-With the `ziren` feature, `ZirenGroth16Verifier` accepts the upstream SDK Groth16
-JSON variant and uses `zkm-verifier` from the pinned Ziren revision. It verifies
-cryptography, expected public bytes and the approved program key, including the
-upstream recursion-key allowlist. Other proof formats fail closed. The gateway
-must approve the ELF/key mapping; a worker cannot select a verification manifest.
-
-`ProgramRef.program_sha256` hashes the ELF. `verifying_key_sha256` hashes the
-decoded 32-byte program key (`vk.bytes32()`), not the global Groth16 circuit key.
-trusted-rail's guest checker produces both values through upstream static machine
-setup. Guest, checker, verifier and Fleet prover image revisions must agree.
-
-Rail's v2 evaluator profile includes checked collection-index conversions for
-matching native/MIPS decisions. Roll out the native evaluator, guest ELF, approved
-program key and explicitly approved policy revisions together. Old profiles fail
-closed; existing stored policies and receipts are not silently rewritten. Run
-`scripts/check_engine_features.py` in every consumer build to audit the exact
-evaluator source and Cargo features. A previous remote proof does not validate
-the new ELF; repeat network acceptance before enabling it.
-
-## Remote acceptance test
-
-First build trusted-rail's guest and run its native/MIPS differential checker.
-Keep build outputs, synthetic witnesses and the generated program manifest outside
-project directories. Register that ELF as a dedicated Fleet proof app with the
-matching prover image and a shared proof storage root; start its prover through
-Fleet. Point a `fleet-proof-app` endpoint at that app's namespace, ELF and storage.
-The Fleet control-plane URL is not the app's StageService endpoint.
-
-Supply credentials through the environment from an explicitly selected secret
-source, never command-line token values or tracked files:
-
-```sh
-# TRUSTED_PROOF_ENDPOINT: the app's authenticated StageService endpoint
-# TRUSTED_PROOF_TOKEN: namespace token
-# TRUSTED_PROOF_SIGNER: optional hex SDK key required by older Fleet deployments
-export CARGO_TARGET_DIR=/absolute/path/outside-projects/build
-cargo run --locked --features ziren --example remote-policy-proof -- \
-  /absolute/path/policy-guest.elf 0xPROGRAM_KEY_FROM_MANIFEST \
-  /absolute/path/read.witness.json UNIQUE_PERSISTED_JOB_ID \
-  /absolute/path/outside-projects/receipt.json
-```
-
-The example submits to the remote network, polls up to 30 minutes, verifies the
-receipt, rejects substituted public values and optionally saves the verified
-receipt. It never starts a prover or dispatches an action. Synthetic historical
-inputs test proof correctness; live admission separately requires current validity.
-Remote proving operators can see the witness. Stop the dedicated app through
-Fleet after testing and confirm its resources are released.
-
-## Checks and remaining adapters
-
-The current migration baseline is **DockerDriver + the shared OpenShell access
-layer**. Default access remains subject to driver restrictions; user-configured
-rules require OpenShell enforcement. TEE simulation and fixture-based guest tests
-do not qualify a node for hardware-attested production workloads.
-
-Deferred acceptance work:
-
-- [ ] Real TDX: validate a fresh, launch-bound quote and collateral on a measured
-  confidential VM, including OpenShell enforcement and runtime creation.
-- [ ] Startup proof: publish/approve the DCAP guest and obtain and verify its
-  launch-bound receipt through the remote proof network before creating a runtime.
-  Execution-only guest tests and existing policy receipts do not satisfy this gate;
-  do not start a local prover.
-- [ ] AMD SNP: implement full raw-evidence verification in its approved guest and
-  complete hardware plus proof-network startup acceptance. An AS result alone
-  cannot authorize launch.
+## Development
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
 python3 scripts/check_engine_features.py
 ```
 
-Tests cover protocol framing/authentication, admission failure paths, request
-substitution, concurrent grant consumption and rejection by the real crypto
-verifier. Test ledgers and proof networks are orchestration doubles, not production
-implementations or evidence of successful remote proving. The feature audit must
-also run in downstream binaries to prevent widening Regorus's deterministic profile.
-
-`DockerDriver` and the confidential-VM `TeeDriver` implement machine-local
-`RuntimeDriver`; the data-plane adapter owns outbound connectors. CoCo evidence
-and optional Trustee gRPC adapters are concrete. The TDX guest reuses Automata
-DCAP verification; collateral refresh, SNP guests, SGX/Nitro isolation backends
-and live hardware/proof-network acceptance remain follow-ups. Fleet embeds the central ledger and implements private
-provisioning, native launch preparation and gateway readiness. Application action
-hooks still need integration to make preflight enforcement non-bypassable.
-Non-TEE attestation remains `SkippedNonTee`;
-requiring an attestation proof for that outcome is invalid. No permissive fallback
-or local prover is included.
-
-## Node-selected TEE startup
-
-The Intel TDX path follows [Automata DCAP](https://github.com/automata-network/automata-dcap-attestation):
-the Ziren guest verifies original quote/collateral with pinned upstream Rust code,
-then checks the measured profile, init-data, launch binding and TCB floor. Shim
-submits the witness to the proof network and checks the receipt against the approved
-program/key and exact input commitment. AS is not required for this path.
-See [attestation implementation and tests](attestation/README.md).
-
-The legacy SNP/sample adapter can use stock Trustee AS through generated bindings
-from its pinned official gRPC schema. AS is only a precheck, never a proof or
-launch authorization. Its token cannot replace raw-evidence verification in the
-approved guest. The upstream KBS SDK handles secret delivery, not this AS RPC.
-
-Fleet passes `shim_machine_labels` and `shim_tee` from the existing `apps.yaml`
-as daemon `machine` options; no second configuration file is introduced.
-`runtime.driver` selects `auto`, `docker`, `tee` or `tee-simulation`.
-`--probe-machine` reports visible SNP/TDX/SGX character devices, never successful
-attestation. Auto uses a configured TEE adapter; detected devices without an
-approved TEE configuration require an explicit operator decision rather than
-silently claiming hardware trust. SGX host capability cannot run ordinary Docker
-as an enclave. Native OpenShell can use the same node TEE profile: both create
-paths pass through the shared RA gate. OpenShell still executes its own native
-provisioning and policy enforcement; it does not launch through DockerDriver.
-
-`tee.mode=hardware` accepts `snp`/`tdx`, requires the matching guest device and
-immutable workload image digests. `tee.mode=simulation` requires `sample`, needs
-no hardware and advertises `tee-simulation`. OpenShell is a shared access capability,
-not a driver advertisement. Sample evidence never satisfies
-a hardware allocation. Production binaries include `ziren` for real Groth16
-receipt verification; there is no no-proof simulation option in the daemon.
-
-Configure the AA `/aa/evidence` endpoint on numeric loopback, approved
-measurement/init-data/key digests and pinned RA ELF/program/verifying-key identity.
-For TDX, set `tee.dcap` to an absolute collateral artifact path and a positive
-minimum TCB evaluation number; omit the Trustee settings. Legacy profiles retain
-the stock Trustee v0.19 API and approved attestation policy IDs.
-Proof credentials are explicit private files; an optional signer file supports
-Fleet's token-bound proof signatures. Nothing discovers workspace credentials.
-The proof service and Trustee use reconnecting channels so their outage does not
-prevent daemon restart, inspection or cleanup. Configuration/credential files
-must remain available locally. For HTTPS, `tee.trustee_tls` requires absolute
-`ca_file`, `cert_file` and `key_file` paths. Shim verifies the endpoint hostname
-against the configured CA and presents the node certificate. The private key must
-be owned by the daemon UID, have no group/other permissions and not be a symlink.
-TLS settings cannot be silently ignored on HTTP. Certificate renewal takes effect
-on daemon restart; existing runtimes remain independent of the daemon process.
-Fleet exposes only appraisal to certificates with a node URI SAN through its
-existing HTTPS ingress; AS administration remains private.
-
-The DCAP witness adds the original collateral, verification time and minimum TCB
-number to `{binding,evidence}`. The guest commits the canonical witness SHA256
-only after all checks succeed. The consumer's expected commitment prevents a
-prover from substituting a weaker profile, an old clock input or another launch.
-`binding` covers mode, platform, complete measured profile, init-data, endpoint key,
-execution identity, launch-request digest, nonce and expiry. The guest checks that
-collateral remains valid through that expiry; shim checks its clock again before
-creation. Legacy profiles keep `{binding,evidence_sha256}` public values and require
-their own approved guest. No SNP hardware guest is shipped yet.
-
-Jobs are recorded before submission; ambiguous submission is only polled on
-retry. The gate has a five-minute deadline. A crash before submission may need
-operator reconciliation. An expired admission can observe an existing workload
-but cannot create it. State is fenced to its trust profile; changing labels does
-not migrate allocations or permit removing their cleanup driver.
-
-When the daemon advertises `runtime-resume-tee-v1`, a crashed `tee` or
-`tee-simulation` runtime can be resumed in place as a Docker one is. It starts only
-behind a fresh admission: new evidence and a proof, for exactly the request digest
-its launch was admitted with.
-- **Each restart is a numbered start** with its own admission record and nonce; the
-  binding format is unchanged. Only the current restart's record is kept, beside the
-  launch's.
-- **One admission starts the container once.** The start is marked used before
-  Docker starts the container. A retried or interrupted restart continues its unused,
-  unexpired start without submitting another proof. A failed, rejected or expired
-  admission leaves the container stopped.
-- **While a restart is admitted,** `inspect` reports `starting`, and a concurrent
-  `resume` returns that status. The admission continues if the caller stops waiting,
-  and a stop or delete during it stays final.
-- **Restarts and launches share** the node's single admission slot, and each has the
-  five-minute deadline once it holds the slot.
-- **The launch's TEE configuration is required.** After any change to the TEE
-  configuration, a crashed runtime stays down until it is cleaned up and launched as
-  a new generation.
-
-Simulation checks use actual upstream Trustee sample verification and local Docker;
-proof-network/receipt doubles test orchestration and are explicitly not ZK proofs:
-
-```sh
-TRUSTEE_TEST_ENDPOINT=http://127.0.0.1:50004 \
-  cargo test --locked --all-features --test tee -- --include-ignored
-```
-
-Run stock `grpc-as` only on loopback for that test. The checked upstream image is
-`ghcr.io/confidential-containers/staged-images/coco-as-grpc@sha256:f65a0a74972781d5a3a9595f6e1308b86343f940738a0b6a23c270a7e8bd065a`.
-The test AA endpoint emits the upstream sample evidence format; it is a fixture,
-not a hardware attester. No local prover is started.
-
-## Native OpenShell transport
-
-The pinned stock gateway's create protocol is covered by an opt-in integration
-test. It starts an isolated gateway, authenticates with mTLS, creates a workspace,
-and captures the gateway-prepared private compute request. The shim accepts its
-pending configuration status and policy-derived process selectors, binds the
-workspace to Fleet's tenant, and rejects substituted tenants or claimed runtime
-readiness. The platform namespace is empty on create and remains driver-owned.
-The test extension refuses provisioning after capture; this does not establish
-native sandbox isolation, application readiness or completed Fleet migration.
-
-```sh
-OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
-  cargo test --locked --all-features --test openshell \
-  stock_gateway_mints_private_launch -- --ignored
-```
-
-OpenShell is an unconditional dependency, including in `--no-default-features` builds;
-there is no OpenShell build or runtime enable switch. The adapter uses the unmodified upstream compute-driver
-protobufs at commit `ce58cf8e9b953281352d98a637e41616295b1318`.
-`openshell::NativeDriver` connects to a private same-UID Unix socket, negotiates
-the upstream extension contract and checks the operator's resource admission
-policy and CPU/memory limit capabilities. `NativeCreate` binds the native policy
-hash, namespace/workspace, image, command, environment and hard limits to the
-approved launch inputs. Fleet/Ray own resource requests; the native Docker
-driver receives only hard limits because it rejects resource request fields. Unmapped identity, namespace and platform options fail closed.
-
-GPUs and durable storage are `LaunchRequest.gpus` / `LaunchRequest.mounts`
-(omitted when empty, so existing launch commitments are unchanged). Fleet binds
-`gpus` to the device ids Ray granted the allocation and `mounts` to the admitted
-app manifest. The shim translates them into the upstream Docker driver's own
-`driver_config`: one `cdi_devices` entry `nvidia.com/gpu=<id>` per granted id
-(plus `gpu.count` equal to that number, never a driver-chosen default), and one
-`type: volume` mount per entry. Volume names are derived as
-`fleet-<commitment(namespace, workload, name)>`, stable across generations but
-unnameable by another workload. `NativeCreate` requires the native sandbox to
-carry exactly that translation and nothing else; host binds, tmpfs, image mounts
-and foreign devices are rejected.
-
-Attachments require the node's driver to run with `allow_driver_config=true` in
-its admission policy; the acknowledged policy is checked before any volume is
-touched. Only then does the daemon advertise `openshell-attachments-v1`. Before dispatch the shim idempotently creates each missing volume as a
-plain `local` volume carrying the policy's `required_labels` (with
-`${workspace}` substituted) and `trusted-shim.openshell/volume=v1`. An existing
-volume is used only if it is a plain local volume with that label that upstream
-resource admission already accepts; otherwise the launch is rejected as
-untrusted. Runtime deletion never removes these volumes.
-Inspect, stop and delete require the exact sandbox ID and name; deletion is
-confirmed by a subsequent lookup. Mutations are never automatically retried.
-
-`openshell_lifecycle::ManagedNativeDriver` adds durable allocation ownership,
-native sandbox ID/name claims and generation tombstones. The gateway first
-prepares the native sandbox and a Rail `runtime.create` evaluation whose
-resource and parameters come from `NativeCreate::authorization_resource` and
-`authorization_parameters`. These bind the complete launch input, native policy
-and exact private protobuf bytes. After remote proof verification, the adapter
-consumes the resulting exact-request grant at the central ledger before calling
-native create. `ledger_transport::RemoteLedger` reaches the central ledger through
-an authenticated gateway client
-on a node; its authoritative database must never be copied onto an untrusted node.
-
-SQLite stores ownership, commitments, admitted service targets, the public SSH
-host-key fingerprint and lifecycle state, without native
-credentials, environment or the grant. A replay after restart only observes the
-original sandbox. An unanswered create is never resubmitted, and an absent
-snapshot cannot release its reservation while the create may still be in flight.
-Stop and delete verify persisted ownership and confirm their outcome; failed
-cleanup retains the allocation. Old generations and reused sandbox identities
-remain fenced after deletion. A changed physical instance is rejected.
-
-This adapter proves provisioning admission only. It does not claim that platform
-`Ready=True` means supervisor/policy readiness, enforce proofs on agent actions,
-or provide TEE attestation. Fleet's guarded activation/credential API is available;
-Fleet's embedded stock-gateway compute extension now connects remote startup
-proofs to private node delivery. Local application health gates outbound service
-registration; Fleet joins central policy readiness before publishing services.
-`control_observation` strips native configuration, credentials, local
-endpoints and condition messages before returning bounded status to Fleet; it
-cannot establish application readiness. Native split credentials
-must never enter an ordinary Fleet App spec, workload environment or public response.
-The adapter accepts HTTP services and TCP services with a declared application
-banner check. Management/credential injection and action-proof-required requests
-remain unsupported.
-Tests use an upstream-protocol
-test server. The ignored native admission test also calls the pinned, unmodified
-Docker compute-driver binary to check capabilities, real input validation and
-operator policy mismatch. Neither test establishes full OpenShell isolation or
-an end-to-end provisioning proof.
-
-`openshell_network::bind` supplies the local data-plane transport for the native
-Docker profile. It checks the full workload container ID, native sandbox/name,
-driver namespace and workspace, selects exactly one owned supervisor, and checks
-its immutable image ID and read-only root filesystem. The SSH host key must match
-the public fingerprint returned by the authenticated OpenShell control API. It
-uses the same `russh` version as the pinned upstream lockfile. SSH channels reach
-only the caller-selected workload loopback port through the stock supervisor's
-boundary connector. Requests on that service reuse one SSH session. The central
-OpenShell gateway carries no application bytes.
-
-The stock supervisor image needs the small Rust `trusted-shim-socket` executable
-at `/opt/trusted-shim/socket`. Compose it with
-[`docker/openshell/Dockerfile.supervisor`](docker/openshell/Dockerfile.supervisor),
-using a verified upstream image digest as `SUPERVISOR_IMAGE` and a static binary
-for the node architecture in the build context. On a Linux GNU build host:
-
-```sh
-rustc --edition=2021 -C target-feature=+crt-static -C opt-level=s -C strip=symbols \
-  src/bin/trusted-shim-socket.rs -o /absolute/external/build-context/trusted-shim-socket
-docker build --build-arg SUPERVISOR_IMAGE=registry/supervisor@sha256:... \
-  -f docker/openshell/Dockerfile.supervisor /absolute/external/build-context
-```
-
-Configure the resulting immutable image in the existing native driver's
-`supervisor_image` setting, and put its exact local `sha256:<64 hex>` image ID in
-the existing shim OpenShell configuration's optional `supervisor_image` field.
-Omitting this field preserves provisioning-only behavior and the previous daemon
-configuration digest. Keep the native SSH socket at its default
-`/run/openshell/ssh.sock`. The helper has no listener, accepts no arguments, and
-requires a private socket owned by its supervisor UID. Shim attaches it with
-local Docker exec; it stays inside the trusted supervisor container, never the
-agent workload. It does not change upstream binaries, require a public node port,
-or publish a workload port. Binary stdio is flushed without line buffering.
-
-The returned endpoint is host-loopback only, for the existing outgoing router
-connector. Drop/cancellation drains active local streams; ownership monitoring
-closes the transport when the pinned workload or supervisor disappears or stops.
-This is a privileged library interface, **not an app API**. Callers must supply a
-fresh owned observation and an admitted service port. The daemon's private
-`network` command accepts the allocation’s actual runtime driver with the existing `NetworkConfig`;
-it takes no target or SSH identity from that command. `LaunchRequest.services`
-must contain unique, allocation-scoped services of the same protocol, with
-`endpoint_ref: app`.
-Its `driver_options` must be exactly `{"container_port":8090,"health_path":"/health"}`
-(with the application's port/path). These fields participate in the launch
-commitment. The public SSH fingerprint is derived from the exact proof-bound
-native authentication bundle before Consume; private keys are never persisted.
-
-For TCP (including SSH), select `protocol: tcp`, keep `health_path: /`, and add
-`health_tcp_banner: "SSH-2.0-"` to these options. Readiness requires the exact
-nonempty ASCII prefix (up to 128 bytes) within three seconds; it sends no commands
-or credentials. A local listener or native SSH channel ACK alone does not prove
-the workload accepted the connection. Silent TCP protocols need another health
-adapter and remain unsupported. `openshell-tcp-services-v1` advertises this
-capability so Fleet does not place these services on older shims.
-
-Native HTTP services can also use restricted ingress and a logs-only `control`
-service. Give an application service `endpoint_ref: ingress:<service>` and a
-matching `driver_options.ingress` rule (at most eight) with the same `paths`,
-`methods` and optional `single_use` as Docker ingress; `bearer_env` is rejected,
-because a native node holds no copy of the application's credential. The shim
-instead forwards the caller's own `Authorization` header, and the application
-authenticates it. Single-use approvals commit to the allocation's private
-`native-http-invocations.sqlite` journal before forwarding, exactly as on
-Docker. Declare at most one `control` service (`endpoint_ref: control`,
-`protocol: http1`, also beside TCP applications) for `GET /logs?tail=N` with
-Docker's bounds, read from the freshly observed owned workload container. Native
-control has no exec, restart or metadata routes: administrative exec goes
-through the stock gateway, and lifecycle changes stay Fleet allocation
-operations. The rules are part of the launch commitment. `openshell-ingress-v1`
-advertises this support.
-
-The daemon recovers stored connector records on restart, checks application health
-without redirects or proxy environment, and retries health recovery independently
-of Ray. Stop/delete permanently fence connections and wait for transport drain
-before native cleanup. No host application port is published. A started connector
-worker is not proof of route reachability or policy readiness.
-
-With the service adapter configured, `openshell-service-health-v1` advertises
-local health reporting. Native `inspect.application_ready` requires a running
-connector worker and a successful local probe within six seconds. It does not
-wait for registration grants. The value resets on health failure, worker exit,
-cancellation and daemon restart, avoiding a route-grant/readiness dependency cycle.
-
-Fleet publication additionally requires its authenticated gateway
-configuration/policy observer. The stock supervisor health socket indicates
-session acceptance **before** asynchronous configuration application, so it cannot
-replace this gate. Router grants, revocation and control-snapshot freshness still apply;
-local connectivity during a control outage does not authorize indefinite access.
-
-Fleet's opt-in native Docker acceptance composes this helper with the stock
-supervisor and exercises real HTTP/SSE/WebSocket through the local Data Router,
-including wrong tenant/image/host-key rejection, active-stream revocation,
-health denial/recovery, durable daemon restart, cleanup drain, gateway mTLS
-readiness, cache expiry and control-gateway outage.
-Its proof service and route-grant issuer
-are explicit test fixtures; it is neither a fresh proof nor a cross-machine NAT
-acceptance test.
-
-The pinned router transport also sends standard WebSocket Ping/Pong controls,
-with a 15-second interval and 15-second reply deadline. Idle outbound connections
-stay active through NAT/proxies; silent network loss closes streams within about
-30 seconds plus scheduling delay. Recovery reconnects without replaying work or
-creating another runtime. Router's `tools/test_nat.py` and `tools/test_remote.py`
-exercise this transport using isolated NAT namespaces and an authorized remote
-SSH host, respectively. They use fixture grants and loopback applications;
-cross-machine Fleet/OpenShell control and actual workload migration remain
-separate acceptance gates.
-
-Canonical namespace IDs map to native workspace names within the stock gateway's
-19-byte limit; the full Fleet identity remains proof-bound. The embedding control
-plane must reject collisions. Explicit nonempty commands avoid the gateway's
-implicit interactive TTY mode, which this profile does not support.
-
-`openshell_gateway::GatewayLaunch` translates an admitted Fleet launch and native
-policy into the stock gateway's public create request. It binds the workspace,
-command, environment, CPU/memory limits and an allocation-derived routable name.
-The compute extension can use the same binding for validation before credential
-minting, then bind the credential-bearing Create bytes to Rail's authorization
-resource and commitments. `ProvisionRequest::validate_native` repeats these
-checks against the exact evaluation request before private delivery and again
-inside shim. It does not verify a proof or consume a grant; the existing central
-ledger remains responsible for those checks. This translation has no scheduler,
-queue, durable state or config file. Fleet remains the lifecycle owner.
-
-The opt-in `stock_gateway_mints_private_launch_for_shim_with_workspace_isolation`
-test runs the pinned, unmodified gateway with mTLS. It rejects a changed workload
-before native Create and checks the gateway-minted credentials through the same
-binding. Its capture driver deliberately refuses provisioning; this acceptance
-does not assert sandbox execution or readiness.
-
-The standard runtime includes native OpenShell provisioning inside
-the persistent daemon. Its optional `--options` argument contains only operator
-settings: `{"openshell":{"socket":"/run/openshell/compute.sock",
-"admission_policy":"<upstream acknowledgement>","ledger_endpoint":"https://fleet.example",
-"ledger_ca_file":null}}`. Fleet fills these from its existing `apps.yaml`.
-The socket must be private and owned by the same UID. HTTPS uses system roots or
-the explicitly configured, non-writable CA file; plain HTTP is restricted to numeric
-loopback. The access layer always advertises `openshell-access-v1`; without user rules it
-delegates to the driver unchanged. A daemon with a native endpoint additionally advertises `openshell-provisioning-v1`, `openshell-allocation-v1` and a digest of its effective operator settings.
-It can start during a gateway outage without claiming the native driver is healthy.
-
-The private daemon command `{"operation":"provision","payload":...}` accepts a
-`provisioning::ProvisionRequest`, constructed with the exact gateway protobuf,
-canonical launch, Rail request, proof-backed grant and execution-only ledger token.
-The token and native credentials travel over the same-UID Unix socket, never argv,
-status or durable node state. The payload cannot supply a ledger endpoint or driver
-socket. Native validation precedes central Consume and the one permitted Create.
-Daemon request bodies are bounded; losing the caller does not cancel accepted work.
-An ambiguous Consume is retained as authorizing and never retried automatically.
-
-Before private credentials arrive, `{"operation":"allocate","driver":"docker",
-"execution":...}` durably reserves ownership without calling the compute driver or
-ledger. The `reserved` phase has no sandbox ID, compute or application readiness.
-Repeated allocation returns the current phase; it never revives a cancelled lease.
-Stopping/deleting an unprovisioned reservation works offline and leaves a tombstone,
-so late grants cannot create it. A newer generation requires confirmed deletion.
-Fleet retains Ray resources during this state and uses a separate, private outbound
-HTTPS delivery for the provisioning envelope.
-
-Use the actual runtime driver with the existing `inspect`, `stop` and `delete` daemon
-commands to manage that allocation. Inspection returns `phase`, `present` and
-`platform_ready` and, with the service adapter enabled, `application_ready`. Management uses persisted ownership
-without a ledger credential or a live gateway, including after daemon restart.
-The library likewise takes the ledger only in `ManagedNativeDriver::launch`;
-opening ownership state and cleanup never require an authority client. Tests cover
-real daemon sockets, central HTTP/2 Consume, revocation, reply loss, restart and
-gateway outage with protocol/proof doubles, without claiming native isolation.
-
-Proof-required admission waits for remote verification before dispatch. Applying
-that mode to every serial tool call adds the proof network's queue, proving and
-round-trip latency to every step. The implemented preflight path evaluates before execution and queues the
-ZK receipt in the background. Native permissions enforce at execution; the later
-proof establishes the recorded policy evaluation. Such a proof alone establishes
-neither completeness of the execution log nor the external side effect. It must
-not be accepted as the existing pre-execution `ExecutionGrant`.
-
-Keep one authoritative existing runtime config per application and retain dormant
-ACK support. Fleet's opt-in runtime adapter delegates container hard limits to shim
-([zkm-fleet #95](https://github.com/ProjectZKM/zkm-fleet/issues/95)). Film and ClawUp
-have opt-in adapters for the independent data transport. This increment builds on framework
-PR #1 and pins companion repository commits for reproducibility.
-
-
-## Opt-in Docker lifecycle
-
-Build `cargo build --locked --bin trusted-shim-runtime`. Fleet selects the binary
-and a private persistent state directory in its existing node configuration. The
-binary accepts one JSON control request on stdin and returns bounded metadata on
-stdout; it has no network listener. `--capabilities` reports protocol 1 and the
-Docker driver. Docker is invoked directly through `/usr/bin/docker` against the
-local Unix socket; install the binary only for the trusted machine adapter.
-
-This lifecycle path accepts only explicit non-TEE, no-proof requests. It rejects
-policy-proof requirements, attestation requirements, unsupported driver options
-and unsupported router service mappings rather than dropping them. Plain Docker is not an agent
-shell policy boundary. Connect proof-required admission and upstream OpenShell
-before advertising those guarantees; the proven PolicyEngine is unchanged.
-
-CPU millicores and memory bytes become Docker hard limits, checked before start
-and on inspect. The driver requires daemon support for the requested cgroup limits;
-the Docker acceptance test also reads CPU/memory limits from the live cgroup. Memory swap is limited to the same total. GPU ids come from the
-allocator. Published service ports bind host loopback only. Images must already
-be present; this driver does not pull images. Bind mounts are administrator
-settings. Environment is passed in a mode-0600 temporary env file, never argv;
-multiline env values are rejected. Local host administrators and Docker owners
-remain trusted.
-
-Each allocation has an exclusive file lock, atomically fsynced journal and Docker
-ownership labels binding the complete request and execution. Recovery reuses the
-same container; changed requests, stale leases and generations are rejected.
-Stopped/deleted generations stay fenced by tombstones. A missing started container
-or an ambiguous pending start is not automatically rerun: confirm cleanup and
-allocate a new generation explicitly. Cleanup checks ownership and actual daemon
-state before acknowledging release. Keep both Fleet's allocation journal and
-shim's state across restarts and upgrades; never delete them to retry an operation.
-A crashed process can leave a private temporary env file; protect the state directory
-with the same access and retention controls as runtime credentials.
-
-The persistent daemon also accepts `resume`, which it advertises as `runtime-resume-v1`.
-It starts a Running allocation's own exited container again in place, keeping its
-state, after checking the committed limits again. A running container is left alone.
-It never recreates a missing container, and it refuses a stopped or deleted allocation,
-so a stop or delete stays final. The one-shot binary has no `resume`.
-
-Run real Docker acceptance separately (only test containers are created/removed):
+Tests that need real Docker are ignored by default:
 
 ```sh
 docker pull alpine:3.21
 cargo test --locked --test docker -- --ignored
+cargo test --locked --test daemon -- --ignored
+cargo test --locked --all-features --test tee simulated_ -- --ignored
 ```
 
-It covers concurrent idempotent launch, hard limits, process recovery, request
-substitution, stale cleanup, tombstones and refusal to recreate a lost execution.
+Proof networks, receipts and ledgers in tests are orchestration doubles, not ZK
+proofs, and no test starts a prover. Other ignored tests need extra
+services: stock Trustee (`TRUSTEE_TEST_ENDPOINT`, run in CI) and a pinned
+OpenShell gateway binary (`OPENSHELL_GATEWAY_BINARY`).
 
-## Outbound service connections
+## Not done yet
 
-Declare services in the existing `LaunchRequest.services`. The Docker adapter
-accepts approved `endpoint_ref: app` mappings with matching namespace/workload,
-a unique service name and HTTP/1, WebSocket or TCP protocol. Persist the resolved
-loopback port with the allocation. `container_port` can differ from the host
-port, and an explicit `entrypoint` supports existing agent images. These options
-are validated before Docker runs; they do not enable arbitrary Docker flags.
-
-The node supervisor runs a second long-lived stdio command:
-`{"operation":"network","execution":...,"config":...}`. `NetworkConfig` is
-node-owned data taken from Fleet's existing apps.yaml: `gateway_url`, `relay_url`,
-`token_file`, `public_key_file` and `issuer`. It is not a second runtime catalog.
-The central gateway's authenticated `POST /v1/runtime/registration` accepts
-`{"execution":...,"service":...}` and returns `{"token":"..."}` after checking
-the live allocation and approved policy. Fleet embeds the registration gateway and delivers scoped credentials to shim;
-operators must configure the approved issuer and trust roots. A local test
-issuer does not substitute for production authorization.
-
-Shim verifies the Ed25519 registration grant, exact execution/service, issuer,
-audience and expiry before dialing the fixed relay. Gateway HTTP and relay WS
-must use TLS except numeric loopback tests. Redirects are disabled, responses are
-bounded and node credentials are read only from an explicitly named private file.
-No token value is placed in process arguments or runtime environment variables.
-
-The connector holds a per-execution network lock. Stop/delete durably fence new
-connectors and wait for every stream to close before stopping/removing the runtime
-or permitting port reuse. A failed drain leaves cleanup unconfirmed. Connection
-loss never restarts the container. Expiring credentials are refreshed through the
-central gateway, and reconnect never replays application requests. Applications
-must tolerate failed in-flight streams when a connection or grant expires.
-
-Validation includes a real Docker HTTP/SSE service across the independent relay,
-private registration, distinct host/container ports, active-stream drain and port
-reuse fencing. The CLI advertises `data-plane-v1`; upgrade Fleet's node adapter
-before enabling services. Policy proof and TEE requirements remain independent
-and fail closed when the selected runtime path cannot satisfy them.
-
-### Runtime administration and restricted HTTP ingress
-
-An administrator can declare the reserved `control` service (endpoint `control`) to expose exact-allocation metadata, bounded runtime logs, command execution and in-place restart through the independent data relay. The central connection gateway requires a Fleet administrator credential for this service. The node checks the signed `X-Trusted-Route` grant again, including its exact execution and service. Ordinary application grants cannot access administration. The Docker daemon is never exposed remotely. Exec accepts argv, optional user, base64 stdin and a deadline of at most 600 seconds; it uses the image's `timeout` utility, bounds input/output at 64 MiB and returns base64 stdout/stderr plus an exit code. `GET /logs?tail=N` reads 1–5000 lines directly from the owned container, returns base64 stdout/stderr (at most the last 128 KiB each), and bounds the complete read to 15 seconds or the remaining grant lifetime. It requires the same exact-execution control grant and does not depend on legacy Fleet node log files. Callers must not automatically retry a timed-out command. Docker administration does not claim action-policy proof; proof-required launch requests continue to fail closed.
-
-For application ingress, declare `endpoint_ref: ingress:<service>` and a matching `driver_options.ingress` entry with exact `paths`, allowed `methods` and optional `bearer_env`. The node reads that credential from the owned container and injects it into the local HTTP request; the client never receives it. This supports HTTP/SSE and rejects undeclared paths/methods. Use the direct app endpoint for services that need native WebSocket/TCP. Ingress is configured in the existing application manifest, not a second runtime catalog.
-
-`driver_options.port: 0` with `container_port` asks the shim to select and durably reserve a free host loopback port. Docker receives a fixed mapping, so a restart preserves the endpoint. Runtime status reports the assigned port. Reservation records are released only after network drain and confirmed container removal. A conflicting external listener fails launch; no different target is silently selected. Preserve the private state directory across upgrades. A crash before allocation-record persistence can leave a conservative orphan port reservation for operator reconciliation.
-
-
-### Single-use application ingress
-
-Set `single_use: true` on an existing ingress rule to require a signed
-`http_request` binding. The shim verifies the method, exact path and SHA-256 of
-at most 16 MiB of request body, then commits the invocation ID to a private SQLite
-ledger before sending to the workload. Concurrent replays and reconnect/restart
-replays return 409; a mismatched request returns 403 without consuming approval.
-Expired ledger entries are pruned. Preserve the shim state directory on upgrades.
-A lost upstream response consumes the approval: reconcile the application outcome
-before authorizing a new ID. HTTP response bodies remain streamed, including SSE.
-
-Old ingress rules keep their prior behavior and wire representation. Nodes report
-`single-use-ingress-v1`; Fleet must require this capability before placing a
-single-use rule. Admin control routes do not accept body-bound application grants.
-These invocation capabilities enforce application admission and replay protection;
-they are separate from the remote PolicyEngine proof required by trusted actions.
-
-
-### Fleet-managed access identity compatibility
-
-This revision accepts the optional signed `access` claim containing opaque
-principal/session IDs and the approved access-policy version/digest. Relay/Fleet
-own freshness and per-stream revocation; shim still validates the signature,
-exact execution/service and any single-use request/body binding before forwarding.
-This transport policy reference is not a PolicyEngine evaluation proof, and
-consuming a tool action does not generate a second proof. The Docker management
-acceptance covers scoped claims, changed-body rejection and concurrent replay.
-Upgrade shim before enabling `TRUSTED_GATEWAY_ROUTER_ID` in the application
-backend: older parsers reject the additive claim. Legacy grants omit it and
-existing runtimes are not migrated by this update. In managed mode, administrator
-control grants additionally require an enabled Fleet `control` service policy.
-
-The existing `public_key_file` in Fleet node network settings accepts a bounded
-Ed25519 PEM bundle and is reloaded for each new ingress authorization. Stage
-old+new public keys on every shim, relay and gateway before switching the central
-signer; remove the old key after replacing node enrollment credentials and
-allowing old route grants to expire. Use atomic file replacement and mode 0644
-or stricter. Runtime containers, ports and existing streams survive this update;
-stream expiry and Fleet revocation remain in force.
+- Real TDX acceptance: a fresh, launch-bound quote on a measured confidential VM,
+  including OpenShell enforcement and runtime creation.
+- A published DCAP guest, and a launch-bound receipt from the remote proof
+  network before a runtime is created.
+- AMD SNP: raw-evidence verification in an approved guest. A Trustee result alone
+  never authorizes a launch.
+- Collateral refresh, and SGX/Nitro isolation backends.
+- Application action hooks, so preflight enforcement can't be bypassed.
+- GOAT agent registration. Only the owner-consent interface exists.
