@@ -73,7 +73,7 @@ async fn run() -> Result<()> {
         .await;
     }
     if args.len() == 2 && args[1] == "--capabilities" {
-        println!("{{\"protocol\":1,\"drivers\":[\"docker\"],\"features\":[\"data-plane-v1\",\"chisel-network-v1\",\"runtime-management-v1\",\"single-use-ingress-v1\",\"openshell-access-v1\"]}}");
+        println!("{{\"protocol\":1,\"drivers\":[\"docker\"],\"features\":[\"data-plane-v1\",\"chisel-network-v1\",\"runtime-management-v1\",\"single-use-ingress-v1\",\"openshell-access-v1\",\"runtime-cpu-shares-v1\"]}}");
         return Ok(());
     }
     if args.len() != 5 || args[1] != "--state-dir" || args[3] != "--node-id" {
