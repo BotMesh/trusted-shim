@@ -96,6 +96,7 @@ uses only what a node advertises.
 | `runtime-cpu-shares-v1` | `limits.cpu_shares`: a CPU weight under contention, not a cap |
 | `runtime-long-stop-v1` | `driver_options.stop_timeout_s` up to 3600 s, the grace period between SIGTERM and SIGKILL |
 | `runtime-network-v1` | `driver_options.network`: `none` (loopback only) or `host` (refused on TEE) instead of Docker's default network |
+| `runtime-named-network-v1` | `driver_options.network`: `{"named": NAME}`, a Docker network the node's administrator made, with no published port or services |
 | `runtime-exit-status-v1` | `exit`: how an exited container's process ended, including an OOM kill |
 | `runtime-run-to-completion-v1` | `driver_options.run_to_completion`: a run that ends with its process, such as a batch job |
 | `runtime-logs-v1` | `logs`: a runtime's output from a point in time, in windows of up to 1 MiB |

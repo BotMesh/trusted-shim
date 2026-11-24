@@ -564,6 +564,46 @@ async fn real_docker_runs_a_container_without_a_network_or_on_the_hosts() {
     driver.delete(&host.execution).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local Docker and preloaded alpine:3.21"]
+async fn real_docker_runs_a_container_on_a_network_the_node_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("private-state");
+    let driver = DockerDriver::new(&state, "test-node".into()).unwrap();
+    let id = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+    // An internal network has no route out; what else is on it is the node's choice.
+    let network = format!("shim-test-{id}");
+    assert!(docker(&["network", "create", "--internal", &network])
+        .status
+        .success());
+
+    let mut named = request(&format!("network-named-{id}"));
+    named.driver_options = json!({"stop_timeout_s":1,"network":{"named":network}});
+    let status = driver.launch(&named).await.unwrap();
+    assert_eq!(status.state, RuntimeState::Ready);
+    assert_eq!(status.port, None);
+    let container = inspect(&status.runtime_id);
+    assert_eq!(container["HostConfig"]["NetworkMode"], network.as_str());
+    assert!(container["NetworkSettings"]["Networks"]
+        .as_object()
+        .is_some_and(|networks| networks.len() == 1 && networks.contains_key(&network)));
+    assert!(container["HostConfig"]["PortBindings"]
+        .as_object()
+        .is_none_or(|bindings| bindings.is_empty()));
+    let routes = docker(&["exec", &status.runtime_id, "ip", "route"]);
+    assert!(routes.status.success());
+    assert!(!String::from_utf8_lossy(&routes.stdout).contains("default"));
+    driver.delete(&named.execution).await.unwrap();
+
+    // The shim makes no network: a name the node lacks starts nothing.
+    let mut missing = request(&format!("network-missing-{id}"));
+    missing.driver_options =
+        json!({"stop_timeout_s":1,"network":{"named":format!("{network}-missing")}});
+    assert!(driver.launch(&missing).await.is_err());
+    let _ = driver.delete(&missing.execution).await;
+    assert!(docker(&["network", "rm", &network]).status.success());
+}
+
 async fn exited(driver: &DockerDriver, r: &LaunchRequest) -> trusted_shim::runtime::RuntimeStatus {
     for _ in 0..100 {
         let status = driver.inspect(&r.execution).await.unwrap();

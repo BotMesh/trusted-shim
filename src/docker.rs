@@ -53,7 +53,7 @@ pub struct DockerOptions {
 }
 
 /// A network other than Docker's default bridge.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
     /// Loopback only: no egress, no published port and no services.
@@ -63,15 +63,31 @@ pub enum NetworkMode {
     /// services, so only an administrator should choose it. A TEE runtime
     /// refuses it: in a confidential VM that includes the attestation agent.
     Host,
+    /// A Docker network the node's administrator made, by its name. What the
+    /// container reaches is that network's business: an internal one with a
+    /// filtering proxy gives a job a short list of hosts. Nothing reaches the
+    /// container through the shim: no published port and no services.
+    Named(String),
 }
 
 impl NetworkMode {
     /// Docker's `HostConfig.NetworkMode` for this network.
-    fn docker(self) -> &'static str {
+    fn docker(&self) -> &str {
         match self {
             Self::None => "none",
             Self::Host => "host",
+            Self::Named(name) => name,
         }
+    }
+
+    /// A name Docker takes for a user-defined network. Its own modes (`bridge`,
+    /// `default`, `container:ID`) are not names: they select other networking.
+    fn names_a_network(name: &str) -> bool {
+        let mut bytes = name.bytes();
+        bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+            && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            && name.len() <= 63
+            && !["none", "host", "bridge", "default"].contains(&name)
     }
 }
 
@@ -942,7 +958,7 @@ impl DockerDriver {
             r.limits.clone()
         };
         // A chosen network is part of the committed launch, like its limits.
-        if let (Some(v), Some(network)) = (container, r.network) {
+        if let (Some(v), Some(network)) = (container, &r.network) {
             if v["HostConfig"]["NetworkMode"] != network.docker() {
                 return Err(Error::Untrusted);
             }
@@ -1053,14 +1069,17 @@ impl DockerDriver {
         {
             return Err(Error::InvalidContract);
         }
-        match options.network {
-            // Nothing can reach a container without a network.
-            Some(NetworkMode::None)
-                if options.port.is_some()
-                    || options.container_port.is_some()
-                    || !options.ingress.is_empty()
-                    || !request.services.is_empty() =>
-            {
+        let surface = options.port.is_some()
+            || options.container_port.is_some()
+            || !options.ingress.is_empty()
+            || !request.services.is_empty();
+        match &options.network {
+            // Nothing can reach a container without a network, and the shim
+            // publishes nothing on a network it did not make.
+            Some(NetworkMode::None | NetworkMode::Named(_)) if surface => {
+                return Err(Error::InvalidContract)
+            }
+            Some(NetworkMode::Named(name)) if !NetworkMode::names_a_network(name) => {
                 return Err(Error::InvalidContract)
             }
             // There is no mapping: the container listens on `port` itself, so
@@ -1073,12 +1092,7 @@ impl DockerDriver {
             _ => {}
         }
         // A run to completion is reached by nothing: it ends on its own.
-        if options.run_to_completion
-            && (options.port.is_some()
-                || options.container_port.is_some()
-                || !options.ingress.is_empty()
-                || !request.services.is_empty())
-        {
+        if options.run_to_completion && surface {
             return Err(Error::InvalidContract);
         }
         let mut names = std::collections::HashSet::new();
@@ -1157,7 +1171,7 @@ impl DockerDriver {
         if let Some(bytes) = options.shm_bytes {
             args.extend(["--shm-size".into(), bytes.to_string()]);
         }
-        if let Some(network) = options.network {
+        if let Some(network) = &options.network {
             args.push(format!("--network={}", network.docker()));
         }
         if let Some(port) = r.port.filter(|_| options.network.is_none()) {
@@ -1232,7 +1246,7 @@ impl RuntimeDriver for DockerDriver {
                     allocated_port: options.port == Some(0),
                     services: request.services.clone(),
                     ingress: options.ingress.clone(),
-                    network: options.network,
+                    network: options.network.clone(),
                     run_to_completion: options.run_to_completion,
                 };
                 self.save(&slot, &r)?;
@@ -1613,7 +1627,7 @@ mod network_tests {
             allocated_port: false,
             services: request.services.clone(),
             ingress: options.ingress.clone(),
-            network: options.network,
+            network: options.network.clone(),
             run_to_completion: options.run_to_completion,
         }
     }
@@ -1631,6 +1645,8 @@ mod network_tests {
             request(json!({"network":"none"}), json!([])),
             request(json!({"network":"host"}), json!([])),
             request(json!({"network":"host","port":8080}), app()),
+            request(json!({"network":{"named":"build-egress"}}), json!([])),
+            request(json!({"network":{"named":"a"}}), json!([])),
         ] {
             DockerDriver::options(&valid).unwrap();
         }
@@ -1651,9 +1667,23 @@ mod network_tests {
                 json!({"network":"host","port":0,"container_port":8080}),
                 app(),
             ),
-            // Only the two named networks.
+            // The shim publishes nothing on a network it did not make.
+            request(
+                json!({"network":{"named":"build-egress"},"port":8080}),
+                json!([]),
+            ),
+            request(json!({"network":{"named":"build-egress"}}), app()),
+            // A name is a user-defined network's, never one of Docker's modes.
             request(json!({"network":"bridge"}), json!([])),
             request(json!({"network":"container:other"}), json!([])),
+            request(json!({"network":{"named":"bridge"}}), json!([])),
+            request(json!({"network":{"named":"host"}}), json!([])),
+            request(json!({"network":{"named":"default"}}), json!([])),
+            request(json!({"network":{"named":"container:other"}}), json!([])),
+            request(json!({"network":{"named":""}}), json!([])),
+            request(json!({"network":{"named":"-egress"}}), json!([])),
+            request(json!({"network":{"named":"a b"}}), json!([])),
+            request(json!({"network":{"named":"e".repeat(64)}}), json!([])),
         ]
         .iter()
         .enumerate()
@@ -1676,6 +1706,13 @@ mod network_tests {
         assert!(!host.iter().any(|a| a == "--publish"));
         let end = host.iter().position(|a| a == "--").unwrap();
         assert!(host.iter().position(|a| a == "--network=host").unwrap() < end);
+
+        let named = args(&request(
+            json!({"network":{"named":"build-egress"}}),
+            json!([]),
+        ));
+        assert!(named.contains(&"--network=build-egress".into()));
+        assert!(!named.iter().any(|a| a == "--publish"));
 
         let default = args(&request(json!({"port":8080}), app()));
         assert!(!default.iter().any(|a| a.starts_with("--network")));
@@ -1703,6 +1740,20 @@ mod network_tests {
                 Err(Error::Untrusted)
             ));
         }
+
+        let named = request(json!({"network":{"named":"build-egress"}}), json!([]));
+        let named = record(&named, &DockerDriver::options(&named).unwrap());
+        DockerDriver::status("slot", &named, Some(&container(json!("build-egress")))).unwrap();
+        for changed in [json!("bridge"), json!("none"), json!("other-egress")] {
+            assert!(matches!(
+                DockerDriver::status("slot", &named, Some(&container(changed))),
+                Err(Error::Untrusted)
+            ));
+        }
+        assert_eq!(
+            serde_json::to_value(&named).unwrap()["network"],
+            json!({"named":"build-egress"})
+        );
 
         // Docker reports the default network as `bridge` or `default`; an
         // existing allocation is not checked against either.
