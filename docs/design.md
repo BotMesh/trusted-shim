@@ -61,8 +61,14 @@ job that needs no network. `host` puts it in the host's own network namespace,
 where it listens on its port itself and can reach every service on the host,
 loopback included, so only a trusted workload should get it. A TEE runtime
 refuses `host`: in the confidential VM it would reach the attestation agent,
-which serves evidence on loopback. A chosen network is part of the committed
-launch, and inspect refuses a container whose network differs.
+which serves evidence on loopback. `{"named": NAME}` puts it on a Docker network
+the node's administrator made, and what it reaches there is that network's
+business: an internal network with a filtering proxy gives a build job a short
+list of hosts and nothing else. The shim publishes no port and offers no
+services on such a network, and the name is a user-defined network's, never one
+of Docker's own modes (`bridge`, `default`, `container:ID`). A chosen network is
+part of the committed launch, and inspect refuses a container whose network
+differs.
 
 ### Runs to completion
 
